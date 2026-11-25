@@ -135,6 +135,7 @@ test('build-cargo-route dry run: both termini, the line, a depot and a train, wi
   assert.equal(res.estimated_cost, res.source_site.cost + res.dest_site.cost + res.line.cost + res.depot.cost + res.train.cost);
   assert.ok(res.source_site.connect_at.x > res.source_site.x - 10 && res.dest_site.x > 40, 'one station at each end');
   assert.ok(res.line.tiles > 20);
+  assert.equal(res.dest_site.acceptance, 8);
 });
 
 test('build-cargo-route builds in order, buys and orders the train, starts it', async () => {
@@ -170,4 +171,7 @@ test('build-cargo-route stops at a failed step and reports what was built', asyn
     assert.equal(execs().slice(before).filter((e) => e.args.steps.some((st) => st[0] === 'demolish')).length, 0);
   } finally { fake.state.failOps = []; }
   await assert.rejects(run('build-cargo-route', { from_industry: 1, from_town: 'Bigton', to_industry: 2, cargo: 'wood' }), /exactly one of --from_industry, --from_town/);
+  const refused = await run('build-cargo-route', { from_industry: 2, to_town: 'Smallham', cargo: 'goods', dry_run: true });
+  assert.equal(refused.failed_step, 'dest_station');
+  assert.match(refused.error, /accepts Goods \(acceptance \d/);
 });

@@ -27,9 +27,11 @@ function dumpRows({ y0, y1, x0 = 0, x1 = FAKE_MAP - 1 }) {
 const FAKE_CARGOS = [{ id: 0, label: 'PASS', name: 'Passengers', passengers: true, mail: false, town_effect: 1 },
   { id: 5, label: 'GOOD', name: 'Goods', passengers: false, mail: false, town_effect: 3 },
   { id: 7, label: 'WOOD', name: 'Wood', passengers: false, mail: false, town_effect: 0 }];
-// Acceptance around a point: Bigton's centre (42,12) accepts passengers and goods, Smallham's (10,50) only passengers.
+// Acceptance around a point: Bigton's centre (42,12) accepts passengers and goods, Smallham's (10,50) only
+// passengers, the sawmill (50,20) wood. Station size is ignored.
 function fakeAcceptance([x, y], cargo, radius) {
-  const near = (cx, cy) => Math.max(Math.abs(x - cx), Math.abs(y - cy)) <= radius;
+  const near = (cx, cy, r = radius) => Math.max(Math.abs(x - cx), Math.abs(y - cy)) <= r;
+  if (cargo === 7) return y >= 15 && near(50, 20, radius + 6) ? 8 : 0;
   if (near(42, 12)) return { 0: 30, 5: 12 }[cargo] ?? 0;
   if (near(10, 50)) return { 0: 9, 5: 4 }[cargo] ?? 0;
   return 0;

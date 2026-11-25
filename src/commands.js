@@ -232,11 +232,23 @@ async function buildCargoRoute(s, company, a) {
   const dstSites = await stationSites(s, company, to, from, opts);
   if (!srcSites.sites.length) return fail('source_station', `no terminus site passed near ${srcSites.target}`, { hint_sites: srcSites.hint });
   if (!dstSites.sites.length) return fail('dest_station', `no terminus site passed near ${dstSites.target}`, { hint_sites: dstSites.hint });
+  // Destination sites must accept the cargo (AgentBridge v7; null = not checkable, kept with a note).
+  const accepts = new Map();
+  for (const d of dstSites.sites) {
+    const along = d.axis === 'y';
+    const lists = await acceptanceAt(s, [[d.x, d.y]], { w: along ? d.platforms : d.length, h: along ? d.length : d.platforms, radius: 4, cargos: [cargo] });
+    accepts.set(d, lists ? (lists[0][0]?.acceptance ?? 0) : null);
+  }
+  const accepting = dstSites.sites.filter((d) => accepts.get(d) === null || accepts.get(d) >= ACCEPTED);
+  if (!accepting.length) {
+    return fail('dest_station', `no terminus site near ${dstSites.target} accepts ${cargoInfo?.name ?? a.cargo} (acceptance ${[...accepts.values()].join(', ')}; ${ACCEPTED} needed)`);
+  }
   let src = null, dst = null;
-  for (const p of srcSites.sites) { const q = dstSites.sites.find((d) => !sitesOverlap(p, d)); if (q) { src = p; dst = q; break; } }
+  for (const p of srcSites.sites) { const q = accepting.find((d) => !sitesOverlap(p, d)); if (q) { src = p; dst = q; break; } }
   if (!src) return fail('dest_station', 'every source and destination site overlap: the two ends are too close for two termini');
   plan.source_site = { target: srcSites.target, ...src };
-  plan.dest_site = { target: dstSites.target, ...dst };
+  plan.dest_site = { target: dstSites.target, ...dst, acceptance: accepts.get(dst) };
+  if (accepts.get(dst) === null) plan.warning = `destination acceptance not checked: ${OLD_GS}`;
 
   // 2. Line between the anchors, planned on a view that already has both termini.
   const lineArgs = (map) => planPath(map, src.connect_at, dst.connect_at, { mode: 'rail', margin: a.margin, startDir: dirIndex(src.connect_at.dir),
