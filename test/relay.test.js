@@ -95,7 +95,7 @@ test('every command that changes the game or reads company data takes a company 
 });
 
 test('host-only commands are refused for players', async () => {
-  for (const [name, args] of [['launch', { mode: 'dedicated', admin_password: 'x' }], ['install-gamescript', {}], ['configure', { admin_password: 'x' }],
+  for (const [name, args] of [['launch', { mode: 'dedicated', admin_password: 'sent-by-player' }], ['install-gamescript', {}], ['configure', { admin_password: 'x' }],
     ['show-config', {}], ['relay-add-player', { name: 'eve', company: 0 }], ['relay-list-players', {}], ['rate', { max_builds_per_day: 1 }], ['rcon', { command: 'quit' }]]) {
     const r = await call(tokens.alice, name, args);
     assert.equal(r.status, 403, name);
@@ -149,6 +149,7 @@ test('audit log: who ran what, as which company, and refusals', () => {
   const text = fs.readFileSync(relayMod.AUDIT_FILE, 'utf8');
   for (const t of Object.values(tokens)) assert.ok(!text.includes(t));
   assert.ok(!text.includes('host-only-pw'));
+  assert.ok(!text.includes('sent-by-player'), 'secret-looking args are redacted');
 });
 
 test('player CLI: configure --relay/--token, then commands go through the relay (no admin password, no daemon)', async () => {

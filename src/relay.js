@@ -54,8 +54,13 @@ export function authorize(player, name, rawArgs = {}) {
   return args;
 }
 
+const SECRET_ARGS = ['admin_password', 'token', 'relay_token'];
+
 export function audit(entry) {
   try {
+    if (entry.args && SECRET_ARGS.some((k) => k in entry.args)) {
+      entry = { ...entry, args: Object.fromEntries(Object.entries(entry.args).map(([k, v]) => [k, SECRET_ARGS.includes(k) ? '***' : v])) };
+    }
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
     fs.appendFileSync(AUDIT_FILE, JSON.stringify({ t: new Date().toISOString(), ...entry }) + '\n', { mode: 0o600 });
   } catch (e) { log.warn('relay', 'audit write failed', { error: e.message }); }
