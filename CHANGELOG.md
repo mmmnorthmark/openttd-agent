@@ -4,7 +4,8 @@ Semver. The GameScript has its own integer version (`GetVersion()` in info.nut);
 re-run `install-gamescript` when it changes.
 
 ## 0.2.0 (unreleased)
-Per-player access replaces the shared admin password. No GameScript change (still v5).
+Per-player access replaces the shared admin password. BaNaNaS scenarios, goals and turn-based
+play. GameScript v6: the host re-runs `install-gamescript`.
 
 - `openttd-agent relay` (host): the only admin-port client. Players send commands to it over HTTP
   with their own token; it forces every command to the company the host bound that player to,
@@ -19,6 +20,18 @@ Per-player access replaces the shared admin password. No GameScript change (stil
 - `launch` generates and saves a random admin password when none is configured, and reports
   whether the admin port is reachable from the LAN (OpenTTD binds it like the game port).
 - New config keys: `relay`, `relay_token`, `relay_port` (default 47978).
+- `scenario-prepare` (host): downloads a scenario from BaNaNaS into the running server and writes
+  `<name>_agent.sav`, a copy that runs AgentBridge (a scenario loaded as-is runs only the
+  GameScript saved in it). `--load true` switches the server to it.
+- `launch --load <save name>` finds saves in the profile's save folder. Launch profiles now write
+  uncompressed saves (`savegame_format = none`; larger files and map downloads) and allow all
+  actions while paused (`command_pause_level = 3`) for new games.
+- Goals (AgentBridge v6): `goal-set` / `goal-clear` (host) and `goal-status` (players, own company).
+  Per company: cargo delivery targets and/or a company value by the end of a year; shown in the
+  goal window, saved with the game, `goal_done` / `goal_failed` events.
+- Turn-based play (host): `pause`, `unpause`, `turn-advance --days N` (run N game days, pause
+  again, return the date and events).
+- A daemon or relay now reconnects by itself after the host loads another game.
 
 Migrating from 0.1.0: the host stops sharing the admin password (change it), runs `relay`, and
 registers players; players replace `configure --host/--admin_password/--company` with

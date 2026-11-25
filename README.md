@@ -64,7 +64,8 @@ What a player's token can do:
 - Read the world (towns, industries, map, all companies' figures) and run every analysis command.
 - Build and operate **only as the company the host bound it to**. `--company <other>` is refused;
   leaving it out always means "my company".
-- Not: `rate` changes, `launch`, `install-gamescript`, anything on the host's config, or raw console access.
+- Not: `rate` changes, `launch`, `install-gamescript`, `scenario-prepare`, setting goals, pausing or
+  advancing turns, anything on the host's config, or raw console access.
 - Chat sent through the relay is prefixed with the player's name.
 
 The host sees who did what in `~/.openttd-agent/relay-audit.jsonl` (one JSON line per command or
@@ -86,9 +87,10 @@ Security notes, so nobody is surprised:
 
 | Group | Commands |
 |---|---|
-| setup | `doctor`, `install-gamescript`, `configure`, `show-config`, `launch` |
+| setup | `doctor`, `install-gamescript`, `configure`, `show-config`, `launch`, `scenario-prepare` (host) |
 | relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player` |
-| game | `status`, `companies`, `chat`, `rate` |
+| game | `status`, `companies`, `chat`, `rate`, `goal-status` |
+| host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance` |
 | world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
 | operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
 | operate: change | `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot`, `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace` |
@@ -144,6 +146,64 @@ console.log(await game.run('companies'));
 game.close();
 ```
 
+## Playing a BaNaNaS scenario
+
+BaNaNaS is OpenTTD's own content service (the in-game "Check Online Content"). A scenario loaded
+as it comes would not start AgentBridge: a loaded game runs only the GameScript saved inside it.
+`scenario-prepare` (host) downloads the scenario into the running server and writes a copy that does:
+
+```sh
+openttd-agent launch --mode dedicated                      # any game with AgentBridge running
+openttd-agent scenario-prepare --search "empire builder"   # several matches: the error lists ids and names
+openttd-agent scenario-prepare --content_id 15847807 --load true
+```
+
+- Result: `<save folder>/<name>_agent.sav`, plus how to load it. `--load true` leaves the server
+  running it; without it, the game that was running is restored.
+- Later: `openttd-agent launch --load <name>_agent` starts a server straight from that save.
+- Do it before players join: the server loads the scenario for a moment, which drops clients.
+- The copy differs from the scenario in three things only: the GameScript is AgentBridge (a goal
+  script the scenario had will not run; set goals with `goal-set`), GameScript opcodes per tick
+  are 100000, and everything may be done while paused (for turn-based play).
+- Needs a server started by `launch` 0.2.0 or later (it writes uncompressed saves, which
+  `scenario-prepare` reads and rewrites).
+
+## Goals
+
+A game runs one GameScript, so AgentBridge keeps the goals itself. The host sets one goal per company:
+
+```sh
+openttd-agent cargos                                        # the cargo labels of this game
+openttd-agent goal-set --company 0 --deadline_year 1954 --targets COAL:3000,PASS:3000,GOOD:500
+openttd-agent goal-status                                   # players: their own company's goal
+openttd-agent goal-clear --company 0
+```
+
+- A cargo target counts what the company **delivers from now on**, anywhere on the map.
+  `VALUE:500000` is a company value to reach instead.
+- The goal shows in the game's goal window with progress, refreshed monthly and on every `goal-status`.
+- `done` once every target was reached (a reached target stays reached); `failed` when the deadline
+  year ends first. Both arrive as events (`goal_done`, `goal_failed`) in `events` and `turn-advance`.
+- Goals are saved with the game. Setting a goal again replaces it and restarts the count.
+
+## Turn-based play
+
+For a brain that needs time to think: keep the game paused while it plans and builds, then let
+time pass in chunks. Host commands:
+
+```sh
+openttd-agent pause                    # -> { paused, date, while_paused: "everything" }
+openttd-agent turn-advance --days 30   # unpause, wait 30 game days (~60 s), pause; returns date + events
+openttd-agent unpause
+```
+
+- A turn loop is: `goal-status`, look, build (the game is paused), `turn-advance`, repeat.
+- Building while paused needs `construction.command_pause_level = 3`. `launch` sets it for new
+  games and `scenario-prepare` for prepared scenarios; it cannot be changed in a running
+  multiplayer game. `pause` reports what the running game allows.
+- Multiplayer has no fast-forward: a game day takes about 2 s, a year about 12 minutes.
+- Everyone in the game is paused. Human players can still look around, and build if the level allows.
+
 ## Building
 
 - **Dry run first.** `--dry_run true` returns the cost and, per step, whether the game would
@@ -194,4 +254,4 @@ host's agent ──CLI/MCP──▶ openttd-agent ──────────
 npm install && npm test     # unit tests + a fake admin server end-to-end test
 ```
 
-Config lives in `~/.openttd-agent/` (`config.json`, launch `profiles/`, and on the host `relay-players.json`, `relay-audit.jsonl`). Your own `openttd.cfg` is never modified.
+Config lives in `~/.openttd-agent/` (`config.json`, launch `profiles/` with the server's saves and downloaded content, and on the host `relay-players.json`, `relay-audit.jsonl`). Your own `openttd.cfg` is never modified.

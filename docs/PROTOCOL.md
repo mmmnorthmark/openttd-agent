@@ -18,8 +18,9 @@ Policy, applied before anything reaches the game (`authorize` in `src/relay.js`)
 
 1. Token -> player. Tokens are 32 random bytes (base64url); the host stores only the SHA-256.
    The player file is re-read on every request, so add/remove/re-bind apply at once.
-2. Only commands in groups `game`, `world`, `build`, `operate` are served. `setup` and `relay`
-   commands (launch, install-gamescript, configure, player management) are host-only, and there is
+2. Only commands in groups `game`, `world`, `build`, `operate` are served. `setup`, `relay` and
+   `host` commands (launch, install-gamescript, configure, scenario-prepare, player management,
+   goal-set/goal-clear, pause/unpause/turn-advance) are host-only, and there is
    no raw rcon/console command. `rate` with arguments (a change) is host-only.
 3. If the command has a `company` argument it is **set to the player's company**. A request that
    names another company is refused, as is any such command from a player still `pending`.
@@ -66,7 +67,8 @@ Rules:
 GS commands: `ping`, `info`, `echo`, `companies`, `cargos`, `towns`, `industries`,
 `industry_types`, `dump_tiles`, `get_rate`, `set_rate`, `airport_types`, `check_airport`,
 `test_build_road`, `build_road`, `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`,
-`autorenew`, `events`, `exec`, `rail_types`, `bridge_types`. Row formats are documented in `gamescript/AgentBridge/main.nut`.
+`autorenew`, `events`, `exec`, `rail_types`, `bridge_types`, `goal_set`, `goal_status`, `goal_clear`.
+Row formats are documented in `gamescript/AgentBridge/main.nut`.
 
 ## exec
 
@@ -92,4 +94,50 @@ The GS records game events in a ring buffer (last 300), each `{seq, date, type, 
 A GameScript receives: vehicle crashed, subsidy offer/awarded/expired, company new/in trouble/
 bankrupt/merger, industry open/close, station first vehicle, town founded, exclusive transport
 rights, road reconstruction. Vehicle lost/unprofitable, engine available and merger offers are
-AI-only events in 15.x and never reach a GameScript.
+AI-only events in 15.x and never reach a GameScript. AgentBridge adds its own `goal_done` and
+`goal_failed` (`{company, deadline_year}`). The buffer is not saved: it restarts on load.
+
+## goals
+
+One goal per company, kept by AgentBridge (a game runs a single GameScript, so a goal script
+cannot run next to it) and saved with the game (GS `Save`/`Load`).
+
+- `goal_set {company, deadline_year, targets: [["COAL", 3000], ["VALUE", 500000]]}`: cargo labels
+  as `cargos` reports them; `VALUE` = company value. Replaces the company's goal. Creates one
+  `GSGoal` entry per target (company goal window). Reply: `[goal]`.
+- `goal_status {company?}` -> `[goal, ...]`, progress read fresh:
+  `{company, status: "active"|"done"|"failed", deadline_year, days_left, set_date, targets: [[label, amount, progress, done], ...]}`.
+- `goal_clear {company}` -> `{removed}`.
+- Cargo progress = deliveries by the company since `goal_set`, read from `GSCargoMonitor` town
+  delivery monitors summed over all towns. In 15.3 every delivery, also one to an industry, is
+  counted for the town the receiving station belongs to (`cargomonitor.cpp AddCargoDelivery`), so
+  that sum counts each delivery once; industry monitors are not used (they would double count).
+- Updated on the first tick of each game month and on every `goal_set`/`goal_status`. A target
+  that was reached stays `done`. All done -> `done`; deadline year over first -> `failed`.
+
+# Console (rcon) use by host commands
+
+Host-only commands use the server console over the admin connection; nothing here is reachable
+through the relay.
+
+- `pause` / `unpause` / `turn-advance`: console `pause` / `unpause`, then poll GS `info`
+  (`paused`, `date`). `setting command_pause_level` is read to report what is allowed while paused.
+- `scenario-prepare` (own admin connection, `src/scenario.js`): `pwd` (save folder), `content update scenario`,
+  `content state` (rows `id, type, state, name, unique id, md5`), `content select <id>`,
+  `content download`, `list_scenarios`, `load_scenario <n>`, `save <name>`, `ls`, `load <name>`.
+  A load is complete when the server sends a second `SERVER_WELCOME`. `save` returns before the
+  file is complete (saving is threaded): the file is polled until it parses to its end marker.
+
+# Savegame editing (scenario-prepare)
+
+`src/savegame.js`, uncompressed saves only (`[misc] savegame_format = none`, tag `OTTN`):
+4-byte tag, 4-byte version, chunks (`id` + mode byte; RIFF = 24/28-bit length + payload; array and
+table types = gamma-length elements until a zero), 4 zero bytes.
+
+- `GSDT` (GameScript name, settings, version, saved data) is copied from a save of a game running
+  AgentBridge. 15.3 `saveload/game_sl.cpp` starts whatever `GSDT` names; nothing else decides it.
+- `PATS` (game settings; a table whose header lists `type, name` per field) gets two integers set in
+  place: `script.script_max_opcode_till_suspend` (new-game-only setting) and
+  `construction.command_pause_level` (flagged not changeable in network games).
+- AgentBridge drops saved goals that do not belong to the loaded map (other map stamp, or their
+  `GSGoal` entries are missing), since the copied `GSDT` carries the donor game's script data.
