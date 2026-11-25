@@ -175,3 +175,16 @@ test('build-cargo-route stops at a failed step and reports what was built', asyn
   assert.equal(refused.failed_step, 'dest_station');
   assert.match(refused.error, /accepts Goods \(acceptance \d/);
 });
+
+test('find-cargo-pairs pairs passengers town with town; names feed build-cargo-route', async () => {
+  const res = await run('find-cargo-pairs', { cargo: 'passengers', with_effort: false });
+  assert.equal(res.total_candidates, 2);
+  const [p] = res.pairs;
+  assert.deepEqual(p.source, { kind: 'town', id: 1, name: 'Bigton', x: 42, y: 12, population: 5000 });
+  assert.deepEqual(p.dest, { kind: 'town', id: 2, name: 'Smallham', x: 10, y: 50, population: 300, acceptance: 9 });
+  assert.deepEqual([p.cargo, p.source_last_month, p.source_transported_pct, p.distance], ['Passengers', 800, 10, 70]);
+  assert.equal((await run('find-cargo-pairs', { cargo: 'passengers', dest_kind: 'industry', with_effort: false })).total_candidates, 0);
+  assert.equal((await run('find-cargo-pairs', { cargo: 'passengers', limit: 1, with_effort: false })).pairs.length, 1);
+  const withEffort = await run('find-cargo-pairs', { cargo: 'passengers', limit: 1 });
+  assert.equal(typeof withEffort.pairs[0].route.reachable, 'boolean');
+});

@@ -638,7 +638,7 @@ export const COMMANDS = [
   },
   {
     name: 'find-cargo-pairs', group: 'world', session: true,
-    description: `Opportunity finder: under-served producers of a cargo paired with destinations min_distance..max_distance tiles away: industries that accept it, and towns whose centre area accepts it (acceptance >= ${ACCEPTED} within radius 4; goods, passengers, mail, food...). Ranked by terrain effort of the route (water, hills, towns, existing track). Each dest has kind industry|town. Secondary producers (sawmill, factory, refinery...) are marked secondary: true; they show last_month 0 until supplied. Example: cargo=goods, dest_kind=town, min_distance=20.`,
+    description: `Opportunity finder: under-served producers of a cargo paired with destinations min_distance..max_distance tiles away: industries that accept it, and towns whose centre area accepts it (acceptance >= ${ACCEPTED} within radius 4; goods, passengers, mail, food...). Ranked by terrain effort of the route (water, hills, towns, existing track). Each dest has kind industry|town. Passengers and mail pair town with town (source kind town, source_last_month = the town's last-month production); feed both names to build-cargo-route --from_town --to_town. Secondary producers (sawmill, factory, refinery...) are marked secondary: true; they show last_month 0 until supplied. Example: cargo=goods, dest_kind=town, min_distance=20.`,
     args: z.object({
       cargo: z.string().optional(), source_type: z.string().optional(), dest_type: z.string().optional().describe("industry type name, or 'town' / a town name"),
       dest_kind: z.enum(['any', 'industry', 'town']).default('any'),
@@ -655,7 +655,7 @@ export const COMMANDS = [
         townAcceptance = lists && new Map(towns.map((t, i) => [t.id, Object.fromEntries(lists[i].map((c) => [c.cargo, c.acceptance]))]));
       }
       const townCargoFallback = new Set([...s.cargos.values()].filter((c) => c.town_effect > 0).map((c) => c.id));
-      return findCargoPairs({ industries, types: s.types, towns, townAcceptance, townCargoFallback, map: s.map, cargo: a.cargo, sourceType: a.source_type,
+      return findCargoPairs({ industries, types: s.types, towns, cargos: s.cargos, townAcceptance, townCargoFallback, map: s.map, cargo: a.cargo, sourceType: a.source_type,
         destType: a.dest_type, destKind: a.dest_kind, minDist: a.min_distance, maxDist: a.max_distance, maxTransportedPct: a.max_transported_pct,
         minProduction: a.min_production, limit: a.limit, withEffort: a.with_effort });
     },
