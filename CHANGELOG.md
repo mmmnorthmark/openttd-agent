@@ -32,6 +32,12 @@ play. GameScript v6: the host re-runs `install-gamescript`.
 - Turn-based play (host): `pause`, `unpause`, `turn-advance --days N` (run N game days, pause
   again, return the date and events).
 - A daemon or relay now reconnects by itself after the host loads another game.
+- `station-sites`: dry-run-checked rail terminus spots next to an industry, town or tile, facing
+  the other end of the planned line, each with a ready `build-terminus` line and `connect_at`.
+- `build-line-depot --station <id>`: finds a straight piece of your line near a station, builds a
+  rail depot beside it and joins it both ways in one call.
+- Unknown flags are refused (nothing runs) instead of ignored; `<command> --help` prints one
+  command's arguments.
 
 Migrating from 0.1.0: the host stops sharing the admin password (change it), runs `relay`, and
 registers players; players replace `configure --host/--admin_password/--company` with
