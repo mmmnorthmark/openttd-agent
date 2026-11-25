@@ -6,6 +6,7 @@
 //   openttd-agent batch < calls.jsonl        one {"name","args"} per line -> one JSON result per line
 //   openttd-agent mcp                        run as an MCP server (stdio)
 //   openttd-agent daemon | daemon-stop       local background connection (auto-started)
+//   openttd-agent relay [--port N] [--bind A] host: serve registered players over the LAN (foreground)
 // Exit code 0 on success, 1 on error (error JSON on stdout: {"error": "..."}).
 
 import readline from 'node:readline';
@@ -35,7 +36,8 @@ function parseFlags(argv) {
 async function execute(name, args, noDaemon) {
   const cmd = COMMANDS_BY_NAME.get(name);
   if (!cmd) throw new Error(`unknown command '${name}'. Run: openttd-agent help`);
-  if (!cmd.session || noDaemon) {
+  // With a relay configured the host's relay is the long-lived process; no local daemon needed.
+  if (!cmd.session || noDaemon || loadConfig().relay) {
     const ctx = makeContext();
     try { return await runCommand(ctx, name, args); } finally { ctx.close(); }
   }
@@ -57,7 +59,7 @@ function printHelp() {
     }
     lines.push('');
   }
-  lines.push('Other: commands (JSON schemas), batch (JSONL on stdin), mcp, daemon, daemon-stop, version');
+  lines.push('Other: commands (JSON schemas), batch (JSONL on stdin), mcp, daemon, daemon-stop, relay [--port N --bind ADDR] (host), version');
   process.stdout.write(lines.join('\n') + '\n');
 }
 
@@ -68,6 +70,12 @@ async function main() {
   if (name === 'commands') return console.log(JSON.stringify(describeCommands(), null, 2));
   if (name === 'mcp') { const { startMcp } = await import('../src/mcp.js'); return startMcp(); }
   if (name === 'daemon') return void startDaemon();
+  if (name === 'relay') {
+    const { args } = parseFlags(rest);
+    const { startRelay } = await import('../src/relay.js');
+    await startRelay({ ...(args.port ? { port: Number(args.port) } : {}), ...(args.bind ? { bind: args.bind } : {}) });
+    return;
+  }
   if (name === 'daemon-stop') return console.log(JSON.stringify(await stopDaemon(loadConfig().daemon_port)));
   if (name === 'batch') {
     const rl = readline.createInterface({ input: process.stdin });

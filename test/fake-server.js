@@ -90,6 +90,7 @@ const GS = {
 
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
+  const chats = []; // messages sent with ADMIN_CHAT
   const server = net.createServer((sock) => {
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));
@@ -122,6 +123,8 @@ export function startFakeServer({ password = 'pw' } = {}) {
           } else {
             send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: true, part: 0, last: true, data })));
           }
+        } else if (type === PKT.ADMIN_CHAT) {
+          chats.push(body.subarray(6, body.length - 1).toString('utf8'));
         } else if (type === PKT.ADMIN_RCON) {
           send(PKT.SERVER_RCON, Buffer.concat([Buffer.from([1, 0]), cstr(`ran: ${r.str()}`)]));
           send(PKT.SERVER_RCON_END, cstr('x'));
@@ -130,5 +133,5 @@ export function startFakeServer({ password = 'pw' } = {}) {
     });
     sock.on('error', () => {});
   });
-  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, received })));
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, received, chats })));
 }

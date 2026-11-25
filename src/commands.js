@@ -4,9 +4,12 @@
 // Command shape: { name, group, description, session: bool, args: zod object, run(ctx, args) }
 // ctx: { cfg, session() -> Promise<Session> } — session() connects lazily.
 
+import os from 'node:os';
 import * as z from 'zod/v4';
 import { doctor, installGamescript, launch, TERRAIN_TYPES } from './setup.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
+import { callRelay } from './relay-client.js';
+import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
@@ -21,6 +24,8 @@ const ids = () => z.preprocess((v) => (Array.isArray(v) ? v : String(v).split(',
 const who = { company: int().optional().describe('company id; default: your configured company') };
 const act = { ...who, dry_run: bool().default(false).describe('true = cost/feasibility only, changes nothing') };
 const lc = (v) => String(v).toLowerCase();
+/** Non-loopback IPv4 addresses of this machine (what players put in their relay URL). */
+const lanAddresses = () => Object.values(os.networkInterfaces()).flat().filter((i) => i && i.family === 'IPv4' && !i.internal).map((i) => i.address);
 
 /** Session + company for read commands. */
 async function mine(ctx, a) {
@@ -89,12 +94,24 @@ export const COMMANDS = [
   },
   {
     name: 'configure', group: 'setup', session: false,
-    description: `Save connection settings to ${CONFIG_FILE}: host (LAN IP of the game host), admin_port, admin_password, company (your company id), max_builds_per_minute (0 = unlimited).`,
+    description: `Save settings to ${CONFIG_FILE}. PLAYER: relay (http://<host-LAN-IP>:<port>) and token, both from the host; game commands then go through the host's relay as the company the host bound you to. HOST: admin_password (stays on this machine), admin_port, relay_port. Either: max_builds_per_minute (0 = unlimited). relay "" switches back to the admin port directly.`,
     args: z.object({
-      host: z.string().optional(), admin_port: int().optional(), admin_password: z.string().optional(),
-      company: int().optional(), max_builds_per_minute: int().min(0).optional(), tile_refresh_rows_per_sec: int().min(0).optional(),
+      relay: z.string().optional().describe('player: relay URL, e.g. http://192.168.1.20:47978 ("" = off)'),
+      token: z.string().optional().describe('player: token from the host (relay-add-player)'),
+      host: z.string().optional(), admin_port: int().optional(), admin_password: z.string().optional().describe('host only'),
+      relay_port: int().min(1).max(65535).optional().describe('host: port the relay listens on'),
+      company: int().optional().describe('direct mode only; with a relay the host decides your company'),
+      max_builds_per_minute: int().min(0).optional(), tile_refresh_rows_per_sec: int().min(0).optional(),
     }),
-    run: (_ctx, a) => redacted(saveConfig(a)),
+    run: (_ctx, { token, ...a }) => {
+      if (a.relay) {
+        let url;
+        try { url = new URL(a.relay); } catch { throw new Error(`relay must be a URL like http://192.168.1.20:47978, got '${a.relay}'`); }
+        if (url.protocol !== 'http:') throw new Error('relay must be an http:// URL (the relay speaks plain HTTP on the LAN)');
+        a.relay = url.origin;
+      }
+      return redacted(saveConfig({ ...a, ...(token !== undefined ? { relay_token: token } : {}) }));
+    },
   },
   {
     name: 'show-config', group: 'setup', session: false,
@@ -122,6 +139,42 @@ export const COMMANDS = [
       seed: a.seed, mapBits: a.map_bits, load: a.load, commandDelayTicks: a.command_delay_ticks,
       maxBuildsPerDay: a.max_builds_per_day, scriptOpcodes: a.script_opcodes, terrain: a.terrain, bind: a.bind, adminPort: ctx.cfg.admin_port, dryRun: a.dry_run,
     }),
+  },
+
+  // ---- relay (host only: who may play which company) ---------------------------
+  {
+    name: 'relay-add-player', group: 'relay', session: false,
+    description: `HOST ONLY: register a player for the relay and print their token ONCE (only a hash is kept, in ${PLAYERS_FILE}). company = a company id, or 'pending' to bind later with relay-set-company. Give the player the printed configure line.`,
+    args: z.object({
+      name: z.string().describe('player name, 1-32 of A-Z a-z 0-9 _ . -'),
+      company: z.string().default('pending').describe("company id (see companies) or 'pending'"),
+      max_builds_per_minute: int().min(0).optional().describe("this player's build limit on the relay (0 = unlimited; default: the host's configured max_builds_per_minute)"),
+    }),
+    run: (ctx, a) => {
+      const p = addPlayer({ name: a.name, company: a.company, maxBuildsPerMinute: a.max_builds_per_minute });
+      const urls = lanAddresses().map((ip) => `http://${ip}:${ctx.cfg.relay_port}`);
+      return { ...p, relay_urls: urls,
+        give_to_player: `openttd-agent configure --relay ${urls[0] ?? `http://<host-LAN-IP>:${ctx.cfg.relay_port}`} --token ${p.token}`,
+        note: 'The token is shown only now. It is sent in clear text over the LAN (plain HTTP).' };
+    },
+  },
+  {
+    name: 'relay-list-players', group: 'relay', session: false,
+    description: 'HOST ONLY: registered relay players and the company each is bound to (no tokens).',
+    args: z.object({}),
+    run: () => listPlayers(),
+  },
+  {
+    name: 'relay-set-company', group: 'relay', session: false,
+    description: "HOST ONLY: bind a registered player to a company (or 'pending' to unbind), and/or change their build limit. Applies to their next request; the relay need not restart.",
+    args: z.object({ name: z.string(), company: z.string().optional().describe("company id or 'pending'"), max_builds_per_minute: int().min(0).optional() }),
+    run: (_ctx, a) => updatePlayer(a.name, { company: a.company, maxBuildsPerMinute: a.max_builds_per_minute }),
+  },
+  {
+    name: 'relay-remove-player', group: 'relay', session: false,
+    description: 'HOST ONLY: remove a player; their token stops working at once.',
+    args: z.object({ name: z.string() }),
+    run: (_ctx, a) => removePlayer(a.name),
   },
 
   // ---- game -------------------------------------------------------------------
@@ -701,6 +754,8 @@ export async function runCommand(ctx, name, rawArgs = {}) {
   if (!cmd) throw new Error(`unknown command '${name}'. Run: openttd-agent help`);
   const parsed = cmd.args.safeParse(rawArgs);
   if (!parsed.success) throw new Error(`bad arguments for ${name}: ${z.prettifyError(parsed.error)}`);
+  // Player with a relay configured: the host's relay runs every game command (it holds the admin connection and the map mirror).
+  if (cmd.session && ctx.cfg.relay) return callRelay(ctx.cfg, name, rawArgs);
   return cmd.run(ctx, parsed.data);
 }
 
