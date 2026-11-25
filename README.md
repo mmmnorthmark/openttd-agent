@@ -91,10 +91,10 @@ Security notes, so nobody is surprised:
 | relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player` |
 | game | `status`, `companies`, `chat`, `rate`, `goal-status` |
 | host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance` |
-| world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
+| world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns), `acceptance`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
 | operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
 | operate: change | `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot`, `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace` |
-| build: rail | `rail-types`, `build-rail` (planned path), `build-track` (one piece, for junctions and depot spurs), `build-rail-station`, `build-rail-depot`, `build-signal`, `build-terminus`, `build-passing-loop` |
+| build: rail | `build-cargo-route` (stations, line, depot, train, orders in one call), `station-sites`, `build-line-depot`, `rail-types`, `build-rail` (planned path), `build-track` (one piece, for junctions and depot spurs), `build-rail-station`, `build-rail-depot`, `build-signal`, `build-terminus`, `build-passing-loop` |
 | build: road | `build-road-path` (planned path), `build-road-station`, `build-road-depot`, `build-road` / `test-build-road` (straight) |
 | build: other | `bridge-types`, `build-bridge`, `build-tunnel`, `terraform`, `demolish`, `build-dock`, `build-buoy`, `build-water-depot`, `build-airport` |
 
@@ -107,6 +107,13 @@ Examples:
 # Unexploited forests 100-200 tiles from a sawmill, easiest terrain first
 openttd-agent find-cargo-pairs --cargo wood --source_type forest --dest_type sawmill \
   --min_distance 100 --max_distance 200 --max_transported_pct 20
+
+# Goods from a factory to towns that accept them
+openttd-agent find-cargo-pairs --cargo goods --dest_kind town
+
+# A whole rail route in one call: check and price it first, then build it
+openttd-agent build-cargo-route --from_industry 6 --to_industry 9 --cargo "iron ore" --dry_run true
+openttd-agent build-cargo-route --from_industry 6 --to_industry 9 --cargo "iron ore"
 
 # Towns with the most untransported passengers
 openttd-agent town-gaps --min_population 1000

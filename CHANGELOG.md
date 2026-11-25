@@ -5,7 +5,8 @@ re-run `install-gamescript` when it changes.
 
 ## 0.2.0 (unreleased)
 Per-player access replaces the shared admin password. BaNaNaS scenarios, goals and turn-based
-play. GameScript v6: the host re-runs `install-gamescript`.
+play. GameScript v7: the host re-runs `install-gamescript` (a running game picks it up when it is
+loaded again).
 
 - `openttd-agent relay` (host): the only admin-port client. Players send commands to it over HTTP
   with their own token; it forces every command to the company the host bound that player to,
@@ -38,6 +39,20 @@ play. GameScript v6: the host re-runs `install-gamescript`.
   rail depot beside it and joins it both ways in one call.
 - Unknown flags are refused (nothing runs) instead of ignored; `<command> --help` prints one
   command's arguments.
+- `build-cargo-route`: a whole rail route in one call: a terminus at each end facing the other,
+  the line between them, a depot beside it, one train (cheapest-to-run locomotive that can pull
+  the cargo, wagons that carry it, filling the platform), orders (full load at the source, unload
+  and leave empty at the destination; plain both ways for passengers/mail between towns) and
+  start. `--dry_run true` checks every placement and the line and returns `estimated_cost`. A
+  failure stops at that step and lists what was built (station ids, tiles, vehicle); nothing is
+  demolished. Default rail type: the one with the cheapest track.
+- `find-cargo-pairs` also pairs sources with towns: goods, passengers, mail, food... go to towns
+  whose centre accepts them (acceptance >= 8, reported per pair). `--dest_kind any|industry|town`.
+  Secondary (processing) industries are marked `secondary: true` in `industries` and
+  `find-cargo-pairs` and are kept by `--min_production` (they show last_month 0 until supplied).
+- `acceptance --x --y [--radius 4] [--width --height] [--cargo]`: per-cargo acceptance of a
+  station spot (AgentBridge v7, `GSTile.GetCargoAcceptance`). With an older AgentBridge,
+  `find-cargo-pairs` lists towns unchecked (acceptance null) with a note.
 
 Migrating from 0.1.0: the host stops sharing the admin password (change it), runs `relay`, and
 registers players; players replace `configure --host/--admin_password/--company` with
