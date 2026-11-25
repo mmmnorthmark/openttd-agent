@@ -19,11 +19,11 @@ Rules:
 GS commands: `ping`, `info`, `echo`, `companies`, `cargos`, `towns`, `industries`,
 `industry_types`, `dump_tiles`, `get_rate`, `set_rate`, `airport_types`, `check_airport`,
 `test_build_road`, `build_road`, `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`,
-`autorenew`, `events`, `exec`. Row formats are documented in `gamescript/AgentBridge/main.nut`.
+`autorenew`, `events`, `exec`, `rail_types`, `bridge_types`. Row formats are documented in `gamescript/AgentBridge/main.nut`.
 
 ## exec
 
-Every state change (vehicles, orders, groups and, from GS v4, construction) is one **step** in an
+Every state change (vehicles, orders, groups, construction) is one **step** in an
 `exec` request, so dry runs, the rate gate and error reporting work the same for all of them:
 
 `{"cmd": "exec", "args": {"company": 0, "dry_run": false, "keep_going": false, "steps": [["veh_buy", 13, 22, 27, 7, 11], ...]}}`
@@ -33,6 +33,9 @@ Every state change (vehicles, orders, groups and, from GS v4, construction) is o
 - `dry_run` runs the steps under `GSTestMode` (cost and feasibility, nothing changes, no rate gate).
 - Without `keep_going` the first failed step stops the request (`stopped` says why); a rate-limit
   refusal also sets `stopped`.
+- Optional `rail_type` / `road_type` select the track type for the whole request.
+- `rail` and `road` steps count "already built" as success, so a plan can be re-run.
+- `demolish` checks every tile of its rectangle first and refuses all of it if one is protected.
 - Step formats are listed in `ExecStep` in main.nut. The client keeps a request under ~7 kB and 150 steps.
 
 ## events

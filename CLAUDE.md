@@ -13,3 +13,5 @@ Research and design history: ~/code-local/openttd-agent-research/FINDINGS.md.
 - Row decoders for operate data live in `src/operate.js` (pure, unit-tested).
 - Not exposed to GameScripts in 15.3 (don't promise them): vehicle breakdown count, service interval, vehicle-lost/unprofitable/engine-available events, production-change events.
 - The GS has not been compiled by OpenTTD yet if `status` has never run against a real game: there is no Squirrel compiler on this machine, so a syntax slip in main.nut only shows in `openttd.log` (`-d script=3`).
+- Path planning and build templates are pure functions in `src/planner.js` (`planPath`, `railSteps`, `roadSteps`, `terminusSteps`, `passingLoopSteps`); test them on synthetic maps in `test/planner.test.js`.
+- Rail `build-rail` anchors get no track; signals face trains coming from `front`. Both conventions are from the 15.3 API source and still need a real-game check.

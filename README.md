@@ -60,7 +60,9 @@ openttd-agent status
 | world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
 | operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
 | operate: change | `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot`, `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace` |
-| build (your company) | `test-build-road`, `build-road` |
+| build: rail | `rail-types`, `build-rail` (planned path), `build-rail-station`, `build-rail-depot`, `build-signal`, `build-terminus`, `build-passing-loop` |
+| build: road | `build-road-path` (planned path), `build-road-station`, `build-road-depot`, `build-road` / `test-build-road` (straight) |
+| build: other | `bridge-types`, `build-bridge`, `build-tunnel`, `terraform`, `demolish`, `build-dock`, `build-buoy`, `build-water-depot`, `build-airport` |
 
 Every command that changes the game takes `--dry_run true` (cost and feasibility only) and
 `--company <id>` (default: your configured company).
@@ -91,6 +93,12 @@ openttd-agent order-add --vehicle 11 --station 3 --flags full_load_any,non_stop
 openttd-agent order-add --vehicle 11 --station 4 --flags unload,non_stop
 openttd-agent vehicle-start --vehicles 11
 
+# Build a wood line: terminus at the forest, line to the sawmill, depot, then the train
+openttd-agent build-terminus --x 12 --y 20 --platforms 2 --length 5 --dry_run true   # cost first
+openttd-agent build-terminus --x 12 --y 20 --platforms 2 --length 5                  # -> connect_at {x,y,dir}
+openttd-agent build-rail --x1 19 --y1 20 --start_dir sw --x2 140 --y2 61 --dry_run true
+openttd-agent build-rail --x1 19 --y1 20 --start_dir sw --x2 140 --y2 61
+
 # Chain many calls in one process
 printf '%s\n' '{"name":"status"}' '{"name":"town-gaps"}' | openttd-agent batch
 ```
@@ -103,6 +111,20 @@ const game = await connect();
 console.log(await game.run('companies'));
 game.close();
 ```
+
+## Building
+
+- **Dry run first.** `--dry_run true` returns the cost and, per step, whether the game would
+  accept it. Nothing is built and no rate limit is used.
+- **Paths are planned on your machine** from the map mirror (flat and straight preferred; houses,
+  industries and stations avoided; roads crossed on the level; water, rail and roads bridged), then
+  built piece by piece. `build-rail` lays track strictly *between* its two anchor tiles (a station
+  end, the tile in front of a depot, existing track); `build-road-path` includes both ends.
+- **A failed step stops the build** and says why; what was built stays. Fix the spot (`terraform`,
+  `demolish`, other anchors) and run the same command again: existing pieces are skipped.
+- **`demolish` is guarded** in the GameScript: never another company's property, industries or town
+  roads, and town buildings only with `--allow_houses true`.
+- The planner's slope rules are simpler than the game's; on hilly ground expect to iterate.
 
 ## Rate limiting
 
