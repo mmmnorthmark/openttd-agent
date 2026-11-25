@@ -564,6 +564,12 @@ export const COMMANDS = [
     run: (ctx, a) => run(ctx, a, [['rail_depot', a.x, a.y, a.front_x, a.front_y]], { railType: a.rail_type }),
   },
   {
+    name: 'build-track', group: 'build', session: true,
+    description: 'Lay (or with remove=true, remove) one rail piece on tile x,y joining its neighbour from_x,from_y to its neighbour to_x,to_y. Existing track on the tile is kept, so this makes junctions: e.g. connect a depot or a branch onto an existing line. Neighbours may be straight across (straight piece) or at right angles (curve).',
+    args: z.object({ ...act, ...point, from_x: int(), from_y: int(), to_x: int(), to_y: int(), remove: bool().default(false), rail_type: int().optional() }),
+    run: (ctx, a) => run(ctx, a, [[a.remove ? 'rail_remove' : 'rail', a.from_x, a.from_y, a.x, a.y, a.to_x, a.to_y]], { railType: a.rail_type }),
+  },
+  {
     name: 'build-signal', group: 'build', session: true,
     description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it. The track must exist (a dry run before the track is built fails).',
     args: z.object({ ...act, ...point, ...front, type: z.enum(Object.keys(SIGNAL_TYPES)).default('path'), two_way: bool().default(false), remove: bool().default(false) }),

@@ -75,3 +75,11 @@ test('client-side rate limit blocks builds over max_builds_per_minute', async ()
     await assert.rejects(runCommand(ctx, 'build-road', { x1: 1, y1: 1, x2: 2, y2: 1 }), /client rate limit/);
   } finally { ctx.close(); }
 });
+
+test('build-track sends one rail piece from -> tile -> to', async () => {
+  const res = await cli('build-track', '--x', '30', '--y', '11', '--from_x', '30', '--from_y', '12', '--to_x', '31', '--to_y', '11');
+  assert.equal(res.ok, true);
+  const req = fake.received.at(-1);
+  assert.equal(req.cmd, 'exec');
+  assert.deepEqual(req.args.steps[0], ['rail', 30, 12, 30, 11, 31, 11]);
+});
