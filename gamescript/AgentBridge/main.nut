@@ -18,9 +18,12 @@ class AgentBridge extends GSController {
 	builds_date = 0;         // date builds_today refers to
 	delay_override = -1;     // set via set_rate; -1 = use GS setting
 	perday_override = -1;
+	events = null;           // ring buffer of event tables, oldest first
+	event_seq = 0;           // seq of the newest recorded event
 
 	constructor() {
 		this.builds_today = {};
+		this.events = [];
 		this.handlers = {
 			ping = this.CmdPing,
 			info = this.CmdInfo,
@@ -37,12 +40,21 @@ class AgentBridge extends GSController {
 			check_airport = this.CmdCheckAirport,
 			test_build_road = this.CmdTestBuildRoad,
 			build_road = this.CmdBuildRoad,
+			stations = this.CmdStations,
+			vehicles = this.CmdVehicles,
+			vehicle = this.CmdVehicle,
+			engines = this.CmdEngines,
+			groups = this.CmdGroups,
+			depots = this.CmdDepots,
+			autorenew = this.CmdAutorenew,
+			events = this.CmdEvents,
+			exec = this.CmdExec,
 		};
 	}
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v2 started");
+	GSLog.Info("AgentBridge v3 started");
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
 		while (GSEventController.IsEventWaiting()) {
@@ -193,7 +205,8 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 2,
+		bridge_version = 3,
+		event_seq = this.event_seq,
 	};
 }
 
@@ -386,4 +399,383 @@ function AgentBridge::CmdBuildRoad(args) {
 	local ok = GSRoad.BuildRoad(GSMap.GetTileIndex(args.x1, args.y1), GSMap.GetTileIndex(args.x2, args.y2));
 	return { ok = ok, cost = costs.GetCosts(), error = ok ? "" : this.Str(GSError.GetLastErrorString()),
 		money = GSCompany.GetBankBalance(args.company) };
+}
+
+// ---- Operate: read ----------------------------------------------------------
+
+// Throws a readable error unless args.company is an existing company.
+function AgentBridge::CheckCompany(args) {
+	if (!("company" in args)) throw "no company given; run: openttd-agent configure --company <id>";
+	if (GSCompany.ResolveCompanyID(args.company) == GSCompany.COMPANY_INVALID) throw "company " + args.company + " does not exist; run: openttd-agent companies";
+	return args.company;
+}
+
+// args: company. Rows: [id, name, x, y, facilities, [[cargo, waiting, rating_pct], ...], vehicles]
+// facilities bitmask: 1 rail, 2 truck, 4 bus, 8 airport, 16 dock.
+function AgentBridge::CmdStations(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local kinds = [GSStation.STATION_TRAIN, GSStation.STATION_TRUCK_STOP, GSStation.STATION_BUS_STOP, GSStation.STATION_AIRPORT, GSStation.STATION_DOCK];
+	local cargos = GSCargoList();
+	local out = [];
+	foreach (s, _ in GSStationList(GSStation.STATION_ANY)) {
+		local tile = GSBaseStation.GetLocation(s);
+		local fac = 0;
+		for (local k = 0; k < kinds.len(); k++) {
+			if (GSStation.HasStationType(s, kinds[k])) fac = fac | (1 << k);
+		}
+		local cg = [];
+		foreach (c, _ in cargos) {
+			if (GSStation.HasCargoRating(s, c)) cg.append([c, GSStation.GetCargoWaiting(s, c), GSStation.GetCargoRating(s, c)]);
+		}
+		out.append([s, this.Str(GSBaseStation.GetName(s)), GSMap.GetTileX(tile), GSMap.GetTileY(tile), fac, cg, GSVehicleList_Station(s).Count()]);
+	}
+	return out;
+}
+
+// args: company. Rows: [id, name, type, engine, engine_name, age_days, max_age_days, reliability_pct,
+//   profit_this_year, profit_last_year, value, state, x, y, group, order_count, unit_number, running_cost, shared_orders]
+// type: 0 rail, 1 road, 2 water, 3 air. state: 0 running, 1 stopped, 2 in depot, 3 at station, 4 broken, 5 crashed.
+function AgentBridge::CmdVehicles(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local out = [];
+	foreach (v, _ in GSVehicleList()) {
+		local tile = GSVehicle.GetLocation(v);
+		local e = GSVehicle.GetEngineType(v);
+		out.append([v, this.Str(GSVehicle.GetName(v)), GSVehicle.GetVehicleType(v), e, this.Str(GSEngine.GetName(e)),
+			GSVehicle.GetAge(v), GSVehicle.GetMaxAge(v), GSVehicle.GetReliability(v),
+			GSVehicle.GetProfitThisYear(v), GSVehicle.GetProfitLastYear(v), GSVehicle.GetCurrentValue(v),
+			GSVehicle.GetState(v), GSMap.GetTileX(tile), GSMap.GetTileY(tile), GSVehicle.GetGroupID(v),
+			GSOrder.GetOrderCount(v), GSVehicle.GetUnitNumber(v), GSVehicle.GetRunningCost(v), GSVehicle.HasSharedOrders(v)]);
+	}
+	return out;
+}
+
+// args: company, vehicle. Returns [info table, order row, order row, ...].
+// Order row: [position, kind, x, y, flags, station_id, destination_name, jump_to]
+// kind: "station", "depot", "waypoint", "conditional", "other". station_id/jump_to are -1 when not applicable.
+function AgentBridge::CmdVehicle(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local v = args.vehicle;
+	if (!GSVehicle.IsValidVehicle(v)) throw "vehicle " + v + " does not exist or is not owned by company " + args.company + "; run: openttd-agent vehicles";
+	local tile = GSVehicle.GetLocation(v);
+	local e = GSVehicle.GetEngineType(v);
+	local cap = [];
+	foreach (c, _ in GSCargoList()) {
+		local n = GSVehicle.GetCapacity(v, c);
+		if (n > 0) cap.append([c, n, GSVehicle.GetCargoLoad(v, c)]);
+	}
+	local count = GSOrder.GetOrderCount(v);
+	local out = [{
+		id = v, name = this.Str(GSVehicle.GetName(v)), type = GSVehicle.GetVehicleType(v), engine = e, engine_name = this.Str(GSEngine.GetName(e)),
+		age_days = GSVehicle.GetAge(v), max_age_days = GSVehicle.GetMaxAge(v), reliability_pct = GSVehicle.GetReliability(v),
+		profit_this_year = GSVehicle.GetProfitThisYear(v), profit_last_year = GSVehicle.GetProfitLastYear(v),
+		value = GSVehicle.GetCurrentValue(v), running_cost = GSVehicle.GetRunningCost(v), state = GSVehicle.GetState(v),
+		x = GSMap.GetTileX(tile), y = GSMap.GetTileY(tile), speed = GSVehicle.GetCurrentSpeed(v), group = GSVehicle.GetGroupID(v),
+		wagons = GSVehicle.GetNumWagons(v), length = GSVehicle.GetLength(v), capacity = cap, shared_orders = GSVehicle.HasSharedOrders(v),
+		order_count = count, current_order = count > 0 ? GSOrder.ResolveOrderPosition(v, GSOrder.ORDER_CURRENT) : -1,
+	}];
+	for (local i = 0; i < count; i++) {
+		local kind = "other";
+		local station = -1;
+		local name = "";
+		local jump = -1;
+		local dest = GSOrder.GetOrderDestination(v, i);
+		if (GSOrder.IsConditionalOrder(v, i)) {
+			kind = "conditional";
+			jump = GSOrder.GetOrderJumpTo(v, i);
+		} else if (GSOrder.IsGotoStationOrder(v, i)) {
+			kind = "station";
+			station = GSStation.GetStationID(dest);
+			name = this.Str(GSBaseStation.GetName(station));
+		} else if (GSOrder.IsGotoDepotOrder(v, i)) {
+			kind = "depot";
+		} else if (GSOrder.IsGotoWaypointOrder(v, i)) {
+			kind = "waypoint";
+		}
+		local valid = GSMap.IsValidTile(dest);
+		out.append([i, kind, valid ? GSMap.GetTileX(dest) : -1, valid ? GSMap.GetTileY(dest) : -1, GSOrder.GetOrderFlags(v, i), station, name, jump]);
+	}
+	return out;
+}
+
+// args: company, type (0 rail, 1 road, 2 water, 3 air), optional cargo, optional rail_type.
+// Engines the company can build now. Rows: [id, name, cargo, capacity, max_speed, price, running_cost_per_year,
+//   reliability_pct, max_age_days, design_year, power, weight, is_wagon, track_type]
+// With cargo: wagons/vehicles that can be refitted to it and locomotives that can pull it.
+function AgentBridge::CmdEngines(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local rail = args.type == GSVehicle.VT_RAIL;
+	local out = [];
+	foreach (e, _ in GSEngineList(args.type)) {
+		if (!GSEngine.IsBuildable(e)) continue;
+		local wagon = rail && GSEngine.IsWagon(e);
+		if ("cargo" in args) {
+			local fits = (rail && !wagon) ? GSEngine.CanPullCargo(e, args.cargo) : GSEngine.CanRefitCargo(e, args.cargo);
+			if (!fits) continue;
+		}
+		if (rail && ("rail_type" in args)) {
+			if (!GSEngine.CanRunOnRail(e, args.rail_type)) continue;
+			if (!wagon && !GSEngine.HasPowerOnRail(e, args.rail_type)) continue;
+		}
+		local track = -1;
+		if (rail) track = GSEngine.GetRailType(e);
+		if (args.type == GSVehicle.VT_ROAD) track = GSEngine.GetRoadType(e);
+		out.append([e, this.Str(GSEngine.GetName(e)), GSEngine.GetCargoType(e), GSEngine.GetCapacity(e), GSEngine.GetMaxSpeed(e),
+			GSEngine.GetPrice(e), GSEngine.GetRunningCost(e), GSEngine.GetReliability(e), GSEngine.GetMaxAge(e),
+			GSDate.GetYear(GSEngine.GetDesignDate(e)), GSEngine.GetPower(e), GSEngine.GetWeight(e), wagon, track]);
+	}
+	return out;
+}
+
+// args: company. Rows: [id, name, vehicle_type, parent (-1 none), vehicles, profit_this_year, profit_last_year, usage_pct]
+function AgentBridge::CmdGroups(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local out = [];
+	foreach (g, _ in GSGroupList()) {
+		local vt = GSGroup.GetVehicleType(g);
+		local parent_group = GSGroup.GetParent(g);
+		out.append([g, this.Str(GSGroup.GetName(g)), vt, GSGroup.IsValidGroup(parent_group) ? parent_group : -1,
+			GSGroup.GetNumVehicles(g, vt), GSGroup.GetProfitThisYear(g), GSGroup.GetProfitLastYear(g), GSGroup.GetCurrentUsage(g)]);
+	}
+	return out;
+}
+
+// args: company, type (0 rail, 1 road, 2 water, 3 air). Rows: [x, y, vehicles_inside]
+function AgentBridge::CmdDepots(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local kinds = [GSTile.TRANSPORT_RAIL, GSTile.TRANSPORT_ROAD, GSTile.TRANSPORT_WATER, GSTile.TRANSPORT_AIR];
+	local out = [];
+	foreach (tile, _ in GSDepotList(kinds[args.type])) {
+		out.append([GSMap.GetTileX(tile), GSMap.GetTileY(tile), GSVehicleList_Depot(tile).Count()]);
+	}
+	return out;
+}
+
+// args: company. Autorenew settings of the company (set them with the exec op "autorenew").
+function AgentBridge::CmdAutorenew(args) {
+	local c = this.CheckCompany(args);
+	return { enabled = GSCompany.GetAutoRenewStatus(c), months = GSCompany.GetAutoRenewMonths(c), money = GSCompany.GetAutoRenewMoney(c) };
+}
+
+// ---- Events -------------------------------------------------------------------
+
+const MAX_EVENTS = 300;
+
+// Turn one game event into a table in the ring buffer. Event types a GameScript
+// receives in 15.x (vehicle lost/unprofitable and engine-available are AI-only).
+function AgentBridge::RecordEvent(ev) {
+	local d = null;
+	switch (ev.GetEventType()) {
+		case GSEvent.ET_VEHICLE_CRASHED: {
+			local e = GSEventVehicleCrashed.Convert(ev);
+			local tile = e.GetCrashSite();
+			d = { type = "vehicle_crashed", company = e.GetVehicleOwner(), vehicle = e.GetVehicleID(),
+				x = GSMap.GetTileX(tile), y = GSMap.GetTileY(tile), reason = e.GetCrashReason(), victims = e.GetVictims() };
+			break;
+		}
+		case GSEvent.ET_SUBSIDY_OFFER:
+			d = this.SubsidyEvent("subsidy_offer", GSEventSubsidyOffer.Convert(ev).GetSubsidyID());
+			break;
+		case GSEvent.ET_SUBSIDY_OFFER_EXPIRED:
+			d = this.SubsidyEvent("subsidy_offer_expired", GSEventSubsidyOfferExpired.Convert(ev).GetSubsidyID());
+			break;
+		case GSEvent.ET_SUBSIDY_AWARDED:
+			d = this.SubsidyEvent("subsidy_awarded", GSEventSubsidyAwarded.Convert(ev).GetSubsidyID());
+			break;
+		case GSEvent.ET_SUBSIDY_EXPIRED:
+			d = this.SubsidyEvent("subsidy_expired", GSEventSubsidyExpired.Convert(ev).GetSubsidyID());
+			break;
+		case GSEvent.ET_COMPANY_NEW:
+			d = { type = "company_new", company = GSEventCompanyNew.Convert(ev).GetCompanyID() };
+			break;
+		case GSEvent.ET_COMPANY_IN_TROUBLE:
+			d = { type = "company_in_trouble", company = GSEventCompanyInTrouble.Convert(ev).GetCompanyID() };
+			break;
+		case GSEvent.ET_COMPANY_BANKRUPT:
+			d = { type = "company_bankrupt", company = GSEventCompanyBankrupt.Convert(ev).GetCompanyID() };
+			break;
+		case GSEvent.ET_COMPANY_MERGER: {
+			local e = GSEventCompanyMerger.Convert(ev);
+			d = { type = "company_merger", company = e.GetNewCompanyID(), old_company = e.GetOldCompanyID() };
+			break;
+		}
+		case GSEvent.ET_INDUSTRY_OPEN: {
+			local i = GSEventIndustryOpen.Convert(ev).GetIndustryID();
+			local tile = GSIndustry.GetLocation(i);
+			d = { type = "industry_open", industry = i, industry_type = GSIndustry.GetIndustryType(i), x = GSMap.GetTileX(tile), y = GSMap.GetTileY(tile) };
+			break;
+		}
+		case GSEvent.ET_INDUSTRY_CLOSE:
+			d = { type = "industry_close", industry = GSEventIndustryClose.Convert(ev).GetIndustryID() };
+			break;
+		case GSEvent.ET_STATION_FIRST_VEHICLE: {
+			local e = GSEventStationFirstVehicle.Convert(ev);
+			d = { type = "station_first_vehicle", station = e.GetStationID(), vehicle = e.GetVehicleID(), company = GSBaseStation.GetOwner(e.GetStationID()) };
+			break;
+		}
+		case GSEvent.ET_TOWN_FOUNDED:
+			d = { type = "town_founded", town = GSEventTownFounded.Convert(ev).GetTownID() };
+			break;
+		case GSEvent.ET_EXCLUSIVE_TRANSPORT_RIGHTS: {
+			local e = GSEventExclusiveTransportRights.Convert(ev);
+			d = { type = "exclusive_transport_rights", company = e.GetCompanyID(), town = e.GetTownID() };
+			break;
+		}
+		case GSEvent.ET_ROAD_RECONSTRUCTION: {
+			local e = GSEventRoadReconstruction.Convert(ev);
+			d = { type = "road_reconstruction", company = e.GetCompanyID(), town = e.GetTownID() };
+			break;
+		}
+	}
+	if (d == null) return;
+	local today = GSDate.GetCurrentDate();
+	this.event_seq++;
+	d.seq <- this.event_seq;
+	d.date <- GSDate.GetYear(today) + "-" + GSDate.GetMonth(today) + "-" + GSDate.GetDayOfMonth(today);
+	this.events.append(d);
+	if (this.events.len() > MAX_EVENTS) this.events.remove(0);
+}
+
+function AgentBridge::SubsidyEvent(name, id) {
+	local d = { type = name, subsidy = id };
+	if (!GSSubsidy.IsValidSubsidy(id)) return d;
+	d.cargo <- GSSubsidy.GetCargoType(id);
+	d.from_kind <- GSSubsidy.GetSourceType(id) == GSSubsidy.SPT_TOWN ? "town" : "industry";
+	d.from_id <- GSSubsidy.GetSourceIndex(id);
+	d.to_kind <- GSSubsidy.GetDestinationType(id) == GSSubsidy.SPT_TOWN ? "town" : "industry";
+	d.to_id <- GSSubsidy.GetDestinationIndex(id);
+	d.expires_year <- GSDate.GetYear(GSSubsidy.GetExpireDate(id));
+	if (GSSubsidy.IsAwarded(id)) d.company <- GSSubsidy.GetAwardedTo(id);
+	return d;
+}
+
+// args: optional since (seq). Events with seq > since, oldest first (the buffer keeps the last MAX_EVENTS).
+function AgentBridge::CmdEvents(args) {
+	local since = ("since" in args) ? args.since : 0;
+	local out = [];
+	foreach (d in this.events) {
+		if (d.seq > since) out.append(d);
+	}
+	return out;
+}
+
+// ---- Exec: every state-changing step goes through here ---------------------------
+
+// args: company, steps = [[op, ...], ...]; optional dry_run (GSTestMode: costs only, nothing changes),
+// keep_going (default: stop at the first failed step unless dry_run), rail_type, road_type.
+// Returns [summary, row, row, ...]: one row [ok, cost, error, value] per attempted step.
+// Each real step passes BuildGate, so the rate limits apply to all of them.
+function AgentBridge::CmdExec(args) {
+	local company = this.CheckCompany(args);
+	local dry = ("dry_run" in args) && args.dry_run;
+	local keep = ("keep_going" in args) ? args.keep_going : dry;
+	local mode = GSCompanyMode(company);
+	local test = dry ? GSTestMode() : null;
+	local rows = [];
+	local total = 0;
+	local failed = 0;
+	local stopped = "";
+	foreach (st in args.steps) {
+		if (!dry) {
+			local gate = this.BuildGate(company);
+			if (gate != null) {
+				stopped = gate;
+				break;
+			}
+		}
+		local costs = GSAccounting();
+		local res = null;
+		try {
+			res = this.ExecStep(company, st, dry);
+		} catch (e) {
+			res = [false, 0, "" + e];
+		}
+		local cost = costs.GetCosts();
+		local err = res[0] ? "" : (res.len() > 2 ? res[2] : this.Str(GSError.GetLastErrorString()));
+		total += cost;
+		rows.append([res[0], cost, err, res[1]]);
+		if (!res[0]) {
+			failed++;
+			if (!keep) {
+				stopped = "step " + (rows.len() - 1) + " failed";
+				break;
+			}
+		}
+	}
+	rows.insert(0, { dry_run = dry, attempted = rows.len(), failed = failed, cost = total, stopped = stopped, money = GSCompany.GetBankBalance(company) });
+	return rows;
+}
+
+// One step. Returns [ok, value] or [false, 0, "own error text"]; when the third item is
+// missing the caller reports GSError.GetLastErrorString(). value: new vehicle/group id, else 0.
+function AgentBridge::ExecStep(company, s, dry) {
+	switch (s[0]) {
+		// -- groups: [op, vehicle_type, name, parent (-1 none)] / [op, group, name] / [op, group] / [op, group (-1 default), vehicle]
+		case "group_create": {
+			local g = GSGroup.CreateGroup(s[1], s[3] < 0 ? GSGroup.GROUP_INVALID : s[3]);
+			if (g == GSGroup.GROUP_INVALID) return [false, 0];
+			if (!dry && s[2] != "") GSGroup.SetName(g, s[2]);
+			return [true, g];
+		}
+		case "group_rename": return [GSGroup.SetName(s[1], s[2]), 0];
+		case "group_delete": return [GSGroup.DeleteGroup(s[1]), 0];
+		case "group_move": return [GSGroup.MoveVehicle(s[1] < 0 ? GSGroup.GROUP_DEFAULT : s[1], s[2]), 0];
+		// [op, group (-1 all), old_engine, new_engine (-1 = stop replacing old_engine)]
+		case "autoreplace": {
+			local g = s[1] < 0 ? GSGroup.GROUP_ALL : s[1];
+			if (s[3] < 0) return [GSGroup.StopAutoReplace(g, s[2]), 0];
+			return [GSGroup.SetAutoReplace(g, s[2], s[3]), 0];
+		}
+		// [op, enabled or null, months or null, money or null]
+		case "autorenew": {
+			local ok = true;
+			if (s[1] != null) ok = GSCompany.SetAutoRenewStatus(s[1]) && ok;
+			if (s[2] != null) ok = GSCompany.SetAutoRenewMonths(s[2]) && ok;
+			if (s[3] != null) ok = GSCompany.SetAutoRenewMoney(s[3]) && ok;
+			return [ok, 0];
+		}
+		// -- orders: [op, vehicle, x, y, flags, position (-1 append)]
+		case "order_add": {
+			local tile = GSMap.GetTileIndex(s[2], s[3]);
+			if (s[5] < 0) return [GSOrder.AppendOrder(s[1], tile, s[4]), 0];
+			return [GSOrder.InsertOrder(s[1], s[5], tile, s[4]), 0];
+		}
+		case "order_remove": return [GSOrder.RemoveOrder(s[1], s[2]), 0];
+		case "order_flags": return [GSOrder.SetOrderFlags(s[1], s[2], s[3]), 0];
+		case "order_skip": return [GSOrder.SkipToOrder(s[1], s[2]), 0];
+		case "order_move": return [GSOrder.MoveOrder(s[1], s[2], s[3]), 0];
+		// [op, vehicle, source_vehicle, share]
+		case "orders_copy": return [s[3] ? GSOrder.ShareOrders(s[1], s[2]) : GSOrder.CopyOrders(s[1], s[2]), 0];
+		case "orders_unshare": return [GSOrder.UnshareOrders(s[1]), 0];
+		// -- vehicles: [op, depot_x, depot_y, engine, refit_cargo (-1 none), attach_to_train (-1 none)]
+		case "veh_buy": {
+			local depot = GSMap.GetTileIndex(s[1], s[2]);
+			local v = s[4] < 0 ? GSVehicle.BuildVehicle(depot, s[3]) : GSVehicle.BuildVehicleWithRefit(depot, s[3], s[4]);
+			if (v == GSVehicle.VEHICLE_INVALID) return [false, 0];
+			if (!dry && s[5] >= 0) {
+				if (!GSVehicle.MoveWagonChain(v, 0, s[5], GSVehicle.GetNumWagons(s[5]) - 1)) return [false, v, "bought vehicle " + v + " but could not attach it to train " + s[5] + ": " + this.Str(GSError.GetLastErrorString())];
+			}
+			return [true, v];
+		}
+		// [op, depot_x, depot_y, vehicle, share_orders]
+		case "veh_clone": {
+			local v = GSVehicle.CloneVehicle(GSMap.GetTileIndex(s[1], s[2]), s[3], s[4]);
+			return [v != GSVehicle.VEHICLE_INVALID, v];
+		}
+		// [op, vehicle, want (1 running, 0 stopped, -1 toggle)]
+		case "veh_start_stop": {
+			if (!GSVehicle.IsValidVehicle(s[1])) return [false, 0, "vehicle " + s[1] + " does not exist or is not yours"];
+			local stopped = GSVehicle.GetState(s[1]) == GSVehicle.VS_STOPPED || GSVehicle.IsStoppedInDepot(s[1]);
+			if (s[2] == (stopped ? 0 : 1)) return [true, 0];
+			return [GSVehicle.StartStopVehicle(s[1]), 0];
+		}
+		// [op, vehicle, service_only]
+		case "veh_depot": return [s[2] ? GSVehicle.SendVehicleToDepotForServicing(s[1]) : GSVehicle.SendVehicleToDepot(s[1]), 0];
+		case "veh_sell": return [GSVehicle.SellVehicle(s[1]), 0];
+		case "veh_refit": return [GSVehicle.RefitVehicle(s[1], s[2]), 0];
+		case "veh_rename": return [GSVehicle.SetName(s[1], s[2]), 0];
+		// [op, source_vehicle, source_wagon, dest_vehicle, dest_wagon]
+		case "veh_move_wagon": return [GSVehicle.MoveWagonChain(s[1], s[2], s[3], s[4]), 0];
+	}
+	return [false, 0, "unknown exec op: " + s[0]];
 }
