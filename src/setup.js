@@ -149,7 +149,7 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
   }
   const patches = {};
   if (mode !== 'join') {
-    if (!adminPassword) throw new Error('adminPassword is required to host (players use the same one in `configure`)');
+    if (!adminPassword) throw new Error('adminPassword is required to host (the launch command generates one when none is configured)');
     patches.network = {
       server_admin_port: adminPort, server_port: gamePort, allow_insecure_admin_login: 'true',
       server_game_type: 'local', server_name: serverName, pause_on_join: 'false',
@@ -177,6 +177,14 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
   if (load) args.push('-g', load);
   const logFile = path.join(dir, 'openttd.log');
   const result = { mode, profile_dir: dir, executable: exe, args, log: logFile, admin_port: mode === 'join' ? null : adminPort, game_port: gamePort };
+  // OpenTTD 15.3 binds the admin port to the same addresses as the game port
+  // (network.cpp GetBindAddresses: one list for both), so it cannot be kept on loopback
+  // while players join over the LAN. The password is what protects it.
+  if (mode === 'dedicated') {
+    result.admin_port_reachable_from = /^(127\.|localhost$|::1$)/.test(bind)
+      ? 'this machine only'
+      : 'the LAN (OpenTTD binds it like the game port). Keep the admin password on this machine; players use the relay.';
+  }
   if (dryRun) return { ...result, dry_run: true };
   const out = fs.openSync(logFile, 'a');
   const child = spawn(exe, args, { cwd: dir, detached: true, stdio: ['ignore', out, out] });

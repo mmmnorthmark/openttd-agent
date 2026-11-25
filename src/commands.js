@@ -5,6 +5,7 @@
 // ctx: { cfg, session() -> Promise<Session> } — session() connects lazily.
 
 import os from 'node:os';
+import { randomBytes } from 'node:crypto';
 import * as z from 'zod/v4';
 import { doctor, installGamescript, launch, TERRAIN_TYPES } from './setup.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
@@ -124,7 +125,7 @@ export const COMMANDS = [
     description: 'Start OpenTTD with the right settings. mode=dedicated: headless LAN server with AgentBridge (everyone joins as a client). mode=host: GUI with server settings preset; then Multiplayer > Start Server. mode=join: GUI client joining join_host. Never edits your own openttd.cfg (uses a profile in ~/.openttd-agent/profiles).',
     args: z.object({
       mode: z.enum(['dedicated', 'host', 'join']).default('dedicated'),
-      admin_password: z.string().optional().describe('required for dedicated/host; defaults to configured admin_password'),
+      admin_password: z.string().optional().describe('dedicated/host: defaults to the configured admin_password; if there is none, a random one is generated and saved in the config (it never needs to leave this machine)'),
       join_host: z.string().optional().describe('host LAN IP for mode=join; defaults to configured host'),
       seed: int().optional(), map_bits: int().min(6).max(12).default(8).describe('map size as power of two: 8=256, 9=512, 10=1024'),
       load: z.string().optional().describe('savegame path to load instead of generating a new map'),
@@ -134,11 +135,20 @@ export const COMMANDS = [
       script_opcodes: int().min(500).max(250000).default(100000).describe('host: opcodes the GameScript may run per tick (OpenTTD default 10000); higher = faster map mirror and replies'),
       bind: z.string().default('0.0.0.0'), dry_run: bool().default(false),
     }),
-    run: (ctx, a) => launch({
-      mode: a.mode, adminPassword: a.admin_password ?? ctx.cfg.admin_password, joinHost: a.join_host ?? ctx.cfg.host,
-      seed: a.seed, mapBits: a.map_bits, load: a.load, commandDelayTicks: a.command_delay_ticks,
-      maxBuildsPerDay: a.max_builds_per_day, scriptOpcodes: a.script_opcodes, terrain: a.terrain, bind: a.bind, adminPort: ctx.cfg.admin_port, dryRun: a.dry_run,
-    }),
+    run: (ctx, a) => {
+      let adminPassword = a.admin_password ?? ctx.cfg.admin_password;
+      const hosting = a.mode !== 'join';
+      const generated = hosting && !adminPassword;
+      if (generated) adminPassword = randomBytes(24).toString('base64url');
+      const result = launch({
+        mode: a.mode, adminPassword, joinHost: a.join_host ?? ctx.cfg.host,
+        seed: a.seed, mapBits: a.map_bits, load: a.load, commandDelayTicks: a.command_delay_ticks,
+        maxBuildsPerDay: a.max_builds_per_day, scriptOpcodes: a.script_opcodes, terrain: a.terrain, bind: a.bind, adminPort: ctx.cfg.admin_port, dryRun: a.dry_run,
+      });
+      // The relay on this machine reads the password from the config, so keep the two in step.
+      if (hosting && !a.dry_run && adminPassword !== ctx.cfg.admin_password) saveConfig({ admin_password: adminPassword });
+      return { ...result, ...(generated ? { admin_password: a.dry_run ? 'would be generated' : 'generated and saved in the config' } : {}) };
+    },
   },
 
   // ---- relay (host only: who may play which company) ---------------------------
