@@ -15,7 +15,7 @@ import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, depotCandidates, depotSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
-import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, DEFAULT_COSTS } from './world.js';
+import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 
 const int = () => z.coerce.number().int();
 const num = () => z.coerce.number();
@@ -98,6 +98,25 @@ const pathArgs = {
   plan_only: bool().default(false).describe('return the planned steps without contacting the game'),
   show_path: bool().default(false).describe('include the tile list'),
 };
+
+/**
+ * Cargo acceptance around each point (GS `acceptance`, AgentBridge v7+): one list per point, see
+ * acceptanceFromRows. Returns null when the running GameScript is older and lacks the command.
+ */
+async function acceptanceAt(s, points, { w = 1, h = 1, radius = 4, cargos } = {}) {
+  const rows = [];
+  try {
+    for (let i = 0; i < points.length; i += 40) {
+      const part = await s.gs.call('acceptance', { points: points.slice(i, i + 40), w, h, radius, ...(cargos ? { cargos } : {}) });
+      rows.push(...part.map(([k, c, v]) => [k + i, c, v]));
+    }
+  } catch (e) {
+    if (/unknown cmd/.test(e.message)) return null;
+    throw e;
+  }
+  return acceptanceFromRows(rows, s.cargos, points.length);
+}
+const OLD_GS = 'the running AgentBridge is older than v7 and has no acceptance query; the host runs install-gamescript and reloads the game';
 
 /** Run exec steps as the company (client throttle + GS rate gate apply). */
 async function run(ctx, a, steps, opts = {}) {
@@ -367,7 +386,7 @@ export const COMMANDS = [
   },
   {
     name: 'industries', group: 'world', session: true,
-    description: 'Industries with location, last-month production per cargo and % transported ("unexploited" = low %). Filter by type name / cargo name substring, max_transported_pct, near x,y within radius.',
+    description: 'Industries with location, last-month production per cargo and % transported ("unexploited" = low %). Filter by type name / cargo name substring, max_transported_pct, min_production, near x,y within radius. Secondary (processing) industries are marked secondary: true and kept by min_production: they produce only after deliveries, so last_month 0 is normal.',
     args: z.object({
       type: z.string().optional(), cargo: z.string().optional(), max_transported_pct: int().default(100),
       min_production: int().default(0), near_x: int().optional(), near_y: int().optional(), radius: int().optional(), limit: int().default(50),
@@ -379,25 +398,50 @@ export const COMMANDS = [
         && (a.near_x === undefined || manhattan(i, { x: a.near_x, y: a.near_y }) <= (a.radius ?? 50))
         && (!a.cargo && a.max_transported_pct >= 100 && a.min_production <= 0
           ? true
-          : i.produces.some((p) => (!a.cargo || lc(p.cargo_name).includes(lc(a.cargo))) && p.transported_pct <= a.max_transported_pct && p.last_month >= a.min_production)))
+          : i.produces.some((p) => (!a.cargo || lc(p.cargo_name).includes(lc(a.cargo))) && p.transported_pct <= a.max_transported_pct && (i.secondary || p.last_month >= a.min_production))))
         .slice(0, a.limit);
     },
   },
   {
     name: 'find-cargo-pairs', group: 'world', session: true,
-    description: 'Opportunity finder: under-served producers of a cargo paired with accepting industries min_distance..max_distance tiles away, ranked by terrain effort of the route between them (water, hills, towns, existing track). Example: cargo=wood, source_type=forest, dest_type=sawmill, min_distance=100, max_distance=200, max_transported_pct=20.',
+    description: `Opportunity finder: under-served producers of a cargo paired with destinations min_distance..max_distance tiles away: industries that accept it, and towns whose centre area accepts it (acceptance >= ${ACCEPTED} within radius 4; goods, passengers, mail, food...). Ranked by terrain effort of the route (water, hills, towns, existing track). Each dest has kind industry|town. Secondary producers (sawmill, factory, refinery...) are marked secondary: true; they show last_month 0 until supplied. Example: cargo=goods, dest_kind=town, min_distance=20.`,
     args: z.object({
-      cargo: z.string().optional(), source_type: z.string().optional(), dest_type: z.string().optional(),
+      cargo: z.string().optional(), source_type: z.string().optional(), dest_type: z.string().optional().describe("industry type name, or 'town' / a town name"),
+      dest_kind: z.enum(['any', 'industry', 'town']).default('any'),
       min_distance: int().default(0), max_distance: int().default(1000), max_transported_pct: int().default(100),
-      min_production: int().default(0), limit: int().default(10), with_effort: bool().default(true),
+      min_production: int().default(0).describe('primary sources only; secondary ones are kept'), limit: int().default(10), with_effort: bool().default(true),
     }),
     run: async (ctx, a) => {
       const s = await ctx.session();
-      const { industries } = await s.economy();
+      const { industries, towns } = await s.economy();
       if (a.with_effort) await s.ensureTiles();
-      return findCargoPairs({ industries, types: s.types, map: s.map, cargo: a.cargo, sourceType: a.source_type, destType: a.dest_type,
-        minDist: a.min_distance, maxDist: a.max_distance, maxTransportedPct: a.max_transported_pct, minProduction: a.min_production,
-        limit: a.limit, withEffort: a.with_effort });
+      let townAcceptance = new Map();
+      if (a.dest_kind !== 'industry' && towns.length) {
+        const lists = await acceptanceAt(s, towns.map((t) => [t.x, t.y]), { radius: 4 });
+        townAcceptance = lists && new Map(towns.map((t, i) => [t.id, Object.fromEntries(lists[i].map((c) => [c.cargo, c.acceptance]))]));
+      }
+      const townCargoFallback = new Set([...s.cargos.values()].filter((c) => c.town_effect > 0).map((c) => c.id));
+      return findCargoPairs({ industries, types: s.types, towns, townAcceptance, townCargoFallback, map: s.map, cargo: a.cargo, sourceType: a.source_type,
+        destType: a.dest_type, destKind: a.dest_kind, minDist: a.min_distance, maxDist: a.max_distance, maxTransportedPct: a.max_transported_pct,
+        minProduction: a.min_production, limit: a.limit, withEffort: a.with_effort });
+    },
+  },
+  {
+    name: 'acceptance', group: 'world', session: true,
+    description: `Which cargos a station at x,y would accept: per-cargo acceptance summed over the catchment (radius; rail stations 4, truck/bus stops 3). ${ACCEPTED} or more = accepted. width/height = station size in tiles. cargo (name) checks one cargo. Needs AgentBridge v7.`,
+    args: z.object({ ...point, radius: int().min(0).max(10).default(4), width: int().min(1).max(20).default(1), height: int().min(1).max(20).default(1),
+      cargo: z.string().optional() }),
+    run: async (ctx, a) => {
+      const s = await ctx.session();
+      const cargo = cargoId(s.cargos, a.cargo);
+      const lists = await acceptanceAt(s, [[a.x, a.y]], { w: a.width, h: a.height, radius: a.radius, ...(cargo !== undefined ? { cargos: [cargo] } : {}) });
+      if (!lists) throw new Error(OLD_GS);
+      let list = lists[0];
+      if (cargo !== undefined && !list.length) {
+        const c = s.cargos.get(cargo);
+        list = [{ cargo, label: c?.label ?? null, name: c?.name ?? `cargo ${cargo}`, acceptance: 0, accepted: false }];
+      }
+      return { x: a.x, y: a.y, width: a.width, height: a.height, radius: a.radius, accepted_at: ACCEPTED, cargo: list };
     },
   },
   {

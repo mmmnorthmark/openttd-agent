@@ -107,3 +107,17 @@ test('rail-types and bridge-types decode rows', async () => {
   assert.deepEqual((await run('rail-types', {}))[1], { id: 1, name: 'Electrified railway construction', max_speed: 0, track_cost: 75 });
   assert.equal((await run('bridge-types', { length: 5 }))[1].price, 1500);
 });
+
+test('find-cargo-pairs pairs goods with towns that accept them; acceptance command', async () => {
+  const res = await run('find-cargo-pairs', { cargo: 'goods', with_effort: false });
+  assert.equal(res.total_candidates, 1, 'Smallham accepts goods only at 4');
+  assert.equal(res.pairs[0].dest.kind, 'town');
+  assert.equal(res.pairs[0].dest.name, 'Bigton');
+  assert.equal(res.pairs[0].dest.acceptance, 12);
+  assert.equal(res.pairs[0].source.secondary, true);
+  const acc = await run('acceptance', { x: 42, y: 12 });
+  assert.deepEqual(acc.cargo.map((c) => [c.label, c.acceptance, c.accepted]), [['PASS', 30, true], ['GOOD', 12, true]]);
+  const one = await run('acceptance', { x: 10, y: 50, cargo: 'wood' });
+  assert.deepEqual(one.cargo.map((c) => [c.label, c.acceptance, c.accepted]), [['WOOD', 0, false]]);
+  assert.deepEqual(fake.received.filter((r) => r.cmd === 'acceptance').at(-1).args.cargos, [7]);
+});

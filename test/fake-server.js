@@ -24,7 +24,16 @@ function dumpRows({ y0, y1, x0 = 0, x1 = FAKE_MAP - 1 }) {
   return out;
 }
 
-const FAKE_CARGOS = [{ id: 0, label: 'PASS', name: 'Passengers', passengers: true }, { id: 7, label: 'WOOD', name: 'Wood', passengers: false }];
+const FAKE_CARGOS = [{ id: 0, label: 'PASS', name: 'Passengers', passengers: true, mail: false, town_effect: 1 },
+  { id: 5, label: 'GOOD', name: 'Goods', passengers: false, mail: false, town_effect: 3 },
+  { id: 7, label: 'WOOD', name: 'Wood', passengers: false, mail: false, town_effect: 0 }];
+// Acceptance around a point: Bigton's centre (42,12) accepts passengers and goods, Smallham's (10,50) only passengers.
+function fakeAcceptance([x, y], cargo, radius) {
+  const near = (cx, cy) => Math.max(Math.abs(x - cx), Math.abs(y - cy)) <= radius;
+  if (near(42, 12)) return { 0: 30, 5: 12 }[cargo] ?? 0;
+  if (near(10, 50)) return { 0: 9, 5: 4 }[cargo] ?? 0;
+  return 0;
+}
 
 // Goal rows as CmdGoalStatus sends them. Progress comes from state.delivered[label] (tests set it).
 function goalView(g, state) {
@@ -68,19 +77,30 @@ const GS = {
   // The date runs at one game day per state.dayMs of real time while the game is not paused.
   info: (_a, state) => {
     const date = 1 + fakeDays(state);
-    return { tick: 1, date, year: state.year, month: 1, day: date, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: state.paused, towns: 2, industries: 3, bridge_version: 6, event_seq: 2, goals: state.goals.length };
+    return { tick: 1, date, year: state.year, month: 1, day: date, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: state.paused, towns: 2, industries: 3, bridge_version: 7, event_seq: 2, goals: state.goals.length };
   },
   cargos: () => FAKE_CARGOS,
-  industry_types: () => [{ id: 3, name: 'Forest', produces: [7], accepts: [] }, { id: 4, name: 'Sawmill', produces: [], accepts: [7] }],
+  industry_types: () => [{ id: 3, name: 'Forest', produces: [7], accepts: [], raw: true, processing: false },
+    { id: 4, name: 'Sawmill', produces: [5], accepts: [7], raw: false, processing: true }],
   industries: () => [
     [1, 3, 10, 20, [[7, 120, 0]], 0],
-    [2, 4, 50, 20, [], 0],
+    [2, 4, 50, 20, [[5, 0, 0]], 0],
     [3, 3, 5, 60, [[7, 80, 75]], 1],
   ],
   towns: () => [[1, 'Bigton', 42, 12, 5000, false, 800, 10, 200, 0, 6], [2, 'Smallham', 10, 50, 300, false, 40, 0, 10, 0, 2]],
   companies: () => [{ id: 0, name: 'Matthew Transport', money: 100000, loan: 300000 }],
   get_rate: () => ({ command_delay_ticks: 0, max_builds_per_day: 0 }),
   dump_tiles: dumpRows,
+  acceptance: (a) => {
+    const rows = [];
+    a.points.forEach((p, i) => {
+      for (const c of a.cargos ?? FAKE_CARGOS.map((k) => k.id)) {
+        const v = fakeAcceptance(p, c, a.radius ?? 4);
+        if (v > 0) rows.push([i, c, v]);
+      }
+    });
+    return rows;
+  },
   echo: (a) => a,
   build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 98766, echoed_company: a.company }),
   // operate (row formats: see main.nut)

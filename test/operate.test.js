@@ -122,7 +122,7 @@ test('goals: set with cargo labels, status with pct, done and failed, clear', as
   assert.equal((await run('goal-status', {})).status, 'done');
   fake.state.year = 1950;
   fake.state.delivered = {};
-  await assert.rejects(run('goal-set', { deadline_year: 1954, targets: 'COAL:10' }), /unknown goal cargo 'COAL'. Use a cargo label of this game \(PASS, WOOD\) or VALUE/);
+  await assert.rejects(run('goal-set', { deadline_year: 1954, targets: 'COAL:10' }), /unknown goal cargo 'COAL'. Use a cargo label of this game \(PASS, GOOD, WOOD\) or VALUE/);
   await assert.rejects(run('goal-set', { deadline_year: 1954, targets: 'WOOD:lots' }), /whole number above 0/);
   await assert.rejects(run('goal-set', { deadline_year: 1940, targets: 'WOOD:10' }), /in the past/);
   assert.deepEqual(await run('goal-set', { deadline_year: 1951, targets: [{ cargo: 'pass', amount: 5 }], company: 3 }).then((g) => [g.company, g.targets.length]), [3, 1]);

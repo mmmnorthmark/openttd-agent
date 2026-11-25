@@ -196,12 +196,15 @@ export function townsFromRows(rows) {
   }));
 }
 
-/** Normalise GS `industries` rows, resolving type and cargo names. */
+/** A producer that makes its cargo from deliveries (sawmill, factory, refinery...): output is 0 until it is supplied. */
+const isSecondary = (type) => !!type && (type.processing === true || (type.raw === false && (type.accepts?.length ?? 0) > 0));
+
+/** Normalise GS `industries` rows, resolving type and cargo names. Secondary (processing) industries get secondary: true. */
 export function industriesFromRows(rows, typesById, cargosById) {
   return rows.map(([id, type, x, y, prod, stations_around]) => {
     const t = typesById.get(type);
     return {
-      id, type, type_name: t?.name ?? `type ${type}`, x, y, stations_around,
+      id, type, type_name: t?.name ?? `type ${type}`, x, y, stations_around, ...(isSecondary(t) ? { secondary: true } : {}),
       produces: prod.map(([cargo, amount, pct]) => ({
         cargo, cargo_name: cargosById.get(cargo)?.name ?? `cargo ${cargo}`, last_month: amount, transported_pct: pct,
         unserved: Math.round(amount * (100 - pct) / 100),
@@ -213,28 +216,65 @@ export function industriesFromRows(rows, typesById, cargosById) {
 
 const matches = (needle, hay) => !needle || String(hay).toLowerCase().includes(String(needle).toLowerCase());
 
+/** Acceptance at or above this means a station there accepts the cargo (GSTile.GetCargoAcceptance). */
+export const ACCEPTED = 8;
+
+/**
+ * Decode GS `acceptance` rows [point_index, cargo, value] into one list per point:
+ * [{ cargo, label, name, acceptance, accepted }], highest acceptance first.
+ */
+export function acceptanceFromRows(rows, cargosById, nPoints) {
+  const out = Array.from({ length: nPoints }, () => []);
+  for (const [i, cargo, value] of rows) {
+    const c = cargosById.get(cargo);
+    out[i]?.push({ cargo, label: c?.label ?? null, name: c?.name ?? `cargo ${cargo}`, acceptance: value, accepted: value >= ACCEPTED });
+  }
+  for (const list of out) list.sort((a, b) => b.acceptance - a.acceptance);
+  return out;
+}
+
 /**
  * Source industries producing `cargo` (name substring) with transported% <= maxTransportedPct,
- * paired with accepting industries `minDist..maxDist` tiles away (Manhattan).
+ * paired with destinations `minDist..maxDist` tiles away (Manhattan): industries whose type accepts
+ * the cargo, and towns. `townAcceptance` maps town id -> { cargo id: acceptance around the centre };
+ * towns below ACCEPTED are left out. Without it (null, an older GameScript) towns are listed unchecked
+ * (acceptance null) for cargos in `townCargoFallback` (ids of cargos with a town effect) only.
+ * destKind 'industry' | 'town' | 'any'. Secondary (processing) sources are marked `secondary: true`:
+ * their last_month is 0 between deliveries, so minProduction does not drop them.
  * Optionally ranks each pair by routeEffort on `map`.
  */
-export function findCargoPairs({ industries, types, map, cargo, sourceType, destType, minDist = 0, maxDist = 1e9,
-  maxTransportedPct = 100, minProduction = 0, limit = 10, withEffort = true }) {
+export function findCargoPairs({ industries, types, towns = [], townAcceptance = null, townCargoFallback = new Set(), map, cargo, sourceType, destType, destKind = 'any',
+  minDist = 0, maxDist = 1e9, maxTransportedPct = 100, minProduction = 0, limit = 10, withEffort = true }) {
   const pairs = [];
   for (const src of industries) {
     if (!matches(sourceType, src.type_name)) continue;
+    const secondary = isSecondary(types.get(src.type));
     for (const p of src.produces) {
       if (!matches(cargo, p.cargo_name)) continue;
-      if (p.transported_pct > maxTransportedPct || p.last_month < minProduction) continue;
-      for (const dst of industries) {
-        if (dst.id === src.id) continue;
-        const dt = types.get(dst.type);
-        if (!dt?.accepts.includes(p.cargo)) continue;
-        if (!matches(destType, dst.type_name)) continue;
-        const dist = manhattan(src, dst);
-        if (dist < minDist || dist > maxDist) continue;
-        pairs.push({ source: brief(src), dest: brief(dst), cargo: p.cargo_name, source_last_month: p.last_month,
-          source_transported_pct: p.transported_pct, distance: dist });
+      if (p.transported_pct > maxTransportedPct || (!secondary && p.last_month < minProduction)) continue;
+      const base = { cargo: p.cargo_name, source_last_month: p.last_month, source_transported_pct: p.transported_pct };
+      const srcBrief = { ...brief(src), ...(secondary ? { secondary: true } : {}) };
+      if (destKind !== 'town') {
+        for (const dst of industries) {
+          if (dst.id === src.id) continue;
+          const dt = types.get(dst.type);
+          if (!dt?.accepts.includes(p.cargo)) continue;
+          if (!matches(destType, dst.type_name)) continue;
+          const dist = manhattan(src, dst);
+          if (dist < minDist || dist > maxDist) continue;
+          pairs.push({ source: srcBrief, dest: { kind: 'industry', ...brief(dst) }, ...base, distance: dist });
+        }
+      }
+      if (destKind !== 'industry' && (townAcceptance || townCargoFallback.has(p.cargo))) {
+        for (const town of towns) {
+          if (destType && !matches(destType, 'town') && !matches(destType, town.name)) continue;
+          const acc = townAcceptance ? (townAcceptance.get(town.id)?.[p.cargo] ?? 0) : null;
+          if (acc !== null && acc < ACCEPTED) continue;
+          const dist = manhattan(src, town);
+          if (dist < minDist || dist > maxDist) continue;
+          pairs.push({ source: srcBrief, dest: { kind: 'town', id: town.id, name: town.name, x: town.x, y: town.y, population: town.population, acceptance: acc },
+            ...base, distance: dist });
+        }
       }
     }
   }
@@ -246,7 +286,14 @@ export function findCargoPairs({ industries, types, map, cargo, sourceType, dest
     for (const pr of shortlist) pr.route = routeEffort(map, pr.source, pr.dest);
     shortlist.sort((x, y) => (x.route.reachable ? x.route.effort_per_tile : 1e9) - (y.route.reachable ? y.route.effort_per_tile : 1e9));
   }
-  return { total_candidates: pairs.length, map_complete: !!map?.isComplete(), pairs: shortlist.slice(0, limit) };
+  const notes = [];
+  if (shortlist.some((pr) => pr.source.secondary && pr.source_last_month === 0)) {
+    notes.push('secondary sources (secondary: true) produce only while supplied, so last_month 0 is normal before their input arrives');
+  }
+  if (townAcceptance === null && pairs.some((pr) => pr.dest.kind === 'town')) {
+    notes.push('town acceptance was not checked (the running AgentBridge is older than v7): verify with `acceptance --x --y` before building');
+  }
+  return { total_candidates: pairs.length, map_complete: !!map?.isComplete(), pairs: shortlist.slice(0, limit), ...(notes.length ? { notes } : {}) };
 }
 
 const brief = (ind) => ({ id: ind.id, type: ind.type_name, x: ind.x, y: ind.y });
