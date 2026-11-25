@@ -37,6 +37,20 @@ function fakeAcceptance([x, y], cargo, radius) {
   return 0;
 }
 
+// Loan step as LoanStep in main.nut: interval 10000, max 500000. Changes state only for real runs.
+// state.gsVersion < 8 behaves like an older AgentBridge without the step.
+const FAKE_MAX_LOAN = 500000, FAKE_LOAN_INTERVAL = 10000;
+function fakeLoanStep([, kind, n], dry, state) {
+  if (state.gsVersion < 8) return [false, 0, 'unknown exec op: loan', 0];
+  let want = kind === 'max' ? FAKE_MAX_LOAN : kind === 'add' ? state.loan + n : n;
+  if (want < 0) return [false, 0, `refused: loan would be ${want}, below 0 (current loan ${state.loan})`, 0];
+  if (want % FAKE_LOAN_INTERVAL) want += FAKE_LOAN_INTERVAL - (want % FAKE_LOAN_INTERVAL);
+  if (want > FAKE_MAX_LOAN) return [false, 0, `refused: loan ${want} is over max_loan ${FAKE_MAX_LOAN} (loan interval ${FAKE_LOAN_INTERVAL})`, want];
+  if (want - state.loan + state.money < 0) return [false, 0, `refused: repaying ${state.loan - want} needs that much cash; bank balance is ${state.money}`, want];
+  if (!dry) { state.money += want - state.loan; state.loan = want; }
+  return [true, 0, '', want];
+}
+
 // Goal rows as CmdGoalStatus sends them. Progress comes from state.delivered[label] (tests set it).
 function goalView(g, state) {
   const targets = g.targets.map(([label, amount]) => [label, amount, state.delivered[label] ?? 0, (state.delivered[label] ?? 0) >= amount]);
@@ -90,7 +104,7 @@ const GS = {
     [3, 3, 5, 60, [[7, 80, 75]], 1],
   ],
   towns: () => [[1, 'Bigton', 42, 12, 5000, false, 800, 10, 200, 0, 6], [2, 'Smallham', 10, 50, 300, false, 40, 0, 10, 0, 2]],
-  companies: () => [{ id: 0, name: 'Test Transport', money: 100000, loan: 300000 }],
+  companies: (_a, state) => [{ id: 0, name: 'Test Transport', money: state.money, loan: state.loan, max_loan: FAKE_MAX_LOAN }],
   get_rate: () => ({ command_delay_ticks: 0, max_builds_per_day: 0 }),
   dump_tiles: dumpRows,
   acceptance: (a) => {
@@ -146,6 +160,11 @@ const GS = {
     const rows = [];
     let stopped = '';
     for (const st of a.steps) {
+      if (st[0] === 'loan') {
+        rows.push(fakeLoanStep(st, a.dry_run, state));
+        if (!rows.at(-1)[0] && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+        continue;
+      }
       const bad = st[0] === 'bogus' || (st[0] === 'veh_sell' && st[1] === 404) || (!a.dry_run && state.failOps.includes(st[0]));
       rows.push(bad ? [false, 0, 'Vehicle not available', 0] : [true, 10, '', 100 + rows.length]);
       if (bad && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
@@ -158,7 +177,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [] };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], money: 100000, loan: 300000, gsVersion: 8 };
   const server = net.createServer((sock) => {
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));

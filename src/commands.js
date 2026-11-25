@@ -119,6 +119,15 @@ async function acceptanceAt(s, points, { w = 1, h = 1, radius = 4, cargos } = {}
 }
 const OLD_GS = 'the running AgentBridge is older than v7 and has no acceptance query; the host runs install-gamescript and reloads the game';
 
+const OLD_GS_LOAN = 'the running AgentBridge is older than v8 and has no loan step; the host re-runs install-gamescript and loads the game again';
+
+/** Loan, max_loan and bank balance of one company (GS `companies`). */
+async function loanState(s, company) {
+  const c = (await s.gs.call('companies')).find((r) => r.id === company);
+  if (!c) throw new Error(`company ${company} not found; run: openttd-agent companies`);
+  return { loan: c.loan, max_loan: c.max_loan, money: c.money };
+}
+
 /** Town by id or exact name (case-insensitive). */
 const findTown = (towns, v) => towns.find((t) => String(t.id) === String(v) || t.name.toLowerCase() === String(v).toLowerCase());
 
@@ -878,6 +887,30 @@ export const COMMANDS = [
       s.throttleBuild();
       const res = await s.exec(company, [['autorenew', a.enabled ?? null, a.months ?? null, a.money ?? null]]);
       return { ...res, autorenew: await s.gs.call('autorenew', { company }) };
+    },
+  },
+  {
+    name: 'loan', group: 'operate', session: true,
+    description: 'Show or change your company loan. Give one of: amount (set the loan to this), borrow (add this much), repay (pay back this much; needs the cash), max true (borrow up to max_loan). The new loan is rounded up to the loan interval; refused below 0 or over max_loan. No arguments = show. Returns loan, max_loan and money before and after (dry_run: predicted). Needs AgentBridge v8.',
+    args: z.object({ ...act, amount: int().optional().describe('set the loan to this amount'), borrow: int().min(1).optional().describe('add this much to the loan'),
+      repay: int().min(1).optional().describe('pay back this much of the loan'), max: bool().optional().describe('true = borrow up to max_loan') }),
+    run: async (ctx, a) => {
+      const given = ['amount', 'borrow', 'repay', 'max'].filter((k) => a[k] !== undefined && a[k] !== false);
+      if (given.length > 1) throw new Error(`loan takes one of --amount, --borrow, --repay, --max; got ${given.map((k) => `--${k}`).join(', ')}. Nothing was run.`);
+      const { s, company } = await mine(ctx, a);
+      const before = await loanState(s, company);
+      if (!given.length) return before;
+      const step = a.max ? ['loan', 'max', 0] : a.amount !== undefined ? ['loan', 'set', a.amount] : ['loan', 'add', a.borrow ?? -a.repay];
+      const requested = a.max ? before.max_loan : a.amount ?? before.loan + (a.borrow ?? -a.repay);
+      if (!a.dry_run) s.throttleBuild();
+      const res = await s.exec(company, [step], { dryRun: a.dry_run });
+      const r = res.results[0];
+      if (r?.error?.startsWith('unknown exec op')) throw new Error(OLD_GS_LOAN);
+      if (!res.ok) return { ok: false, dry_run: a.dry_run, error: r?.error ?? res.stopped ?? 'failed', requested_loan: requested, before, after: before };
+      const target = r.value ?? 0; // execSummary drops a 0 value
+      const after = a.dry_run ? { loan: target, max_loan: before.max_loan, money: before.money + target - before.loan } : await loanState(s, company);
+      return { ok: true, dry_run: a.dry_run, requested_loan: requested, ...(target !== requested ? { rounded_to: target, note: 'rounded up to a multiple of the loan interval' } : {}),
+        change: target - before.loan, before, after };
     },
   },
   {

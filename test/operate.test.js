@@ -155,3 +155,51 @@ test('turn-advance runs the wanted number of days and leaves the game paused', a
   assert.ok(again.days_advanced >= 1);
   assert.equal(again.from, turn.to, 'no time passed between turns');
 });
+
+test('loan: show, borrow rounds up, repay, max, dry run', async () => {
+  fake.state.money = 100000; fake.state.loan = 300000;
+  assert.deepEqual(await run('loan', {}), { loan: 300000, max_loan: 500000, money: 100000 });
+  const dry = await run('loan', { borrow: 15000, dry_run: true });
+  assert.deepEqual(lastExec().steps, [['loan', 'add', 15000]]);
+  assert.equal(lastExec().dry_run, true);
+  assert.equal(dry.ok, true);
+  assert.equal(dry.rounded_to, 320000);
+  assert.deepEqual(dry.after, { loan: 320000, max_loan: 500000, money: 120000 });
+  assert.equal(fake.state.loan, 300000, 'dry run changes nothing');
+  const b = await run('loan', { borrow: 15000 });
+  assert.equal(b.change, 20000);
+  assert.deepEqual(b.before, { loan: 300000, max_loan: 500000, money: 100000 });
+  assert.deepEqual(b.after, { loan: 320000, max_loan: 500000, money: 120000 });
+  const r = await run('loan', { repay: 20000 });
+  assert.equal(r.ok, true);
+  assert.equal(r.rounded_to, undefined);
+  assert.equal(r.after.loan, 300000);
+  const m = await run('loan', { max: true });
+  assert.deepEqual(lastExec().steps, [['loan', 'max', 0]]);
+  assert.deepEqual(m.after, { loan: 500000, max_loan: 500000, money: 300000 });
+  fake.state.money = 600000;
+  const zero = await run('loan', { amount: 0 });
+  assert.equal(zero.ok, true);
+  assert.equal(zero.change, -500000);
+  assert.deepEqual(zero.after, { loan: 0, max_loan: 500000, money: 100000 });
+});
+
+test('loan: refusals, one option only, and an older GameScript', async () => {
+  fake.state.money = 5000; fake.state.loan = 300000;
+  const over = await run('loan', { amount: 600000 });
+  assert.equal(over.ok, false);
+  assert.match(over.error, /over max_loan 500000/);
+  assert.deepEqual(over.after, over.before);
+  assert.match((await run('loan', { amount: -10 })).error, /below 0/);
+  const poor = await run('loan', { repay: 100000 });
+  assert.equal(poor.ok, false);
+  assert.match(poor.error, /needs that much cash; bank balance is 5000/);
+  assert.equal(fake.state.loan, 300000);
+  await assert.rejects(run('loan', { borrow: 10000, repay: 10000 }), /one of --amount, --borrow, --repay, --max/);
+  fake.state.gsVersion = 7;
+  try {
+    await assert.rejects(run('loan', { borrow: 10000 }), /older than v8.*install-gamescript/);
+  } finally {
+    fake.state.gsVersion = 8; fake.state.money = 100000;
+  }
+});
