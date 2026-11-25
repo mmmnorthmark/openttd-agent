@@ -14,7 +14,8 @@ import { prepareScenario } from './scenario.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow } from './operate.js';
-import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, depotCandidates, depotSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
+import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
+import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 
 const int = () => z.coerce.number().int();
@@ -188,6 +189,146 @@ async function lineDepot(s, company, near, { radius = 12, railType, dryRun = fal
       ...(ok ? { next: `vehicle-buy --depot_x ${depot.x} --depot_y ${depot.y} --engine <id>` } : { hint: 'a join failed: run build-track on the front tile toward each end, or try another --station' }) };
   }
   return { ok: false, candidates_on_map: cands.length, tried, hint: cands.length ? 'every spot failed its dry run; try --radius 20' : 'no straight piece of rail with free flat land beside it near there; try --radius 20 or another station' };
+}
+
+/** Do two terminus sites (station-sites entries) share a tile? */
+function sitesOverlap(a, b) {
+  const tiles = (site) => terminusFootprint({ x: site.x, y: site.y, axis: site.axis, platforms: site.platforms, length: site.length, exitHigh: site.exit === 'high' }).tiles;
+  const seen = new Set(tiles(a).map((t) => t.join(',')));
+  return tiles(b).some((t) => seen.has(t.join(',')));
+}
+
+/** Your station whose sign tile lies on a just-built terminus site. */
+async function stationAt(s, company, site) {
+  const { station: r } = terminusFootprint({ x: site.x, y: site.y, axis: site.axis, platforms: site.platforms, length: site.length, exitHigh: site.exit === 'high' });
+  const rows = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+  return rows.find((st) => st.x >= r.x0 && st.x <= r.x1 && st.y >= r.y0 && st.y <= r.y1) ?? null;
+}
+
+/**
+ * build-cargo-route: plan everything as a dry run (both termini, the line between their connect_at
+ * anchors, a depot beside the line near the source, a train), then, unless dryRun, build it step by
+ * step. On a failure it stops and reports the step and everything already built; it never demolishes.
+ */
+async function buildCargoRoute(s, company, a) {
+  const plan = { dry_run: a.dry_run, company };
+  const built = [];
+  const fail = (step, error, extra = {}) => ({ ok: false, failed_step: step, error, built, ...plan, ...extra,
+    hint: built.length ? 'nothing was demolished: continue from the failed step by hand (build-rail, build-line-depot, vehicle-buy, order-add, vehicle-start) using the ids and tiles in built' : 'nothing was built' });
+  const from = a.from_industry !== undefined ? { industry: a.from_industry } : a.from_town !== undefined ? { town: a.from_town } : null;
+  const to = a.to_industry !== undefined ? { industry: a.to_industry } : a.to_town !== undefined ? { town: a.to_town } : null;
+  if (!from || !to) throw new Error('give one source (--from_industry <id> or --from_town <name>) and one destination (--to_industry <id> or --to_town <name>)');
+  const cargo = cargoId(s.cargos, a.cargo);
+  const cargoInfo = s.cargos.get(cargo);
+  const railTypes = await s.gs.call('rail_types', { company });
+  // Default: the cheapest track (the plain build-rail default is the game's first listed type, often electrified).
+  const railType = a.rail_type ?? [...railTypes].sort((p, q) => p[3] - q[3])[0]?.[0];
+  if (railType === undefined) throw new Error('your company cannot build any rail type yet (see rail-types)');
+  plan.rail_type = railType;
+
+  // 1. Stations: best dry-run-checked site at each end, facing the other end, not overlapping.
+  const opts = { platforms: a.platforms, length: a.length, radius: a.radius, limit: 3, railType };
+  const srcSites = await stationSites(s, company, from, to, opts);
+  const dstSites = await stationSites(s, company, to, from, opts);
+  if (!srcSites.sites.length) return fail('source_station', `no terminus site passed near ${srcSites.target}`, { hint_sites: srcSites.hint });
+  if (!dstSites.sites.length) return fail('dest_station', `no terminus site passed near ${dstSites.target}`, { hint_sites: dstSites.hint });
+  let src = null, dst = null;
+  for (const p of srcSites.sites) { const q = dstSites.sites.find((d) => !sitesOverlap(p, d)); if (q) { src = p; dst = q; break; } }
+  if (!src) return fail('dest_station', 'every source and destination site overlap: the two ends are too close for two termini');
+  plan.source_site = { target: srcSites.target, ...src };
+  plan.dest_site = { target: dstSites.target, ...dst };
+
+  // 2. Line between the anchors, planned on a view that already has both termini.
+  const lineArgs = (map) => planPath(map, src.connect_at, dst.connect_at, { mode: 'rail', margin: a.margin, startDir: dirIndex(src.connect_at.dir),
+    endDir: dirIndex(oppositeDir(dst.connect_at.dir)), maxBridge: a.max_bridge });
+  const box = [Math.min(src.connect_at.x, dst.connect_at.x) - a.margin, Math.min(src.connect_at.y, dst.connect_at.y) - a.margin,
+    Math.max(src.connect_at.x, dst.connect_at.x) + a.margin, Math.max(src.connect_at.y, dst.connect_at.y) + a.margin];
+  await s.refreshArea(...box);
+  const cells = terminusCells(dst, terminusCells(src));
+  const line = lineArgs(overlayMap(s.map, cells));
+  if (!line.reachable) return fail('rail_line', line.reason ?? 'no rail path between the two stations');
+  const lineSteps = railSteps(line, { bridgeType: -1 });
+  const lineCheck = await s.exec(company, lineSteps, { dryRun: true, railType });
+  plan.line = { ...line.stats, cost: lineCheck.cost };
+  if (!lineCheck.ok) return fail('rail_line', `rail dry run failed: ${lineCheck.first_error}`, { line_results: lineCheck.results.filter((r) => !r.ok).slice(0, 5) });
+
+  // 3. Depot beside the planned line near the source.
+  const near = [src.connect_at.x, src.connect_at.y];
+  const depotCheck = await lineDepot(s, company, near, { radius: 12, railType, dryRun: true, map: overlayMap(s.map, pathCells(line, cells)) });
+  if (!depotCheck.ok) return fail('depot', depotCheck.hint ?? 'no depot spot passed its dry run', { tried: depotCheck.tried });
+  plan.depot = { ...depotCheck.depot, cost: depotCheck.cost };
+
+  // 4. Train.
+  const engines = enginesFromRows(await s.gs.call('engines', { company, type: 0, cargo, rail_type: railType }), s.cargos);
+  let train;
+  try { train = pickTrain(engines, { cargoId: cargo, engine: a.engine, wagon: a.wagon }); } catch (e) { return fail('engine', e.message); }
+  const wagons = a.wagons ?? defaultWagons(src.length);
+  plan.train = { locomotive: { id: train.loco.id, name: train.loco.name, price: train.loco.price, running_cost: train.loco.running_cost },
+    wagon: { id: train.wagon.id, name: train.wagon.name, price: train.wagon.price, capacity: train.wagon.capacity }, wagons,
+    cost: train.loco.price + wagons * train.wagon.price };
+  const orders = routeOrderFlags({ passengerOrMail: !!(cargoInfo?.passengers || cargoInfo?.mail), fromTown: !!from.town, toTown: !!to.town });
+  plan.orders = { source: orders.source_flags || 'plain', dest: orders.dest_flags || 'plain' };
+  const estimate = src.cost + dst.cost + lineCheck.cost + depotCheck.cost + plan.train.cost;
+  plan.estimated_cost = estimate;
+  plan.money = lineCheck.money;
+  plan.affordable = lineCheck.money === null || lineCheck.money >= estimate;
+  if (a.dry_run) return { ok: true, ...plan, note: 'dry run: nothing was built. Depot joins and train purchase are estimated, not dry-run.' };
+  if (!plan.affordable) return fail('money', `estimated cost ${estimate} is more than the company has (${lineCheck.money})`);
+
+  // ---- build, step by step -------------------------------------------------------------
+  const exec = async (steps, opts2 = {}) => { s.throttleBuild(); return s.exec(company, steps, { railType, ...opts2 }); };
+  let spent = 0;
+  const station = async (name, site) => {
+    const t = terminusSteps({ x: site.x, y: site.y, axis: site.axis, platforms: site.platforms, length: site.length, exitHigh: site.exit === 'high', join: -1 });
+    const res = await exec(t.steps);
+    spent += res.cost;
+    const st = res.results.some((r) => r.op === 'rail_station' && r.ok) ? await stationAt(s, company, site) : null;
+    if (st || res.results.some((r) => r.ok)) built.push({ step: name, station: st?.id ?? null, x: site.x, y: site.y, connect_at: site.connect_at, complete: res.ok, cost: res.cost });
+    return { res, st };
+  };
+  try {
+    const A = await station('source_station', src);
+    if (!A.res.ok) return fail('source_station', A.res.first_error, { spent });
+    const B = await station('dest_station', dst);
+    if (!B.res.ok) return fail('dest_station', B.res.first_error, { spent });
+    await s.refreshArea(...box);
+    const realLine = lineArgs(s.map);
+    if (!realLine.reachable) return fail('rail_line', realLine.reason ?? 'no rail path after building the stations', { spent });
+    const lineRes = await exec(railSteps(realLine, { bridgeType: -1 }));
+    spent += lineRes.cost;
+    built.push({ step: 'rail_line', from: src.connect_at, to: dst.connect_at, tiles: realLine.stats.tiles, steps_done: lineRes.steps_done, steps_total: lineRes.steps_total, complete: lineRes.ok, cost: lineRes.cost });
+    if (!lineRes.ok) {
+      const bad = lineRes.results.find((r) => !r.ok);
+      return fail('rail_line', lineRes.first_error, { spent, failed_rail_step: bad ? railSteps(realLine, { bridgeType: -1 })[bad.step] : null });
+    }
+    await s.refreshArea(...box);
+    // The overlay marks what was just built in case the mirror rows lag behind.
+    const dep = await lineDepot(s, company, near, { radius: 12, railType, map: overlayMap(s.map, pathCells(realLine, terminusCells(dst, terminusCells(src)))) });
+    spent += dep.cost ?? 0;
+    if (dep.depot) built.push({ step: 'depot', x: dep.depot.x, y: dep.depot.y, front: dep.front, complete: dep.ok, cost: dep.cost });
+    if (!dep.ok) return fail('depot', dep.hint ?? 'depot failed', { spent, depot_results: dep.results });
+    const locoRes = await exec([['veh_buy', dep.depot.x, dep.depot.y, train.loco.id, -1, -1]]);
+    spent += locoRes.cost;
+    const loco = locoRes.ok ? locoRes.results[0].value : null;
+    if (loco === null || loco === undefined) return fail('buy_locomotive', locoRes.first_error, { spent });
+    built.push({ step: 'buy_locomotive', vehicle: loco, engine: train.loco.id, cost: locoRes.cost });
+    const refit = train.wagon.cargo === cargo ? -1 : cargo;
+    const wagRes = await exec(Array.from({ length: wagons }, () => ['veh_buy', dep.depot.x, dep.depot.y, train.wagon.id, refit, loco]));
+    spent += wagRes.cost;
+    built.push({ step: 'buy_wagons', attached_to: loco, wagons: wagRes.steps_done, of: wagons, wagon_ids: wagRes.results.filter((r) => r.ok).map((r) => r.value), complete: wagRes.ok, cost: wagRes.cost });
+    if (!wagRes.ok) return fail('buy_wagons', wagRes.first_error, { spent, vehicle: loco });
+    const ordRes = await exec([['order_add', loco, src.x, src.y, orders.source, -1], ['order_add', loco, dst.x, dst.y, orders.dest, -1]]);
+    built.push({ step: 'orders', vehicle: loco, done: ordRes.steps_done, complete: ordRes.ok });
+    if (!ordRes.ok) return fail('orders', ordRes.first_error, { spent, vehicle: loco });
+    const startRes = await exec([['veh_start_stop', loco, 1]]);
+    if (!startRes.ok) return fail('start', startRes.first_error, { spent, vehicle: loco });
+    built.push({ step: 'start', vehicle: loco });
+    return { ok: true, ...plan, dry_run: false, source_station: A.st?.id ?? null, dest_station: B.st?.id ?? null, depot: dep.depot, vehicle: loco,
+      total_cost: spent, built, next: `vehicle-clone --depot_x ${dep.depot.x} --depot_y ${dep.depot.y} --vehicle ${loco} --start true adds trains with the same orders` };
+  } catch (e) {
+    const last = built.at(-1)?.step ?? null;
+    return fail(last ? `after ${last}` : 'source_station', e.message, { spent });
+  }
 }
 
 /** Run exec steps as the company (client throttle + GS rate gate apply). */
@@ -881,6 +1022,28 @@ export const COMMANDS = [
       await s.ensureTiles();
       await s.refreshArea(Math.max(0, near[0] - a.radius - 1), Math.max(0, near[1] - a.radius - 1), near[0] + a.radius + 1, near[1] + a.radius + 1);
       return lineDepot(s, company, near, { radius: a.radius, railType: a.rail_type, dryRun: a.dry_run });
+    },
+  },
+  {
+    name: 'build-cargo-route', group: 'build', session: true,
+    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
+    args: z.object({
+      ...act,
+      from_industry: int().optional().describe('source industry id (see industries / find-cargo-pairs)'), from_town: z.string().optional().describe('source town id or name'),
+      to_industry: int().optional(), to_town: z.string().optional(),
+      cargo: z.string().describe('cargo name or label (see cargos)'),
+      engine: int().optional().describe('locomotive engine id (see engines --type rail --cargo <c>)'), wagon: int().optional().describe('wagon engine id'),
+      wagons: int().min(1).max(60).optional().describe('default: fill the platform length (2 per tile, minus the locomotive)'),
+      platforms: int().min(1).max(4).default(2), length: int().min(2).max(10).default(4),
+      radius: int().min(2).max(20).default(8).describe('station search box around each end'),
+      margin: int().min(2).max(80).default(20).describe('how far the line may wander outside the two stations'),
+      max_bridge: int().min(3).max(40).default(12), rail_type: int().optional().describe('see rail-types; default: the one with the cheapest track'),
+    }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      if ((a.from_industry !== undefined) === (a.from_town !== undefined)) throw new Error('give exactly one of --from_industry, --from_town');
+      if ((a.to_industry !== undefined) === (a.to_town !== undefined)) throw new Error('give exactly one of --to_industry, --to_town');
+      return buildCargoRoute(s, company, a);
     },
   },
   {

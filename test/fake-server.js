@@ -138,12 +138,13 @@ const GS = {
   bridge_types: (a) => [[0, 'Wooden rail bridge', 32, 100 * a.length, 0, 16], [2, 'Steel girder bridge', 112, 300 * a.length, 0, 400]],
   airport_types: () => [{ type: 0, name: 'small', buildable_now: true, width: 4, height: 3, coverage_radius: 4, price: 5000, monthly_maintenance: 300 }],
   // exec: every step costs 10 and returns value 100+index; a step whose op is 'veh_sell'
-  // on vehicle 404, or any step with op 'bogus', fails.
-  exec: (a) => {
+  // on vehicle 404, any step with op 'bogus', and real (not dry-run) steps whose op is in
+  // state.failOps (tests set it) fail.
+  exec: (a, state) => {
     const rows = [];
     let stopped = '';
     for (const st of a.steps) {
-      const bad = st[0] === 'bogus' || (st[0] === 'veh_sell' && st[1] === 404);
+      const bad = st[0] === 'bogus' || (st[0] === 'veh_sell' && st[1] === 404) || (!a.dry_run && state.failOps.includes(st[0]));
       rows.push(bad ? [false, 0, 'Vehicle not available', 0] : [true, 10, '', 100 + rows.length]);
       if (bad && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
     }
@@ -155,7 +156,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [] };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [] };
   const server = net.createServer((sock) => {
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));

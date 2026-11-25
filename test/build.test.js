@@ -121,3 +121,53 @@ test('find-cargo-pairs pairs goods with towns that accept them; acceptance comma
   assert.deepEqual(one.cargo.map((c) => [c.label, c.acceptance, c.accepted]), [['WOOD', 0, false]]);
   assert.deepEqual(fake.received.filter((r) => r.cmd === 'acceptance').at(-1).args.cargos, [7]);
 });
+
+test('build-cargo-route dry run: both termini, the line, a depot and a train, with the total cost', async () => {
+  const before = execs().length;
+  const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true });
+  assert.equal(res.ok, true, JSON.stringify(res).slice(0, 400));
+  assert.ok(execs().slice(before).every((e) => e.args.dry_run === true), 'a dry run sends only dry-run execs');
+  assert.equal(res.train.locomotive.id, 5, 'cheapest to run');
+  assert.equal(res.train.wagon.id, 27);
+  assert.equal(res.train.wagons, 7, 'fills a 4-tile platform');
+  assert.equal(res.train.cost, 8000 + 7 * 1500);
+  assert.deepEqual(res.orders, { source: 'full_load_any', dest: 'unload,no_load' });
+  assert.equal(res.estimated_cost, res.source_site.cost + res.dest_site.cost + res.line.cost + res.depot.cost + res.train.cost);
+  assert.ok(res.source_site.connect_at.x > res.source_site.x - 10 && res.dest_site.x > 40, 'one station at each end');
+  assert.ok(res.line.tiles > 20);
+});
+
+test('build-cargo-route builds in order, buys and orders the train, starts it', async () => {
+  const before = execs().length;
+  const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', wagons: 3 });
+  assert.equal(res.ok, true, JSON.stringify(res).slice(0, 400));
+  const real = execs().slice(before).filter((e) => !e.args.dry_run).map((e) => e.args.steps);
+  assert.equal(real[0][0][0], 'rail_station');
+  assert.equal(real[1][0][0], 'rail_station');
+  assert.ok(real[2].every((st) => st[0] === 'rail' || st[0] === 'bridge'), 'then the line');
+  assert.equal(real[3][0][0], 'rail_depot');
+  const [loco, wagons, orders, start] = real.slice(4);
+  assert.deepEqual(loco, [['veh_buy', res.depot.x, res.depot.y, 5, -1, -1]]);
+  assert.equal(wagons.length, 3);
+  assert.deepEqual(wagons[0], ['veh_buy', res.depot.x, res.depot.y, 27, -1, res.vehicle], 'no refit: the wagon already carries wood');
+  assert.deepEqual(orders, [['order_add', res.vehicle, res.source_site.x, res.source_site.y, 96, -1], ['order_add', res.vehicle, res.dest_site.x, res.dest_site.y, 132, -1]]);
+  assert.deepEqual(start, [['veh_start_stop', res.vehicle, 1]]);
+  assert.equal(res.vehicle, 100);
+  assert.ok(res.total_cost > 0);
+  assert.deepEqual(res.built.map((b) => b.step), ['source_station', 'dest_station', 'rail_line', 'depot', 'buy_locomotive', 'buy_wagons', 'orders', 'start']);
+});
+
+test('build-cargo-route stops at a failed step and reports what was built', async () => {
+  fake.state.failOps = ['veh_buy'];
+  const before = execs().length;
+  try {
+    const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood' });
+    assert.equal(res.ok, false);
+    assert.equal(res.failed_step, 'buy_locomotive');
+    assert.deepEqual(res.built.map((b) => b.step), ['source_station', 'dest_station', 'rail_line', 'depot']);
+    assert.ok(res.built[3].x !== undefined && res.built[0].connect_at);
+    assert.match(res.hint, /nothing was demolished/);
+    assert.equal(execs().slice(before).filter((e) => e.args.steps.some((st) => st[0] === 'demolish')).length, 0);
+  } finally { fake.state.failOps = []; }
+  await assert.rejects(run('build-cargo-route', { from_industry: 1, from_town: 'Bigton', to_industry: 2, cargo: 'wood' }), /exactly one of --from_industry, --from_town/);
+});
