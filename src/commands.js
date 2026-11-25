@@ -7,12 +7,32 @@
 import * as z from 'zod/v4';
 import { doctor, installGamescript, launch } from './setup.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
+import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
+  encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES } from './operate.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, DEFAULT_COSTS } from './world.js';
 
 const int = () => z.coerce.number().int();
 const num = () => z.coerce.number();
 const bool = () => z.preprocess((v) => (v === 'true' ? true : v === 'false' ? false : v), z.boolean());
 const point = { x: int().describe('tile x'), y: int().describe('tile y') };
+/** "1,2,3" | 5 | [1,2] -> [ints] */
+const ids = () => z.preprocess((v) => (Array.isArray(v) ? v : String(v).split(',').filter((t) => t.trim() !== '')), z.array(int()).min(1));
+const who = { company: int().optional().describe('company id; default: your configured company') };
+const act = { ...who, dry_run: bool().default(false).describe('true = cost/feasibility only, changes nothing') };
+const lc = (v) => String(v).toLowerCase();
+
+/** Session + company for read commands. */
+async function mine(ctx, a) {
+  const s = await ctx.session();
+  return { s, company: s.companyOrThrow(a.company) };
+}
+
+/** Run exec steps as the company (client throttle + GS rate gate apply). */
+async function run(ctx, a, steps, opts = {}) {
+  const { s, company } = await mine(ctx, a);
+  if (!a.dry_run) s.throttleBuild();
+  return s.exec(company, steps, { dryRun: a.dry_run, ...opts });
+}
 
 export const COMMANDS = [
   // ---- setup ------------------------------------------------------------------
@@ -242,6 +262,231 @@ export const COMMANDS = [
       s.throttleBuild();
       return s.gs.call('build_road', { ...a, company: s.companyOrThrow(a.company) });
     },
+  },
+
+  // ---- operate (read) -------------------------------------------------------------
+  {
+    name: 'stations', group: 'operate', session: true,
+    description: 'Your stations (or --company X): location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving. Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations).',
+    args: z.object({ ...who, facility: z.enum(FACILITIES).optional(), cargo: z.string().optional(), min_waiting: int().default(0),
+      max_rating_pct: int().default(100), name: z.string().optional(), limit: int().default(100) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const cargoFilter = a.cargo !== undefined || a.min_waiting > 0 || a.max_rating_pct < 100;
+      return stationsFromRows(await s.gs.call('stations', { company }), s.cargos)
+        .filter((st) => (!a.facility || st.facilities.includes(a.facility)) && (!a.name || lc(st.name).includes(lc(a.name)))
+          && (!cargoFilter || st.cargo.some((c) => (!a.cargo || lc(c.name).includes(lc(a.cargo))) && c.waiting >= a.min_waiting && c.rating_pct <= a.max_rating_pct)))
+        .slice(0, a.limit);
+    },
+  },
+  {
+    name: 'vehicles', group: 'operate', session: true,
+    description: 'Your vehicles: type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: type, group, state, max_profit_last_year (e.g. 0 = loss makers), min_age_pct (e.g. 90 = due for replacement), max_reliability_pct, name. Breakdown counts and service intervals are not exposed by the game to scripts.',
+    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
+      max_profit_last_year: int().optional(), min_age_pct: int().default(0), max_reliability_pct: int().default(100), name: z.string().optional(), limit: int().default(200) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
+      const vehicles = all.filter((v) => (!a.type || v.type === a.type) && (a.group === undefined || v.group === a.group) && (!a.state || v.state === a.state)
+        && (a.max_profit_last_year === undefined || v.profit_last_year <= a.max_profit_last_year) && v.age_pct >= a.min_age_pct
+        && v.reliability_pct <= a.max_reliability_pct && (!a.name || lc(v.name).includes(lc(a.name))));
+      return { total: all.length, matched: vehicles.length, vehicles: vehicles.slice(0, a.limit) };
+    },
+  },
+  {
+    name: 'vehicle', group: 'operate', session: true,
+    description: 'One vehicle in detail: status, capacity and load per cargo, wagons, and the full order list with decoded flags.',
+    args: z.object({ ...who, vehicle: int() }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      return vehicleDetail(await s.gs.call('vehicle', { company, vehicle: a.vehicle }), s.cargos);
+    },
+  },
+  {
+    name: 'engines', group: 'operate', session: true,
+    description: 'Engines/wagons/vehicles your company can buy now: price, capacity, max speed, reliability, running cost per year, lifespan, design year, power. type is required; cargo (name) keeps wagons/vehicles refittable to it and locomotives that can pull it; rail_type keeps trains for that track (see rail-types). Newest design first: compare with your fleet to decide replacements.',
+    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES), cargo: z.string().optional(), rail_type: int().optional(), wagons: bool().optional().describe('rail only: true = wagons only, false = locomotives only'), limit: int().default(60) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const cargo = cargoId(s.cargos, a.cargo);
+      const rows = await s.gs.call('engines', { company, type: vehicleTypeId(a.type), ...(cargo !== undefined ? { cargo } : {}), ...(a.rail_type !== undefined ? { rail_type: a.rail_type } : {}) });
+      return enginesFromRows(rows, s.cargos).filter((e) => a.wagons === undefined || e.is_wagon === a.wagons)
+        .sort((x, y) => y.design_year - x.design_year).slice(0, a.limit);
+    },
+  },
+  {
+    name: 'groups', group: 'operate', session: true,
+    description: 'Your vehicle groups with vehicle count and profit this/last year. Use one group per strategy to account for it.',
+    args: z.object({ ...who }),
+    run: async (ctx, a) => { const { s, company } = await mine(ctx, a); return groupsFromRows(await s.gs.call('groups', { company })); },
+  },
+  {
+    name: 'depots', group: 'operate', session: true,
+    description: 'Your depots (or hangars) of one type with the number of vehicles inside. Vehicles are bought and cloned at a depot tile.',
+    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      return (await s.gs.call('depots', { company, type: vehicleTypeId(a.type) })).map(([x, y, vehicles]) => ({ x, y, vehicles }));
+    },
+  },
+  {
+    name: 'events', group: 'operate', session: true,
+    description: 'Game events since sequence number `since` (keep latest_seq and pass it next time): vehicle_crashed, subsidy_offer/awarded/expired, industry_open/close, company_new/in_trouble/bankrupt/merger, station_first_vehicle, town_founded, exclusive_transport_rights, road_reconstruction. The game does not send scripts vehicle-lost/unprofitable or production-change events: poll `vehicles` and `industries` for those. The buffer holds the last 300 events and restarts when the game is loaded.',
+    args: z.object({ since: int().default(0), type: z.string().optional().describe('substring of the event type') }),
+    run: async (ctx, a) => {
+      const s = await ctx.session();
+      const events = await s.gs.call('events', { since: a.since });
+      return { latest_seq: events.length ? events.at(-1).seq : a.since, my_company: s.cfg.company,
+        events: events.filter((e) => !a.type || e.type.includes(lc(a.type))) };
+    },
+  },
+
+  // ---- operate (change; rate limited like builds) ----------------------------------
+  {
+    name: 'group-create', group: 'operate', session: true,
+    description: 'Create a vehicle group for one vehicle type; returns its id in `group`.',
+    args: z.object({ ...act, type: z.enum(VEHICLE_TYPES), name: z.string().default(''), parent: int().default(-1) }),
+    run: async (ctx, a) => {
+      const res = await run(ctx, a, [['group_create', vehicleTypeId(a.type), a.name, a.parent]]);
+      return { ...res, group: res.results[0]?.value ?? null };
+    },
+  },
+  {
+    name: 'group-rename', group: 'operate', session: true,
+    description: 'Rename a vehicle group.',
+    args: z.object({ ...act, group: int(), name: z.string().min(1) }),
+    run: (ctx, a) => run(ctx, a, [['group_rename', a.group, a.name]]),
+  },
+  {
+    name: 'group-delete', group: 'operate', session: true,
+    description: 'Delete a vehicle group (its vehicles go back to the default group).',
+    args: z.object({ ...act, group: int() }),
+    run: (ctx, a) => run(ctx, a, [['group_delete', a.group]]),
+  },
+  {
+    name: 'group-move', group: 'operate', session: true,
+    description: 'Move vehicles (comma-separated ids) into a group; group -1 = back to the default group.',
+    args: z.object({ ...act, group: int(), vehicles: ids() }),
+    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['group_move', a.group, v]), { keepGoing: true }),
+  },
+  {
+    name: 'group-autoreplace', group: 'operate', session: true,
+    description: 'Autoreplace old_engine with new_engine (ids from `engines`) for a group; group -1 = all vehicles. Omit new_engine to stop replacing old_engine. Vehicles are replaced when they next visit a depot.',
+    args: z.object({ ...act, group: int().default(-1), old_engine: int(), new_engine: int().default(-1) }),
+    run: (ctx, a) => run(ctx, a, [['autoreplace', a.group, a.old_engine, a.new_engine]]),
+  },
+  {
+    name: 'autorenew', group: 'operate', session: true,
+    description: 'Show or set company autorenew: enabled, months (renew this many months before/after max age; negative = before), money (minimum bank balance needed). No arguments = show.',
+    args: z.object({ ...who, enabled: bool().optional(), months: int().optional(), money: int().optional() }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      if (a.enabled === undefined && a.months === undefined && a.money === undefined) return s.gs.call('autorenew', { company });
+      s.throttleBuild();
+      const res = await s.exec(company, [['autorenew', a.enabled ?? null, a.months ?? null, a.money ?? null]]);
+      return { ...res, autorenew: await s.gs.call('autorenew', { company }) };
+    },
+  },
+  {
+    name: 'order-add', group: 'operate', session: true,
+    description: `Add an order to a vehicle: destination is a station id (see stations) or a tile x,y (station tile, depot tile or waypoint). Appends unless position is given (insert before that position). flags, comma-separated: ${ORDER_FLAG_HELP}. Example: --vehicle 12 --station 3 --flags full_load_any,non_stop`,
+    args: z.object({ ...act, vehicle: int(), station: int().optional(), x: int().optional(), y: int().optional(), flags: z.string().default(''), position: int().default(-1) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      let { x, y } = a;
+      if (a.station !== undefined) {
+        const st = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).find((t) => t.id === a.station);
+        if (!st) throw new Error(`station ${a.station} is not one of company ${company}'s stations. Run: openttd-agent stations`);
+        ({ x, y } = st);
+      }
+      if (x === undefined || y === undefined) throw new Error('give a destination: --station <id> or --x <tile x> --y <tile y>');
+      const depot = /service_if_needed|stop_in_depot/.test(a.flags);
+      return run(ctx, a, [['order_add', a.vehicle, x, y, encodeOrderFlags(a.flags, { depot }), a.position]]);
+    },
+  },
+  {
+    name: 'order-remove', group: 'operate', session: true,
+    description: 'Remove the order at a position (0-based, see `vehicle`).',
+    args: z.object({ ...act, vehicle: int(), position: int().min(0) }),
+    run: (ctx, a) => run(ctx, a, [['order_remove', a.vehicle, a.position]]),
+  },
+  {
+    name: 'order-flags', group: 'operate', session: true,
+    description: `Replace the flags of an existing order. flags, comma-separated: ${ORDER_FLAG_HELP}. Empty = plain order.`,
+    args: z.object({ ...act, vehicle: int(), position: int().min(0), flags: z.string().default('') }),
+    run: (ctx, a) => run(ctx, a, [['order_flags', a.vehicle, a.position, encodeOrderFlags(a.flags, { depot: /service_if_needed|stop_in_depot/.test(a.flags) })]]),
+  },
+  {
+    name: 'order-skip', group: 'operate', session: true,
+    description: 'Make a vehicle head for the order at this position now.',
+    args: z.object({ ...act, vehicle: int(), position: int().min(0) }),
+    run: (ctx, a) => run(ctx, a, [['order_skip', a.vehicle, a.position]]),
+  },
+  {
+    name: 'orders-copy', group: 'operate', session: true,
+    description: 'Give vehicles (comma-separated ids) the orders of vehicle `from`. share=true (default) shares the list, so later edits apply to all; share=false copies it.',
+    args: z.object({ ...act, vehicles: ids(), from: int(), share: bool().default(true) }),
+    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['orders_copy', v, a.from, a.share]), { keepGoing: true }),
+  },
+  {
+    name: 'vehicle-buy', group: 'operate', session: true,
+    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>. New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start.',
+    args: z.object({ ...act, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1) }),
+    run: async (ctx, a) => {
+      const { s } = await mine(ctx, a);
+      const cargo = cargoId(s.cargos, a.cargo) ?? -1;
+      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_buy', a.depot_x, a.depot_y, a.engine, cargo, a.attach_to]));
+      return { ...res, vehicles: res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value) };
+    },
+  },
+  {
+    name: 'vehicle-clone', group: 'operate', session: true,
+    description: 'Clone a vehicle `count` times at a depot tile, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`.',
+    args: z.object({ ...act, depot_x: int(), depot_y: int(), vehicle: int(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false) }),
+    run: async (ctx, a) => {
+      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', a.depot_x, a.depot_y, a.vehicle, a.share_orders]));
+      const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
+      if (!a.start || a.dry_run || !vehicles.length) return { ...res, vehicles };
+      const { s, company } = await mine(ctx, a);
+      const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
+      return { ...res, vehicles, started: started.ok };
+    },
+  },
+  {
+    name: 'vehicle-start', group: 'operate', session: true,
+    description: 'Start vehicles (comma-separated ids). Already running ones are left alone.',
+    args: z.object({ ...act, vehicles: ids() }),
+    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true }),
+  },
+  {
+    name: 'vehicle-stop', group: 'operate', session: true,
+    description: 'Stop vehicles (comma-separated ids).',
+    args: z.object({ ...act, vehicles: ids() }),
+    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_start_stop', v, 0]), { keepGoing: true }),
+  },
+  {
+    name: 'vehicle-depot', group: 'operate', session: true,
+    description: 'Send vehicles (comma-separated ids) to a depot: they stop there (needed before vehicle-sell). service=true = service only and carry on.',
+    args: z.object({ ...act, vehicles: ids(), service: bool().default(false) }),
+    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_depot', v, a.service]), { keepGoing: true }),
+  },
+  {
+    name: 'vehicle-sell', group: 'operate', session: true,
+    description: 'Sell vehicles (comma-separated ids). Each must be stopped inside a depot (vehicle-depot, then check `vehicles --state in_depot`). The negative cost is the sale income.',
+    args: z.object({ ...act, vehicles: ids() }),
+    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_sell', v]), { keepGoing: true }),
+  },
+  {
+    name: 'vehicle-refit', group: 'operate', session: true,
+    description: 'Refit a vehicle stopped in a depot to a cargo (name).',
+    args: z.object({ ...act, vehicle: int(), cargo: z.string() }),
+    run: async (ctx, a) => { const { s } = await mine(ctx, a); return run(ctx, a, [['veh_refit', a.vehicle, cargoId(s.cargos, a.cargo)]]); },
+  },
+  {
+    name: 'vehicle-rename', group: 'operate', session: true,
+    description: 'Rename a vehicle.',
+    args: z.object({ ...act, vehicle: int(), name: z.string().min(1) }),
+    run: (ctx, a) => run(ctx, a, [['veh_rename', a.vehicle, a.name]]),
   },
 ];
 

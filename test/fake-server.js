@@ -25,7 +25,7 @@ function dumpRows({ y0, y1, x0 = 0, x1 = FAKE_MAP - 1 }) {
 }
 
 const GS = {
-  info: () => ({ tick: 1, date: 1, year: 1950, month: 1, day: 1, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: false, towns: 2, industries: 3, bridge_version: 2 }),
+  info: () => ({ tick: 1, date: 1, year: 1950, month: 1, day: 1, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: false, towns: 2, industries: 3, bridge_version: 3, event_seq: 2 }),
   cargos: () => [{ id: 0, label: 'PASS', name: 'Passengers', passengers: true }, { id: 7, label: 'WOOD', name: 'Wood', passengers: false }],
   industry_types: () => [{ id: 3, name: 'Forest', produces: [7], accepts: [] }, { id: 4, name: 'Sawmill', produces: [], accepts: [7] }],
   industries: () => [
@@ -39,6 +39,50 @@ const GS = {
   dump_tiles: dumpRows,
   echo: (a) => a,
   build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 98766, echoed_company: a.company }),
+  // operate (row formats: see main.nut)
+  stations: () => [
+    [3, 'Bigton Woods', 12, 20, 1, [[7, 240, 35]], 2],
+    [4, 'Bigton Central', 41, 9, 4 | 2, [[0, 15, 80]], 5],
+  ],
+  vehicles: () => [
+    [11, 'Train 1', 0, 5, 'Kirby Paul Tank', 4000, 7300, 62, -1200, -3000, 9000, 0, 14, 20, 2, 2, 1, 800, false],
+    [12, 'Road Vehicle 1', 1, 9, 'MPS Regal Bus', 100, 5475, 98, 400, 2500, 4000, 3, 41, 9, 0xFFFE, 2, 1, 300, true],
+  ],
+  vehicle: (a) => {
+    if (a.vehicle !== 11) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${a.company}; run: openttd-agent vehicles`);
+    return [
+      { id: 11, name: 'Train 1', type: 0, engine: 5, engine_name: 'Kirby Paul Tank', age_days: 4000, max_age_days: 7300, reliability_pct: 62,
+        profit_this_year: -1200, profit_last_year: -3000, value: 9000, running_cost: 800, state: 0, x: 14, y: 20, speed: 60, group: 2,
+        wagons: 5, length: 80, capacity: [[7, 120, 40]], shared_orders: false, order_count: 2, current_order: 1 },
+      [0, 'station', 12, 20, 96 | 1, 3, 'Bigton Woods', -1],
+      [1, 'depot', 13, 22, 4, -1, '', -1],
+    ];
+  },
+  engines: (a) => [
+    [5, 'Kirby Paul Tank', 0xFF, 0, 64, 8000, 800, 75, 7300, 1925, 300, 47, false, 0],
+    [27, 'Wood Truck', 7, 30, 0, 1500, 0, 0, 0, 1925, 0, 18, true, 0],
+    [6, 'SH 8P', 0xFF, 0, 128, 21000, 1800, 80, 7300, 1954, 1000, 85, false, 0],
+  ].filter((r) => a.type === 0 && (a.cargo === undefined || a.cargo === 7)),
+  groups: () => [[2, 'Wood line', 0, -1, 1, -1200, -3000, 40]],
+  depots: (a) => (a.type === 0 ? [[13, 22, 0]] : []),
+  autorenew: () => ({ enabled: false, months: 6, money: 100000 }),
+  events: (a) => [
+    { seq: 1, date: '1950-1-3', type: 'industry_open', industry: 9, industry_type: 3, x: 5, y: 5 },
+    { seq: 2, date: '1950-2-1', type: 'vehicle_crashed', company: 0, vehicle: 11, x: 14, y: 20, reason: 0, victims: 2 },
+  ].filter((e) => e.seq > (a.since ?? 0)),
+  // exec: every step costs 10 and returns value 100+index; a step whose op is 'veh_sell'
+  // on vehicle 404, or any step with op 'bogus', fails.
+  exec: (a) => {
+    const rows = [];
+    let stopped = '';
+    for (const st of a.steps) {
+      const bad = st[0] === 'bogus' || (st[0] === 'veh_sell' && st[1] === 404);
+      rows.push(bad ? [false, 0, 'Vehicle not available', 0] : [true, 10, '', 100 + rows.length]);
+      if (bad && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+    }
+    const cost = rows.reduce((n, r) => n + r[1], 0);
+    return [{ dry_run: !!a.dry_run, attempted: rows.length, failed: rows.filter((r) => !r[0]).length, cost, stopped, money: a.dry_run ? 100000 : 100000 - cost }, ...rows];
+  },
 };
 
 export function startFakeServer({ password = 'pw' } = {}) {
@@ -61,7 +105,11 @@ export function startFakeServer({ password = 'pw' } = {}) {
           const handler = GS[req.cmd];
           const base = { id: req.id, client: req.client };
           if (!handler) { send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: false, part: 0, last: true, error: `unknown cmd: ${req.cmd}` }))); continue; }
-          const data = handler(req.args ?? {});
+          let data;
+          try { data = handler(req.args ?? {}); } catch (e) {
+            send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: false, part: 0, last: true, error: `exception in ${req.cmd}: ${e.message}` })));
+            continue;
+          }
           // Also send a reply for some other client to prove filtering works.
           send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ id: req.id, client: 'someone-else', ok: true, part: 0, last: true, data: 'not for you' })));
           if (Array.isArray(data) && data.length > 1) {

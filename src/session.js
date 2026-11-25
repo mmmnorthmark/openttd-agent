@@ -4,6 +4,7 @@
 import { AdminClient, UPDATE, FREQ } from './admin-client.js';
 import { GSRpc } from './gs-rpc.js';
 import { TileMap, townsFromRows, industriesFromRows } from './world.js';
+import { execSummary } from './operate.js';
 import { log } from './log.js';
 
 const ECONOMY_TTL_MS = 60_000; // towns/industries refresh at most once a minute (~1 game month)
@@ -116,6 +117,29 @@ export class Session {
     const c = company ?? this.cfg.company;
     if (c === null || c === undefined || Number.isNaN(c)) throw new Error('no company set. Run: openttd-agent companies, then openttd-agent configure --company <id>');
     return c;
+  }
+
+  /**
+   * Run state-changing steps through the GS `exec` command (see main.nut ExecStep).
+   * Steps go in batches that fit one admin packet; a failed batch stops the rest.
+   */
+  async exec(company, steps, { dryRun = false, keepGoing, railType, roadType } = {}) {
+    const replies = [];
+    for (let i = 0; i < steps.length;) {
+      let n = 0, bytes = 0;
+      while (i + n < steps.length && n < 150 && (bytes += JSON.stringify(steps[i + n]).length + 1) < 7000) n++;
+      n = Math.max(1, n);
+      const reply = await this.gs.call('exec', {
+        company, steps: steps.slice(i, i + n), dry_run: dryRun,
+        ...(keepGoing !== undefined ? { keep_going: keepGoing } : {}),
+        ...(railType !== undefined ? { rail_type: railType } : {}), ...(roadType !== undefined ? { road_type: roadType } : {}),
+      }, 30000 + n * 1000);
+      replies.push(reply);
+      if (reply[0].stopped) break;
+      i += n;
+    }
+    this._economy.at = 0; // world changed; refresh on next read
+    return execSummary(steps, replies, dryRun);
   }
 
   /** Client-side throttle (max_builds_per_minute, 0 = off). Throws when over the limit. */
