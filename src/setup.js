@@ -19,6 +19,7 @@ export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.
 export const GS_NAME = 'AgentBridge';
 // OpenTTD 15.x INIFILE_VERSION (IFV_REMOVE_GENERATION_SEED). Needed so secrets.cfg is honoured.
 export const INI_VERSION = 7;
+export const TERRAIN_TYPES = ['very_flat', 'flat', 'hilly', 'mountainous', 'alpinist']; // difficulty.terrain_type 0..4
 
 export function personalDirCandidates() {
   const home = os.homedir();
@@ -135,7 +136,7 @@ export function patchIni(text, patches) {
  *       'join' (GUI client joining host:3979).
  */
 export function launch({ mode = 'dedicated', profile = mode, adminPassword, adminPort = 3977, gamePort = 3979,
-  bind = '0.0.0.0', joinHost, seed, mapBits = 8, load, commandDelayTicks = 0, maxBuildsPerDay = 0, serverName = 'openttd-agent game',
+  bind = '0.0.0.0', joinHost, seed, mapBits = 8, load, commandDelayTicks = 0, maxBuildsPerDay = 0, scriptOpcodes = 100000, terrain, serverName = 'openttd-agent game',
   dryRun = false }) {
   const exe = findExecutable();
   if (!exe) throw new Error('OpenTTD executable not found; install it or set OPENTTD_EXE');
@@ -153,8 +154,12 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
       server_admin_port: adminPort, server_port: gamePort, allow_insecure_admin_login: 'true',
       server_game_type: 'local', server_name: serverName, pause_on_join: 'false',
     };
+    // Opcodes a script may run per tick before OpenTTD suspends it (game default 10000, max 250000).
+    // Higher = faster map dumps and replies, at some cost to tick time on the host.
+    patches.script = { script_max_opcode_till_suspend: scriptOpcodes };
     patches.game_scripts = { [GS_NAME]: `command_delay_ticks=${commandDelayTicks},max_builds_per_day=${maxBuildsPerDay}` };
-    patches.game_creation = { map_x: mapBits, map_y: mapBits }; // seed goes on the command line (-G); ini v7 dropped generation_seed
+    patches.game_creation = { map_x: mapBits, map_y: mapBits };
+    if (terrain !== undefined) patches.difficulty = { terrain_type: TERRAIN_TYPES.indexOf(terrain) }; // seed goes on the command line (-G); ini v7 dropped generation_seed
     fs.writeFileSync(path.join(dir, 'secrets.cfg'), `[network]\nadmin_password = ${adminPassword}\n`, { mode: 0o600 });
   }
   let cfgText = fs.readFileSync(cfgPath, 'utf8');

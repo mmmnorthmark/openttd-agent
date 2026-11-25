@@ -5,7 +5,7 @@
 // ctx: { cfg, session() -> Promise<Session> } — session() connects lazily.
 
 import * as z from 'zod/v4';
-import { doctor, installGamescript, launch } from './setup.js';
+import { doctor, installGamescript, launch, TERRAIN_TYPES } from './setup.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES } from './operate.js';
@@ -113,12 +113,14 @@ export const COMMANDS = [
       load: z.string().optional().describe('savegame path to load instead of generating a new map'),
       command_delay_ticks: int().min(0).max(74).default(0).describe('GameScript rate limit: extra ticks after each build command (0 = full speed)'),
       max_builds_per_day: int().min(0).default(0).describe('GameScript rate limit per company per game day (0 = unlimited)'),
+      terrain: z.enum(TERRAIN_TYPES).optional().describe('new maps only; default: whatever your openttd.cfg says (OpenTTD default flat)'),
+      script_opcodes: int().min(500).max(250000).default(100000).describe('host: opcodes the GameScript may run per tick (OpenTTD default 10000); higher = faster map mirror and replies'),
       bind: z.string().default('0.0.0.0'), dry_run: bool().default(false),
     }),
     run: (ctx, a) => launch({
       mode: a.mode, adminPassword: a.admin_password ?? ctx.cfg.admin_password, joinHost: a.join_host ?? ctx.cfg.host,
       seed: a.seed, mapBits: a.map_bits, load: a.load, commandDelayTicks: a.command_delay_ticks,
-      maxBuildsPerDay: a.max_builds_per_day, bind: a.bind, adminPort: ctx.cfg.admin_port, dryRun: a.dry_run,
+      maxBuildsPerDay: a.max_builds_per_day, scriptOpcodes: a.script_opcodes, terrain: a.terrain, bind: a.bind, adminPort: ctx.cfg.admin_port, dryRun: a.dry_run,
     }),
   },
 
