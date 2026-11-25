@@ -200,6 +200,49 @@ test('loan: refusals, one option only, and an older GameScript', async () => {
   try {
     await assert.rejects(run('loan', { borrow: 10000 }), /older than v8.*install-gamescript/);
   } finally {
-    fake.state.gsVersion = 8; fake.state.money = 100000;
+    fake.state.gsVersion = 9; fake.state.money = 100000;
   }
+});
+
+test('verify-route: stations joined, then a gap with the last reachable tile', async () => {
+  const ok = await run('verify-route', { from_station: 'Bigton Woods', to_station: 5 });
+  assert.equal(ok.method, 'rail_tracks');
+  assert.equal(ok.connected, true);
+  fake.state.railGap = '18,20';
+  try {
+    const broken = await run('verify-route', { from_station: 3, to_station: 5 });
+    assert.equal(broken.connected, false);
+    assert.deepEqual(broken.last_reachable, { x: 17, y: 20 });
+    assert.deepEqual(broken.first_gap, { x: 18, y: 20, from: { x: 17, y: 20 }, reason: 'no_track' });
+  } finally { fake.state.railGap = null; }
+  const v = await run('verify-route', { vehicle: 11 });
+  assert.equal(v.unit_number, 1);
+  assert.equal(v.connected, true);
+  assert.deepEqual(v.from_vehicle.map((r) => [r.station, r.connected]), [[3, true]]);
+  await assert.rejects(run('verify-route', { from_station: 3 }), /both --from_station and --to_station/);
+});
+
+test('vehicle-problems: train on another line, losing money, then stuck; unit numbers', async () => {
+  fake.state.lostTrain = true;
+  await run('unpause', {}); // game days must pass between the two calls
+  try {
+    const first = await run('vehicle-problems', { stuck_days: 1 });
+    assert.equal(first.trace_method, 'rail_tracks');
+    assert.match(first.history.stuck_check, /needs another call/);
+    const mine = first.problems.filter((p) => p.id === 13);
+    assert.deepEqual(mine.map((p) => p.problem), ['wrong_network', 'no_income']);
+    assert.equal(mine[0].unit_number, 2);
+    assert.match(mine[0].evidence, /no rail path from \(30,40\) to Bigton Woods \(12,20\)/);
+    await new Promise((r) => setTimeout(r, 60)); // a few fake game days
+    const later = await run('vehicle-problems', { vehicle: 13, stuck_days: 1 });
+    assert.equal(later.checked, 1);
+    assert.deepEqual(later.problems.map((p) => p.problem), ['wrong_network', 'stuck_or_lost', 'no_income']);
+    // An older GameScript: no rail_tiles, no current order in the vehicles rows; coarse mirror trace.
+    fake.state.gsVersion = 8;
+    const old = await run('vehicle-problems', { vehicle: 13 });
+    assert.equal(old.trace_method, 'mirror_adjacency');
+    assert.match(old.trace_note, /older than v9/);
+    assert.match(old.problems[0].evidence, /coarse/);
+    assert.ok(fake.received.some((r) => r.cmd === 'vehicle' && r.args.vehicle === 13), 'current order read per vehicle');
+  } finally { fake.state.lostTrain = false; fake.state.gsVersion = 9; }
 });

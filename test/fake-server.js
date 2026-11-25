@@ -58,6 +58,18 @@ function goalView(g, state) {
   return { company: g.company, status, deadline_year: g.deadline_year, days_left: Math.max(0, (g.deadline_year + 1 - state.year) * 365), set_date: '1950-1-1', targets };
 }
 
+// Rail world for rail_tiles (AgentBridge v9), as [x, y, kind, tracks, station, a, b, owner, rail_type, signals]:
+// station 3 "Bigton Woods" (10..12,20) - track (13..23,20) - station 5 "Sawmill Halt" (24..26,20), and a
+// separate line (28..34,40) where train 13 runs when state.lostTrain is set. state.railGap ("x,y") removes a tile.
+function fakeRailRows(state) {
+  const rows = [];
+  for (let x = 10; x <= 12; x++) rows.push([x, 20, 's', 1, 3, -1, -1, 0, 0, 0]);
+  for (let x = 13; x <= 23; x++) rows.push([x, 20, 't', 1, -1, -1, -1, 0, 0, 0]);
+  for (let x = 24; x <= 26; x++) rows.push([x, 20, 's', 1, 5, -1, -1, 0, 0, 0]);
+  for (let x = 28; x <= 34; x++) rows.push([x, 40, 't', 1, -1, -1, -1, 0, 0, 0]);
+  return rows.filter((r) => `${r[0]},${r[1]}` !== state.railGap);
+}
+
 const fakeDays = (state) => state.daysRun + (state.paused ? 0 : Math.floor((Date.now() - state.runningSince) / state.dayMs));
 
 // Console commands the package uses. Returns the output lines.
@@ -93,7 +105,7 @@ const GS = {
   // The date runs at one game day per state.dayMs of real time while the game is not paused.
   info: (_a, state) => {
     const date = 1 + fakeDays(state);
-    return { tick: 1, date, year: state.year, month: 1, day: date, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: state.paused, towns: 2, industries: 3, bridge_version: 7, event_seq: 2, goals: state.goals.length };
+    return { tick: 1, date, year: state.year, month: 1, day: date, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: state.paused, towns: 2, industries: 3, bridge_version: state.gsVersion, event_seq: 2, goals: state.goals.length };
   },
   cargos: () => FAKE_CARGOS,
   industry_types: () => [{ id: 3, name: 'Forest', produces: [7], accepts: [], raw: true, processing: false },
@@ -123,12 +135,28 @@ const GS = {
   stations: () => [
     [3, 'Bigton Woods', 12, 20, 1, [[7, 240, 35]], 2],
     [4, 'Bigton Central', 41, 9, 4 | 2, [[0, 15, 80]], 5],
+    [5, 'Sawmill Halt', 24, 20, 1, [], 1],
   ],
-  vehicles: () => [
-    [11, 'Train 1', 0, 5, 'Kirby Paul Tank', 4000, 7300, 62, -1200, -3000, 9000, 0, 14, 20, 2, 2, 1, 800, false],
-    [12, 'Road Vehicle 1', 1, 9, 'MPS Regal Bus', 100, 5475, 98, 400, 2500, 4000, 3, 41, 9, 0xFFFE, 2, 1, 300, true],
-  ],
-  vehicle: (a) => {
+  // v9 rows end with [current_order, dest_x, dest_y, dest_station, speed].
+  vehicles: (_a, state) => [
+    [11, 'Train 1', 0, 5, 'Kirby Paul Tank', 4000, 7300, 62, -1200, -3000, 9000, 0, 14, 20, 2, 2, 1, 800, false, 1, 13, 22, -1, 60],
+    [12, 'Road Vehicle 1', 1, 9, 'MPS Regal Bus', 100, 5475, 98, 400, 2500, 4000, 3, 41, 9, 0xFFFE, 2, 1, 300, true, 0, 41, 9, 4, 0],
+    ...(state.lostTrain ? [[13, 'Train 2', 0, 5, 'Kirby Paul Tank', 800, 7300, 90, -200, -900, 9000, 0, 30, 40, 2, 2, 2, 800, false, 0, 12, 20, 3, 40]] : []),
+  ].map((r) => (state.gsVersion >= 9 ? r : r.slice(0, 19))),
+  rail_tiles: (a, state) => {
+    if (state.gsVersion < 9) throw new Error('unknown cmd: rail_tiles');
+    return fakeRailRows(state).filter(([x, y]) => x >= a.x0 && x <= a.x1 && y >= a.y0 && y <= a.y1);
+  },
+  vehicle: (a, state) => {
+    if (a.vehicle === 13 && state.lostTrain) {
+      return [
+        { id: 13, name: 'Train 2', type: 0, engine: 5, engine_name: 'Kirby Paul Tank', age_days: 800, max_age_days: 7300, reliability_pct: 90,
+          profit_this_year: -200, profit_last_year: -900, value: 9000, running_cost: 800, state: 0, x: 30, y: 40, speed: 40, group: 2,
+          wagons: 5, length: 80, capacity: [[7, 120, 0]], shared_orders: false, order_count: 2, current_order: 0, unit_number: 2, rail_type: 0 },
+        [0, 'station', 12, 20, 96, 3, 'Bigton Woods', -1],
+        [1, 'station', 24, 20, 4, 5, 'Sawmill Halt', -1],
+      ];
+    }
     if (a.vehicle !== 11) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${a.company}; run: openttd-agent vehicles`);
     return [
       { id: 11, name: 'Train 1', type: 0, engine: 5, engine_name: 'Kirby Paul Tank', age_days: 4000, max_age_days: 7300, reliability_pct: 62,
@@ -177,7 +205,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], money: 100000, loan: 300000, gsVersion: 8 };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], money: 100000, loan: 300000, gsVersion: 9, lostTrain: false, railGap: null };
   const server = net.createServer((sock) => {
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));

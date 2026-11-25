@@ -16,6 +16,8 @@ import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFrom
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
+import { traceRail, adjacencyTrace, mirrorStationTiles, railTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
+import { recordProgress, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 
 const int = () => z.coerce.number().int();
@@ -358,6 +360,84 @@ async function buildCargoRoute(s, company, a) {
     const last = built.at(-1)?.step ?? null;
     return fail(last ? `after ${last}` : 'source_station', e.message, { spent });
   }
+}
+
+// ---- connectivity (verify-route, vehicle-problems) ---------------------------------
+
+const OLD_GS_TRACE = 'the running AgentBridge is older than v9 and has no rail_tiles query, so this is a coarse trace over the map mirror (rail and station tiles touching, no track directions; bridges and tunnels guessed from straight runs). For an exact trace the host re-runs install-gamescript and loads the game again';
+const TRACE_BLOCK = 16;
+
+/** Tile getter over GS `rail_tiles` (v9), loading 16x16 blocks on first use; cached for one command. */
+function railTileSource(s) {
+  const blocks = new Map();
+  const tiles = new Map();
+  return async (x, y) => {
+    if (!s.map.inBounds(x, y)) return null;
+    const bx = Math.floor(x / TRACE_BLOCK), by = Math.floor(y / TRACE_BLOCK);
+    const bk = `${bx},${by}`;
+    if (!blocks.has(bk)) {
+      blocks.set(bk, s.gs.call('rail_tiles', { x0: bx * TRACE_BLOCK, y0: by * TRACE_BLOCK, x1: bx * TRACE_BLOCK + TRACE_BLOCK - 1, y1: by * TRACE_BLOCK + TRACE_BLOCK - 1 })
+        .then((rows) => { for (const r of rows) tiles.set(`${r[0]},${r[1]}`, railTileFromRow(r)); }));
+    }
+    await blocks.get(bk);
+    return tiles.get(`${x},${y}`) ?? null;
+  };
+}
+
+/** Tiles of one station, flooding from (x, y) over tiles with the same station id. */
+async function stationTiles(getTile, x, y, station, limit = 200) {
+  const out = [];
+  const seen = new Set();
+  const queue = [{ x, y }];
+  while (queue.length && out.length < limit) {
+    const p = queue.shift();
+    const k = `${p.x},${p.y}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    const t = await getTile(p.x, p.y);
+    if (!t || t.station !== station) continue;
+    out.push({ x: p.x, y: p.y });
+    for (const [dx, dy] of TRACE_DIRS) queue.push({ x: p.x + dx, y: p.y + dy });
+  }
+  return out;
+}
+
+/**
+ * Tracer for one command: trace(starts, goalStation) -> result with `method`.
+ * goalStation: { id, x, y } (x, y = the station's location tile). Exact on GS v9, mirror fallback before.
+ * `info` is a fresh GS `info` reply (its bridge_version says which).
+ */
+async function makeTracer(s, company, info) {
+  if ((info.bridge_version ?? 0) >= 9) {
+    const getTile = railTileSource(s);
+    return {
+      method: 'rail_tracks',
+      stationStarts: (st) => stationTiles(getTile, st.x, st.y, st.id),
+      trace: async (starts, goal) => ({ method: 'rail_tracks',
+        ...await traceRail({ getTile, starts, isGoal: (t) => t.station === goal.id, goal, company }) }),
+    };
+  }
+  await s.ensureTiles();
+  const depots = (await s.gs.call('depots', { company, type: 0 })).map(([x, y]) => ({ x, y }));
+  return {
+    method: 'mirror_adjacency',
+    stationStarts: async (st) => mirrorStationTiles(s.map, st.x, st.y),
+    trace: async (starts, goal) => ({ method: 'mirror_adjacency',
+      ...adjacencyTrace(s.map, starts, mirrorStationTiles(s.map, goal.x, goal.y), goal, { depots }) }),
+  };
+}
+
+const findStation = (stations, v) => {
+  const hit = stations.find((st) => String(st.id) === String(v)) ?? stations.find((st) => lc(st.name) === lc(v));
+  if (!hit) throw new Error(`no station '${v}' of this company; run: openttd-agent stations`);
+  return hit;
+};
+
+/** Current order of a vehicle as { current_order, dest, dest_station, speed } from GS `vehicle` (any version). */
+async function currentOrderOf(s, company, id) {
+  const d = vehicleDetail(await s.gs.call('vehicle', { company, vehicle: id }), s.cargos);
+  const o = d.orders.find((r) => r.position === d.current_order);
+  return { current_order: d.current_order, dest: o && o.x >= 0 ? { x: o.x, y: o.y } : null, dest_station: o?.station ?? -1, speed: d.speed, orders: d.orders };
 }
 
 /** Run exec steps as the company (client throttle + GS rate gate apply). */
@@ -810,6 +890,109 @@ export const COMMANDS = [
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       return vehicleDetail(await s.gs.call('vehicle', { company, vehicle: a.vehicle }), s.cargos);
+    },
+  },
+  {
+    name: 'vehicle-problems', group: 'operate', session: true,
+    description: 'Vehicles with problems, one row per problem: problem, evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot, stopped, old, broken_down, low_reliability, crashed. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
+    args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'),
+      stuck_days: int().min(1).default(30).describe('game days without progress before a vehicle counts as stuck or lost'),
+      trace: bool().default(true).describe('check rail connectivity to each train\'s destination') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const info = await s.gs.call('info');
+      let vehicles = vehiclesFromRows(await s.gs.call('vehicles', { company }));
+      if (a.vehicle !== undefined) {
+        vehicles = vehicles.filter((v) => v.id === a.vehicle);
+        if (!vehicles.length) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
+      }
+      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const stationById = new Map(stations.map((st) => [st.id, st]));
+      s.vehicleHistory ??= new Map();
+      const tracer = a.trace ? await makeTracer(s, company, info) : null;
+      const lineCache = new Map();
+      const rows = [];
+      for (const v of vehicles) {
+        let orders = null;
+        if (v.current_order === undefined && v.order_count > 0) { // AgentBridge before v9: one `vehicle` call each
+          const cur = await currentOrderOf(s, company, v.id);
+          orders = cur.orders;
+          Object.assign(v, { current_order: cur.current_order, dest: cur.dest, dest_station: cur.dest_station, speed: cur.speed });
+        }
+        if (v.order_count === 0) Object.assign(v, { current_order: -1, dest: null, dest_station: -1 });
+        const st = stationById.get(v.dest_station);
+        v.dest_name = st?.name;
+        v.dist = v.dest ? tileDistance(v, v.dest) : null;
+        const progress = v.order_count > 0
+          ? recordProgress(s.vehicleHistory, `${company}:${v.id}`, { date: info.date, order: v.current_order, dist: v.dist, atStation: v.state === 'at_station' })
+          : null;
+        let reach = null, line = null;
+        if (tracer && v.type === 'rail' && st && v.state !== 'in_depot' && v.state !== 'crashed') {
+          reach = await tracer.trace([{ x: v.x, y: v.y }], st);
+          if (!reach.connected) {
+            orders ??= (await currentOrderOf(s, company, v.id)).orders;
+            const ids = [...new Set(orders.filter((o) => o.kind === 'station').map((o) => o.station))];
+            if (ids.length >= 2 && ids.every((id) => stationById.has(id))) {
+              const lk = ids.join('>');
+              if (!lineCache.has(lk)) {
+                let ok = true;
+                for (let i = 0; i < ids.length && ok; i++) {
+                  const from = stationById.get(ids[i]), to = stationById.get(ids[(i + 1) % ids.length]);
+                  ok = (await tracer.trace(await tracer.stationStarts(from), to)).connected;
+                }
+                lineCache.set(lk, { connected: ok });
+              }
+              line = lineCache.get(lk);
+            }
+          }
+        }
+        for (const p of vehicleProblems(v, { today: info.date, stuckDays: a.stuck_days, progress, reach, line })) {
+          rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p });
+        }
+      }
+      const samples = vehicles.map((v) => s.vehicleHistory.get(`${company}:${v.id}`)).filter(Boolean);
+      const watched = samples.length ? info.date - Math.min(...samples.map((e) => e.first)) : 0;
+      return {
+        date: gameDate(info), checked: vehicles.length, vehicles_with_problems: new Set(rows.map((r) => r.id)).size,
+        trace_method: tracer?.method ?? 'off', ...(tracer?.method === 'mirror_adjacency' ? { trace_note: OLD_GS_TRACE } : {}),
+        history: { days_watched: watched, stuck_check: watched >= a.stuck_days ? 'active' : `needs another call in ${a.stuck_days - watched} game days` },
+        problems: rows,
+      };
+    },
+  },
+  {
+    name: 'verify-route', group: 'operate', session: true,
+    description: 'Is there a rail path? --vehicle ID traces from the train to each of its order stations and between consecutive order stations; --from_station A --to_station B (id or name) traces A to B. Reports connected and, if not, the last reachable tile and the first gap with a reason (no_track, track_not_joined, station_platform_side, depot_entrance_faces_away, one_way_signal_against, other_company_track, bridge_side, tunnel_side). Exact with AgentBridge v9 (track bits, signals, bridges, tunnels); coarse map-mirror trace with older GameScripts.',
+    args: z.object({ ...who, vehicle: int().optional(), from_station: z.coerce.string().optional().describe('station id or name'), to_station: z.coerce.string().optional().describe('station id or name') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const tracer = await makeTracer(s, company, await s.gs.call('info'));
+      const brief = (r) => ({ connected: r.connected, ...(r.connected ? {} : { last_reachable: r.last_reachable ?? null, first_gap: r.first_gap ?? null }), tiles_reached: r.tiles_reached });
+      const note = tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {};
+      if (a.vehicle !== undefined) {
+        const veh = vehiclesFromRows(await s.gs.call('vehicles', { company })).find((v) => v.id === a.vehicle);
+        if (!veh) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
+        const { orders, current_order } = await currentOrderOf(s, company, a.vehicle);
+        const stops = orders.filter((o) => o.kind === 'station' && stations.some((st) => st.id === o.station));
+        if (!stops.length) throw new Error(`vehicle ${a.vehicle} has no station orders; add some with order-add`);
+        const fromVehicle = [];
+        for (const o of stops) {
+          const st = stations.find((x) => x.id === o.station);
+          fromVehicle.push({ order: o.position, station: st.id, station_name: st.name, current: o.position === current_order, ...brief(await tracer.trace([{ x: veh.x, y: veh.y }], st)) });
+        }
+        const legs = [];
+        for (let i = 0; i < stops.length && stops.length > 1; i++) {
+          const from = stations.find((x) => x.id === stops[i].station), to = stations.find((x) => x.id === stops[(i + 1) % stops.length].station);
+          legs.push({ from: from.name, to: to.name, ...brief(await tracer.trace(await tracer.stationStarts(from), to)) });
+        }
+        const connected = fromVehicle.every((r) => r.connected) && legs.every((r) => r.connected);
+        return { vehicle: veh.id, unit_number: veh.unit_number, at: { x: veh.x, y: veh.y }, connected, method: tracer.method, ...note, from_vehicle: fromVehicle, legs };
+      }
+      if (a.from_station === undefined || a.to_station === undefined) throw new Error('give --vehicle ID, or both --from_station and --to_station (id or name)');
+      const from = findStation(stations, a.from_station), to = findStation(stations, a.to_station);
+      const r = await tracer.trace(await tracer.stationStarts(from), to);
+      return { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, method: tracer.method, ...note, ...brief(r) };
     },
   },
   {
