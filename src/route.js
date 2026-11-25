@@ -50,7 +50,8 @@ export const defaultWagons = (length) => Math.max(1, length * 2 - 1);
 /**
  * Pick a locomotive and a wagon from `engines` rows (enginesFromRows, already filtered to the cargo
  * and rail type). engine/wagon ids force a choice. Locomotive: lowest running cost, then price,
- * among those with power. Wagon: carries the cargo without refit first, then largest capacity, then price.
+ * among those with power; railcars that carry another cargo themselves (a passenger 'Dash' on a
+ * coal line) only when nothing else can pull. Wagon: carries the cargo without refit first, then largest capacity, then price.
  * Returns { loco, wagon } or throws with what is missing.
  */
 export function pickTrain(engines, { cargoId, engine, wagon } = {}) {
@@ -61,8 +62,9 @@ export function pickTrain(engines, { cargoId, engine, wagon } = {}) {
     if (!hit) throw new Error(`${what} ${id} is not buildable for this cargo and rail type; choose from: ${list.map((e) => `${e.id} ${e.name}`).join(', ') || 'none'}`);
     return hit;
   };
+  const pure = locos.filter((e) => !(e.capacity > 0) || e.cargo === cargoId);
   const loco = engine !== undefined ? byId(locos, engine, 'locomotive')
-    : [...locos].sort((a, b) => a.running_cost - b.running_cost || a.price - b.price)[0];
+    : [...(pure.length ? pure : locos)].sort((a, b) => a.running_cost - b.running_cost || a.price - b.price)[0];
   const car = wagon !== undefined ? byId(wagons, wagon, 'wagon')
     : [...wagons].sort((a, b) => (b.cargo === cargoId) - (a.cargo === cargoId) || b.capacity - a.capacity || a.price - b.price)[0];
   if (!loco) throw new Error('no buildable locomotive can pull this cargo on this rail type (see engines --type rail --wagons false)');

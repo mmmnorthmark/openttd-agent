@@ -63,6 +63,10 @@ test('pickTrain: cheapest-to-run powered locomotive, wagon with the cargo first,
   assert.equal(t.loco.id, 2);
   assert.equal(t.wagon.id, 11);
   assert.equal(pickTrain(engines, { cargoId: 4, engine: 1, wagon: 10 }).loco.id, 1);
+  const railcar = { id: 4, name: 'Dash', is_wagon: false, power: 700, running_cost: 500, price: 8000, cargo: 0, capacity: 80 };
+  assert.equal(pickTrain([...engines, railcar], { cargoId: 4 }).loco.id, 2, 'a passenger railcar is not the ore locomotive');
+  assert.equal(pickTrain([...engines, railcar], { cargoId: 0 }).loco.id, 4, 'but is fine for passengers');
+  assert.equal(pickTrain([railcar, engines[3]], { cargoId: 4 }).loco.id, 4, 'and is used when nothing else pulls');
   assert.throws(() => pickTrain(engines, { engine: 3 }), /locomotive 3 is not buildable/);
   assert.throws(() => pickTrain(engines.filter((e) => !e.is_wagon), {}), /no buildable wagon/);
 });
