@@ -4,7 +4,7 @@
 //   openttd-agent <command> [--key value]   run a command, JSON result on stdout
 //   openttd-agent <command> --args '{"k":1}'
 //   openttd-agent batch < calls.jsonl        one {"name","args"} per line -> one JSON result per line
-//   openttd-agent mcp                        run as an MCP server (stdio)
+//   openttd-agent mcp [--tools a,b] [--compact true]  run as an MCP server (stdio), optionally only some tools
 //   openttd-agent daemon | daemon-stop       local background connection (auto-started)
 //   openttd-agent relay [--port N] [--bind A] host: serve registered players over the LAN (foreground)
 // Exit code 0 on success, 1 on error (error JSON on stdout: {"error": "..."}).
@@ -78,7 +78,11 @@ async function main() {
   if (name === 'version' || name === '--version') return console.log(VERSION);
   if (rest.includes('--help') || rest.includes('-h')) return printCommandHelp(name);
   if (name === 'commands') return console.log(JSON.stringify(describeCommands(), null, 2));
-  if (name === 'mcp') { const { startMcp } = await import('../src/mcp.js'); return startMcp(); }
+  if (name === 'mcp') {
+    const { args } = parseFlags(rest);
+    const { startMcp } = await import('../src/mcp.js');
+    return startMcp({ tools: args.tools ? String(args.tools).split(',') : undefined, compact: String(args.compact) === 'true' });
+  }
   if (name === 'daemon') return void startDaemon();
   if (name === 'relay') {
     const { args } = parseFlags(rest);

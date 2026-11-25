@@ -3,6 +3,12 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
+## (unreleased)
+
+- `mcp --tools a,b,c` serves only those commands as MCP tools (every tool schema is sent with
+  each model request; a few tight tools suit small models), with shorter server instructions.
+  `mcp --compact true` returns tool results as single-line JSON.
+
 ## 0.2.0 (2026-11-25)
 Per-player access replaces the shared admin password. BaNaNaS scenarios, goals and turn-based
 play. GameScript v7: the host re-runs `install-gamescript` (a running game picks it up when it is

@@ -40,6 +40,8 @@ claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.2.0 mcp
 ```
 
 Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.2.0", "mcp"]`.
+For a small or fast model, expose only the tools it needs and get compact results (unreleased, on `main`):
+`openttd-agent mcp --tools goal-status,stations,vehicles,find-cargo-pairs,build-cargo-route --compact true`.
 Agents that run shell commands can use the CLI directly; it is often faster than MCP because they
 can chain calls (`batch`) and filter JSON.
 
