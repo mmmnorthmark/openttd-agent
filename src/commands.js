@@ -307,7 +307,7 @@ export const COMMANDS = [
   {
     name: 'turn-advance', group: 'host', session: true,
     description: 'HOST ONLY: turn-based play. Unpause, let `days` game days pass (about 2 s each; multiplayer has no fast-forward), pause again, and return the new date and the events that happened. Use it in a loop: think and build while paused, then advance. The game ends paused even if the wait fails.',
-    args: z.object({ days: int().min(1).max(366).default(30).describe('game days to run; a month is ~30 (about 60 s of real time)') }),
+    args: z.object({ days: int().min(1).max(120).default(30).describe('game days to run; a month is ~30 (about 60 s of real time). Max 120 per call (4 minutes): one CLI call must answer within 5 minutes') }),
     run: async (ctx, a) => {
       const s = await ctx.session();
       const started = Date.now();

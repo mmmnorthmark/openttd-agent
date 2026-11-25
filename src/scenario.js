@@ -153,6 +153,8 @@ export async function prepareScenario(cfg, { search, contentId, name, load = fal
   await admin.connect();
   const steps = [];
   const step = (msg, data = {}) => { steps.push(msg); log.info('scenario', msg, data); };
+  const donorName = 'agentbridge_donor';
+  let bareScenarioRunning = false; // true while the server runs the scenario without AgentBridge
   try {
     const gs = new GSRpc(admin);
     const before = await gs.call('info', {}, 10000).catch((e) => {
@@ -165,7 +167,6 @@ export async function prepareScenario(cfg, { search, contentId, name, load = fal
     await admin.rcon('content update scenario');
     const content = pickContent(await contentRows(admin, timeoutMs), { search, contentId });
     // 2. Donor: the running game, with AgentBridge and its settings in the GSDT chunk.
-    const donorName = 'agentbridge_donor';
     const donor = await saveAndRead(admin, saveDir, donorName, timeoutMs);
     if (!parseSavegame(donor).chunks.some((c) => c.id === 'GSDT')) throw new Error('the donor save has no GSDT chunk');
     step(`saved the running game as ${donorName}.sav`);
@@ -189,6 +190,7 @@ export async function prepareScenario(cfg, { search, contentId, name, load = fal
 
     // 3. Load it and save it as a normal game.
     const entry = await findScenarioEntry(admin, content.name, titlesBefore);
+    bareScenarioRunning = true;
     const welcome = await loadAndWait(admin, `load_scenario ${entry.index}`, `scenario '${entry.title}' to load`, timeoutMs);
     step(`loaded scenario '${entry.title}' (${welcome.mapX}x${welcome.mapY})`);
     const base = saveSlug(name ?? content.name);
@@ -214,6 +216,7 @@ export async function prepareScenario(cfg, { search, contentId, name, load = fal
     await admin.rcon('ls'); // refresh the console's save list so `load` sees the new file
     const target = load ? `${base}_agent` : donorName;
     await loadAndWait(admin, `load ${target}`, `${target}.sav to load`, timeoutMs);
+    bareScenarioRunning = false;
     const after = await until('AgentBridge to answer in the loaded game', 30000, () => gs.call('info', {}, 3000).catch(() => null));
     step(load ? `loaded ${target}; AgentBridge v${after.bridge_version} is running` : `restored the game that was running (${donorName}.sav)`);
     if (load && (after.map_x !== welcome.mapX || after.map_y !== welcome.mapY)) throw new Error(`loaded ${target} but the map is ${after.map_x}x${after.map_y}, expected ${welcome.mapX}x${welcome.mapY}`);
@@ -221,6 +224,11 @@ export async function prepareScenario(cfg, { search, contentId, name, load = fal
       ? { game: `${base}_agent`, bridge_version: after.bridge_version, year: after.year, map_x: after.map_x, map_y: after.map_y, companies: 'none yet: join the game, or console `start_ai IdleAI` for a test company' }
       : { game: `${donorName} (the game that was running, year ${before.year})`, bridge_version: after.bridge_version },
       steps };
+  } catch (e) {
+    if (!bareScenarioRunning) throw e;
+    // Do not leave the server on a game without AgentBridge: go back to the game we started from.
+    const restored = await admin.rcon('ls').then(() => loadAndWait(admin, `load ${donorName}`, `${donorName}.sav to load`, timeoutMs)).then(() => true, () => false);
+    throw new Error(`${e.message}. ${restored ? `The game that was running was restored (${donorName}.sav).` : `Could not restore the previous game; on the server console run: load ${donorName}`}`);
   } finally {
     admin.close();
   }
