@@ -90,7 +90,7 @@ const GS = {
     [3, 3, 5, 60, [[7, 80, 75]], 1],
   ],
   towns: () => [[1, 'Bigton', 42, 12, 5000, false, 800, 10, 200, 0, 6], [2, 'Smallham', 10, 50, 300, false, 40, 0, 10, 0, 2]],
-  companies: () => [{ id: 0, name: 'Matthew Transport', money: 100000, loan: 300000 }],
+  companies: () => [{ id: 0, name: 'Test Transport', money: 100000, loan: 300000 }],
   get_rate: () => ({ command_delay_ticks: 0, max_builds_per_day: 0 }),
   dump_tiles: dumpRows,
   acceptance: (a) => {
