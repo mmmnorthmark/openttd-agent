@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { PacketSplitter, encodePacket, cstr, Reader } from '../src/admin-client.js';
 import { assembleParts } from '../src/gs-rpc.js';
 import { TileMap, routeEffort, findFlatSites, townGaps, townsFromRows } from '../src/world.js';
-import { patchIni } from '../src/setup.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { patchIni, resolveSavePath } from '../src/setup.js';
 
 test('packet splitter handles split and merged packets', () => {
   const a = encodePacket(5, cstr('hello'));
@@ -71,4 +74,22 @@ test('patchIni updates existing keys, adds missing keys and sections, keeps the 
   assert.match(out, /\[network\][\s\S]*allow_insecure_admin_login = true[\s\S]*\[gui\]/);
   assert.match(out, /\[game_scripts\]\nAgentBridge = a=1/);
   assert.match(out, /foo = bar/);
+});
+
+test('resolveSavePath: bare save names come from the profile save folder, paths are kept', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ottd-profile-'));
+  fs.mkdirSync(path.join(dir, 'save'));
+  fs.writeFileSync(path.join(dir, 'save', 'mini_agent.sav'), 'x');
+  fs.writeFileSync(path.join(dir, 'elsewhere.sav'), 'x');
+  assert.equal(resolveSavePath('mini_agent', dir), path.join(dir, 'save', 'mini_agent.sav'));
+  assert.equal(resolveSavePath('mini_agent.sav', dir), path.join(dir, 'save', 'mini_agent.sav'));
+  assert.equal(resolveSavePath(path.join(dir, 'elsewhere.sav'), dir), path.join(dir, 'elsewhere.sav'));
+  assert.throws(() => resolveSavePath('save', dir), /not found/, 'a directory is not a save');
+  assert.throws(() => resolveSavePath('nope', dir), /savegame 'nope' not found/);
+});
+
+test('patchIni edits an existing [misc] key instead of adding a second section', () => {
+  const out = patchIni('[misc]\nsavegame_format = \nfoo = 1\n\n[gui]\nx = 1\n', { misc: { savegame_format: 'none' } });
+  assert.equal(out.match(/\[misc\]/g).length, 1);
+  assert.match(out, /\[misc\]\nsavegame_format = none\nfoo = 1/);
 });

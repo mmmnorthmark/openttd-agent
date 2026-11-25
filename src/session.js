@@ -39,7 +39,7 @@ export class Session {
     this.cargos = new Map(cargos.map((c) => [c.id, c]));
     this.types = new Map(types.map((t) => [t.id, t]));
     this.map = new TileMap(this.info.map_x, this.info.map_y);
-    this.admin.on('newgame', () => { log.warn('session', 'host started a new game; reconnect needed'); });
+    this.admin.on('newgame', () => { log.warn('session', 'host started or loaded a game; this session is stale'); });
     log.info('session', 'ready', { map: [this.info.map_x, this.info.map_y], year: this.info.year, gs: this.info.bridge_version });
     return this;
   }

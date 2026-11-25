@@ -30,6 +30,9 @@ export function makeContext() {
           session = s;
           key = connKey(ctx.cfg);
           s.admin.on('close', () => { if (session === s) session = null; });
+          // New game or load on the host: map, cargo ids and the GS all changed. Drop the session;
+          // the next call connects again and mirrors the new map.
+          s.admin.on('newgame', () => { if (session === s) session = null; s.close(); });
           return s;
         }).finally(() => { connecting = null; });
       }

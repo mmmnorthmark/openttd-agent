@@ -65,7 +65,8 @@ export class PacketSplitter {
 
 /**
  * Events: 'gamescript' (obj), 'chat' ({action, clientId, message}),
- * 'date' (int), 'close' (reason).
+ * 'date' (int), 'close' (reason), 'newgame' (the old game is ending),
+ * 'welcome' (login, and again once a new or loaded game is running).
  */
 export class AdminClient extends EventEmitter {
   constructor({ host, port, password, name = 'openttd-agent' }) {
@@ -161,6 +162,7 @@ export class AdminClient extends EventEmitter {
         this.welcome = { serverName, revision, dedicated, seed: r.u32(), landscape: r.u8(), startDate: r.u32(), mapX: r.u16(), mapY: r.u16() };
         log.info('admin', 'connected', this.welcome);
         this._onWelcome?.(this.welcome);
+        this.emit('welcome', this.welcome); // sent again after every new game / load
         return;
       }
       case PKT.SERVER_ERROR: {

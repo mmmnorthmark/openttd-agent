@@ -130,6 +130,18 @@ export function patchIni(text, patches) {
 }
 
 /**
+ * `launch --load` value -> path for OpenTTD's -g (used as given: absolute, or relative to the
+ * profile dir, and it needs its extension). A bare save name, as printed by scenario-prepare or
+ * used with the console's `save`, is looked up in the profile's save/ folder.
+ */
+export function resolveSavePath(load, profileDir) {
+  const candidates = [path.resolve(profileDir, load), path.join(profileDir, 'save', load), path.join(profileDir, 'save', `${load}.sav`)];
+  const found = candidates.find((p) => fs.existsSync(p) && fs.statSync(p).isFile());
+  if (!found) throw new Error(`savegame '${load}' not found. Tried: ${candidates.join(', ')}`);
+  return found;
+}
+
+/**
  * Write a launch profile and start OpenTTD.
  * mode: 'dedicated' (headless server, everyone joins as a client),
  *       'host' (GUI; you then start a LAN server from the Multiplayer menu),
@@ -159,6 +171,11 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
     patches.script = { script_max_opcode_till_suspend: scriptOpcodes };
     patches.game_scripts = { [GS_NAME]: `command_delay_ticks=${commandDelayTicks},max_builds_per_day=${maxBuildsPerDay}` };
     patches.game_creation = { map_x: mapBits, map_y: mapBits };
+    // Uncompressed saves: scenario-prepare reads and rewrites them (src/savegame.js). Read at startup only.
+    patches.misc = { savegame_format: 'none' };
+    // 3 = all actions allowed while paused, so agents can build during a paused turn (new games; a
+    // loaded save keeps its own value, which `pause` sets over the console).
+    patches.construction = { command_pause_level: 3 };
     if (terrain !== undefined) patches.difficulty = { terrain_type: TERRAIN_TYPES.indexOf(terrain) }; // seed goes on the command line (-G); ini v7 dropped generation_seed
     fs.writeFileSync(path.join(dir, 'secrets.cfg'), `[network]\nadmin_password = ${adminPassword}\n`, { mode: 0o600 });
   }
@@ -174,7 +191,7 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
     args.push('-n', `${joinHost}:${gamePort}`);
   }
   if (seed !== undefined && mode !== 'join') args.push('-G', String(seed));
-  if (load) args.push('-g', load);
+  if (load) args.push('-g', resolveSavePath(load, dir));
   const logFile = path.join(dir, 'openttd.log');
   const result = { mode, profile_dir: dir, executable: exe, args, log: logFile, admin_port: mode === 'join' ? null : adminPort, game_port: gamePort };
   // OpenTTD 15.3 binds the admin port to the same addresses as the game port

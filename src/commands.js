@@ -128,7 +128,7 @@ export const COMMANDS = [
       admin_password: z.string().optional().describe('dedicated/host: defaults to the configured admin_password; if there is none, a random one is generated and saved in the config (it never needs to leave this machine)'),
       join_host: z.string().optional().describe('host LAN IP for mode=join; defaults to configured host'),
       seed: int().optional(), map_bits: int().min(6).max(12).default(8).describe('map size as power of two: 8=256, 9=512, 10=1024'),
-      load: z.string().optional().describe('savegame path to load instead of generating a new map'),
+      load: z.string().optional().describe('savegame to load instead of generating a new map: a path, or a save name from the profile\'s save/ folder (e.g. the one scenario-prepare printed)'),
       command_delay_ticks: int().min(0).max(74).default(0).describe('GameScript rate limit: extra ticks after each build command (0 = full speed)'),
       max_builds_per_day: int().min(0).default(0).describe('GameScript rate limit per company per game day (0 = unlimited)'),
       terrain: z.enum(TERRAIN_TYPES).optional().describe('new maps only; default: whatever your openttd.cfg says (OpenTTD default flat)'),
