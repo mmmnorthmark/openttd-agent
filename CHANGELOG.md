@@ -3,6 +3,27 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
+## 0.2.0 (unreleased)
+Per-player access replaces the shared admin password. No GameScript change (still v5).
+
+- `openttd-agent relay` (host): the only admin-port client. Players send commands to it over HTTP
+  with their own token; it forces every command to the company the host bound that player to,
+  refuses host-only commands (launch, install-gamescript, configure, rate changes; there is no raw
+  rcon), applies a per-player `max_builds_per_minute`, prefixes chat with the player's name and
+  writes `~/.openttd-agent/relay-audit.jsonl`.
+- Host commands: `relay-add-player` (prints the token once; only its SHA-256 is stored),
+  `relay-list-players`, `relay-set-company` (bind a `pending` player later), `relay-remove-player`.
+- Players: `configure --relay http://<host-LAN-IP>:47978 --token <token>`. CLI, MCP and the library
+  then run game commands through the relay; no admin password and no local daemon. Analysis and
+  path planning run on the relay's shared map mirror.
+- `launch` generates and saves a random admin password when none is configured, and reports
+  whether the admin port is reachable from the LAN (OpenTTD binds it like the game port).
+- New config keys: `relay`, `relay_token`, `relay_port` (default 47978).
+
+Migrating from 0.1.0: the host stops sharing the admin password (change it), runs `relay`, and
+registers players; players replace `configure --host/--admin_password/--company` with
+`configure --relay/--token` (and may clear the old password with `configure --admin_password ""`).
+
 ## 0.1.0 (2026-11-24)
 Verified end to end against a real OpenTTD 15.3 dedicated server (flat 256x256 and mountainous
 512x512 maps): map mirror, opportunity queries, airport sites, rail termini, planned rail lines up
