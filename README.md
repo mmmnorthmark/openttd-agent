@@ -6,25 +6,26 @@ OpenTTD world and build for **your** company while you play the same company by 
 - **CLI first.** Every command prints JSON, so agents can chain and script calls ("code mode").
 - **MCP too.** `openttd-agent mcp` exposes the same commands as MCP tools.
 - **Bundled GameScript** (`AgentBridge`) does the in-game work; only the **host** installs it.
-- **LAN games.** Talks to the host's admin port with the admin password. Don't expose that port to the internet.
+- **LAN games, per-player access.** The host runs a small **relay**; each player gets their own token, bound to
+  one company. Nobody but the host's machine ever holds the admin password.
 
 ## Install / update
 
 Needs Node 20+ and OpenTTD 15.x.
 
 ```sh
-npx -y github:mmmnorthmark/openttd-agent#v0.1.0 doctor
+npx -y github:mmmnorthmark/openttd-agent#v0.2.0 doctor
 ```
 
-To update, change the tag (`#v0.2.0`) wherever you reference it, and the **host** re-runs
+To update, change the tag (`#v0.3.0`) wherever you reference it, and the **host** re-runs
 `install-gamescript`. See [CHANGELOG.md](CHANGELOG.md).
 
-Optional: `npm i -g github:mmmnorthmark/openttd-agent#v0.1.0` gives you a plain `openttd-agent` command.
+Optional: `npm i -g github:mmmnorthmark/openttd-agent#v0.2.0` gives you a plain `openttd-agent` command.
 
 ### Claude Code MCP config
 
 ```sh
-claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.1.0 mcp
+claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.2.0 mcp
 ```
 
 ## Game night
@@ -33,21 +34,51 @@ claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.1.0 mcp
 
 ```sh
 openttd-agent install-gamescript
-openttd-agent launch --mode dedicated --admin_password <shared-secret> --map_bits 9
+openttd-agent launch --mode dedicated --map_bits 9      # generates the admin password and keeps it in your config
 # optional rate limit for everyone: --command_delay_ticks 2 --max_builds_per_day 50
+openttd-agent relay                                     # leave running; listens on port 47978
 ```
 
 Then everyone, the host included, joins the game from OpenTTD's Multiplayer menu (or
 `openttd-agent launch --mode join --join_host <host-LAN-IP>`) and starts or joins their company.
 
-**Each player** (once):
+Register each player (the host too, if their agent should be held to the same rules):
 
 ```sh
-openttd-agent configure --host <host-LAN-IP> --admin_password <shared-secret>
-openttd-agent companies                 # find your company id
-openttd-agent configure --company <id>
-openttd-agent status
+openttd-agent relay-add-player --name joe --company pending   # prints joe's token once, plus the line to send him
+openttd-agent companies                                       # once joe has started his company: find its id
+openttd-agent relay-set-company --name joe --company 1
+openttd-agent relay-list-players
+openttd-agent relay-remove-player --name joe                  # his token stops working at once
 ```
+
+**Each player** (once), with the two values the host sent:
+
+```sh
+openttd-agent configure --relay http://<host-LAN-IP>:47978 --token <token>
+openttd-agent status          # my_company shows the company the host bound you to
+```
+
+What a player's token can do:
+
+- Read the world (towns, industries, map, all companies' figures) and run every analysis command.
+- Build and operate **only as the company the host bound it to**. `--company <other>` is refused;
+  leaving it out always means "my company".
+- Not: `rate` changes, `launch`, `install-gamescript`, anything on the host's config, or raw console access.
+- Chat sent through the relay is prefixed with the player's name.
+
+The host sees who did what in `~/.openttd-agent/relay-audit.jsonl` (one JSON line per command or
+refusal: time, player, company, command, arguments, outcome).
+
+Security notes, so nobody is surprised:
+
+- **Never hand out the admin password.** Anyone holding it has the full server console and can act
+  as any company; the GameScript cannot tell admin connections apart. That is why the relay exists.
+- OpenTTD binds the admin port (3977) to the same addresses as the game port, so on a LAN game it
+  is reachable from the LAN; the password is what protects it. `launch` generates a long random one.
+- The relay speaks plain HTTP, so **tokens cross the LAN in clear text**. Fine for a home network;
+  don't run it over the internet or on a network you don't trust.
+- Tokens are stored on the host only as SHA-256 hashes (`~/.openttd-agent/relay-players.json`, mode 0600).
 
 ## Commands
 
@@ -56,6 +87,7 @@ openttd-agent status
 | Group | Commands |
 |---|---|
 | setup | `doctor`, `install-gamescript`, `configure`, `show-config`, `launch` |
+| relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player` |
 | game | `status`, `companies`, `chat`, `rate` |
 | world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
 | operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
@@ -64,8 +96,8 @@ openttd-agent status
 | build: road | `build-road-path` (planned path), `build-road-station`, `build-road-depot`, `build-road` / `test-build-road` (straight) |
 | build: other | `bridge-types`, `build-bridge`, `build-tunnel`, `terraform`, `demolish`, `build-dock`, `build-buoy`, `build-water-depot`, `build-airport` |
 
-Every command that changes the game takes `--dry_run true` (cost and feasibility only) and
-`--company <id>` (default: your configured company).
+Every command that changes the game takes `--dry_run true` (cost and feasibility only). It acts as
+your company: the one the host bound your token to (a different `--company` is refused).
 
 Examples:
 
@@ -116,7 +148,7 @@ game.close();
 
 - **Dry run first.** `--dry_run true` returns the cost and, per step, whether the game would
   accept it. Nothing is built and no rate limit is used.
-- **Paths are planned on your machine** from the map mirror (flat and straight preferred; houses,
+- **Paths are planned by openttd-agent** (on the host's relay) from the map mirror (flat and straight preferred; houses,
   industries and stations avoided; roads crossed on the level; water, rail and roads bridged), then
   built piece by piece. `build-rail` lays track strictly *between* its two anchor tiles (a station
   end, the tile in front of a depot, existing track); `build-road-path` includes both ends.
@@ -132,20 +164,28 @@ Off by default (full speed). Two independent limits:
 
 - **GameScript (host, applies to everyone):** `launch --command_delay_ticks N --max_builds_per_day N`,
   changeable live in OpenTTD's GameScript settings or with `openttd-agent rate`.
-- **Client (each player, self-imposed):** `configure --max_builds_per_minute N`.
+- **Relay (per player, set by the host):** `relay-add-player --max_builds_per_minute N` or
+  `relay-set-company --name <n> --max_builds_per_minute N`; default is the host's own
+  `configure --max_builds_per_minute N`.
 
 ## How it works
 
 ```
-your agent ──CLI/MCP──▶ openttd-agent (daemon keeps the connection + map mirror)
-                              │ admin port (TCP 3977, LAN)
-                              ▼
-                        OpenTTD host ── AgentBridge GameScript (GSCompanyMode builds as your company)
+player's agent ──CLI/MCP──▶ openttd-agent ──HTTP + token (LAN, port 47978)──┐
+                                                                            ▼
+host's agent ──CLI/MCP──▶ openttd-agent ─────────────────────▶ openttd-agent relay (host)
+                                                               │ checks token, forces company,
+                                                               │ keeps the map mirror, audit log
+                                                               │ admin port (TCP 3977, password stays here)
+                                                               ▼
+                                             OpenTTD ── AgentBridge GameScript (builds as that company)
 ```
 
-- The daemon starts automatically on the first game command and listens on 127.0.0.1 only.
-- It copies the whole map into memory once (height, slope and tile type for every tile), then
-  keeps refreshing it in the background, so analysis questions don't slow the game.
+- The relay copies the whole map into memory once (height, slope and tile type for every tile),
+  then keeps refreshing it in the background. Analysis and path planning run there, so players
+  need no map copy and questions don't slow the game.
+- Playing alone, or as the host without the relay: leave `relay` unset and openttd-agent talks to
+  the admin port itself through a local daemon (127.0.0.1 only, started automatically).
 - Wire protocol: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Development
@@ -154,4 +194,4 @@ your agent ──CLI/MCP──▶ openttd-agent (daemon keeps the connection + m
 npm install && npm test     # unit tests + a fake admin server end-to-end test
 ```
 
-Config lives in `~/.openttd-agent/` (`config.json`, launch `profiles/`). Your own `openttd.cfg` is never modified.
+Config lives in `~/.openttd-agent/` (`config.json`, launch `profiles/`, and on the host `relay-players.json`, `relay-audit.jsonl`). Your own `openttd.cfg` is never modified.
