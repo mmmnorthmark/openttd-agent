@@ -241,9 +241,10 @@ export function acceptanceFromRows(rows, cargosById, nPoints) {
  * (acceptance null) for cargos in `townCargoFallback` (ids of cargos with a town effect) only.
  * destKind 'industry' | 'town' | 'any'. Secondary (processing) sources are marked `secondary: true`:
  * their last_month is 0 between deliveries, so minProduction does not drop them.
- * Optionally ranks each pair by routeEffort on `map`.
+ * Towns are sources too, for cargos that `cargos` (id -> { name, passengers, mail }) marks as passenger or
+ * mail: see townToTownPairs. Optionally ranks each pair by routeEffort on `map`.
  */
-export function findCargoPairs({ industries, types, towns = [], townAcceptance = null, townCargoFallback = new Set(), map, cargo, sourceType, destType, destKind = 'any',
+export function findCargoPairs({ industries, types, towns = [], cargos = new Map(), townAcceptance = null, townCargoFallback = new Set(), map, cargo, sourceType, destType, destKind = 'any',
   minDist = 0, maxDist = 1e9, maxTransportedPct = 100, minProduction = 0, limit = 10, withEffort = true }) {
   const pairs = [];
   for (const src of industries) {
@@ -278,6 +279,7 @@ export function findCargoPairs({ industries, types, towns = [], townAcceptance =
       }
     }
   }
+  if (destKind !== 'industry') pairs.push(...townToTownPairs({ towns, cargos, townAcceptance, townCargoFallback, cargo, sourceType, destType, minDist, maxDist, maxTransportedPct, minProduction }));
   // Pre-rank by unserved volume * distance (revenue proxy) before the costlier effort pass.
   pairs.sort((x, y) => y.source_last_month * (100 - y.source_transported_pct) * y.distance
     - x.source_last_month * (100 - x.source_transported_pct) * x.distance);
@@ -297,6 +299,38 @@ export function findCargoPairs({ industries, types, towns = [], townAcceptance =
 }
 
 const brief = (ind) => ({ id: ind.id, type: ind.type_name, x: ind.x, y: ind.y });
+const townBrief = (town) => ({ kind: 'town', id: town.id, name: town.name, x: town.x, y: town.y, population: town.population });
+
+/**
+ * Town -> town pairs for passenger and mail cargos (a `cargos` entry with passengers or mail true).
+ * Source production is the town's last-month passenger or mail production (GS `towns`); the dest is
+ * another town whose centre accepts the cargo (same acceptance rule as industry -> town pairs).
+ * sourceType / destType, when given, must match 'town' or the town name.
+ */
+function townToTownPairs({ towns, cargos, townAcceptance, townCargoFallback, cargo, sourceType, destType, minDist, maxDist, maxTransportedPct, minProduction }) {
+  const pairs = [];
+  for (const c of cargos.values()) {
+    if (!(c.passengers || c.mail) || !matches(cargo, c.name)) continue;
+    if (!townAcceptance && !townCargoFallback.has(c.id)) continue;
+    for (const src of towns) {
+      if (sourceType && !matches(sourceType, 'town') && !matches(sourceType, src.name)) continue;
+      const produced = c.passengers ? src.pax_produced : src.mail_produced;
+      const pct = c.passengers ? src.pax_transported_pct : src.mail_transported_pct;
+      if (produced === undefined || pct > maxTransportedPct || produced < minProduction) continue;
+      const base = { cargo: c.name, source_last_month: produced, source_transported_pct: pct };
+      for (const dst of towns) {
+        if (dst.id === src.id) continue;
+        if (destType && !matches(destType, 'town') && !matches(destType, dst.name)) continue;
+        const acc = townAcceptance ? (townAcceptance.get(dst.id)?.[c.id] ?? 0) : null;
+        if (acc !== null && acc < ACCEPTED) continue;
+        const dist = manhattan(src, dst);
+        if (dist < minDist || dist > maxDist) continue;
+        pairs.push({ source: townBrief(src), dest: { ...townBrief(dst), acceptance: acc }, ...base, distance: dist });
+      }
+    }
+  }
+  return pairs;
+}
 
 /** Towns ranked by passengers not yet transported. */
 export function townGaps(towns, { minPopulation = 0, maxTransportedPct = 100, limit = 15 } = {}) {
