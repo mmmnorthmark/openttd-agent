@@ -2,7 +2,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSavegame, spliceChunks } from '../src/savegame.js';
+import { parseSavegame, spliceChunks, patchTableFields } from '../src/savegame.js';
 
 const header = (tag = 'OTTN') => Buffer.concat([Buffer.from(tag, 'latin1'), Buffer.from([0x01, 0x5e, 0x00, 0x00])]);
 const end = Buffer.alloc(4);
@@ -77,4 +77,45 @@ test('truncated or padded files are rejected (a save still being written must no
   assert.throws(() => parseSavegame(buf.subarray(0, buf.length - 200)), /truncated|past end/);
   assert.throws(() => parseSavegame(Buffer.concat([buf, Buffer.from([1])])), /after end marker/);
   assert.throws(() => parseSavegame(save(Buffer.concat([Buffer.from('BADC', 'latin1'), Buffer.from([9])]))), /unknown type 9/);
+});
+
+/** Settings-style table: header element (type byte + gamma-length name per field, then 0) and one record. */
+function settingsTable(id, fields) {
+  const head = [];
+  const rec = [];
+  for (const [type, name, bytes] of fields) {
+    head.push(Buffer.from([type]), gamma(name.length), Buffer.from(name));
+    rec.push(bytes);
+  }
+  head.push(Buffer.from([0]));
+  return table(id, [Buffer.concat(head), Buffer.concat(rec)]);
+}
+const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32BE(v); return b; };
+const PATS = (pause, opcodes) => settingsTable('PATS', [
+  [0x02, 'difficulty.max_no_competitors', Buffer.from([7])],
+  [0x1a, 'game_creation.name', Buffer.concat([gamma(5), Buffer.from('hello')])],   // string: length field
+  [0x14, 'some.list', Buffer.concat([gamma(2), Buffer.from([0, 1, 0, 2])])],       // list of two uint16
+  [0x02, 'construction.command_pause_level', Buffer.from([pause])],
+  [0x06, 'script.script_max_opcode_till_suspend', u32(opcodes)],
+  [0x08, 'economy.big', Buffer.alloc(8, 1)],
+]);
+
+test('patchTableFields sets integer settings in place and reports the old values', () => {
+  const buf = save(MAPS, PATS(1, 10000), GS_SCENARIO);
+  const { buf: out, previous } = patchTableFields(buf, 'PATS', { 'construction.command_pause_level': 3, 'script.script_max_opcode_till_suspend': 100000 });
+  assert.deepEqual(previous, { 'construction.command_pause_level': 1, 'script.script_max_opcode_till_suspend': 10000 });
+  assert.ok(out.equals(save(MAPS, PATS(3, 100000), GS_SCENARIO)), 'only the two values differ');
+  assert.ok(buf.equals(save(MAPS, PATS(1, 10000), GS_SCENARIO)), 'input untouched');
+});
+
+test('patchTableFields refuses unknown fields, non-integers, bad values and non-tables', () => {
+  const buf = save(MAPS, PATS(1, 10000));
+  assert.throws(() => patchTableFields(buf, 'PATS', { 'no.such': 1 }), /no field no\.such/);
+  assert.throws(() => patchTableFields(buf, 'PATS', { 'game_creation.name': 1 }), /not a plain/);
+  assert.throws(() => patchTableFields(buf, 'PATS', { 'economy.big': 1 }), /not a plain/);
+  assert.throws(() => patchTableFields(buf, 'PATS', { 'construction.command_pause_level': 256 }), /does not fit/);
+  assert.throws(() => patchTableFields(buf, 'MAPS', {}), /not a table/);
+  assert.throws(() => patchTableFields(buf, 'GSDT', {}), /no GSDT chunk/);
+  const nested = save(settingsTable('PATS', [[0x1b, 'sub', Buffer.from([0])]]));
+  assert.throws(() => patchTableFields(nested, 'PATS', {}), /nested structs/);
 });

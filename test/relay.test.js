@@ -96,7 +96,7 @@ test('every command that changes the game or reads company data takes a company 
 
 test('host-only commands are refused for players', async () => {
   for (const [name, args] of [['launch', { mode: 'dedicated', admin_password: 'sent-by-player' }], ['install-gamescript', {}], ['configure', { admin_password: 'x' }],
-    ['show-config', {}], ['relay-add-player', { name: 'eve', company: 0 }], ['relay-list-players', {}], ['rate', { max_builds_per_day: 1 }], ['rcon', { command: 'quit' }]]) {
+    ['show-config', {}], ['relay-add-player', { name: 'eve', company: 0 }], ['relay-list-players', {}], ['rate', { max_builds_per_day: 1 }], ['rcon', { command: 'quit' }], ['scenario-prepare', { search: 'mini' }]]) {
     const r = await call(tokens.alice, name, args);
     assert.equal(r.status, 403, name);
     assert.match(r.error, /relay refused/, name);

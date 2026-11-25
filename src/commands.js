@@ -10,6 +10,7 @@ import * as z from 'zod/v4';
 import { doctor, installGamescript, launch, TERRAIN_TYPES } from './setup.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
+import { prepareScenario } from './scenario.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES } from './operate.js';
@@ -149,6 +150,18 @@ export const COMMANDS = [
       if (hosting && !a.dry_run && adminPassword !== ctx.cfg.admin_password) saveConfig({ admin_password: adminPassword });
       return { ...result, ...(generated ? { admin_password: a.dry_run ? 'would be generated' : 'generated and saved in the config' } : {}) };
     },
+  },
+  {
+    name: 'scenario-prepare', group: 'setup', session: false,
+    description: 'HOST ONLY: download a scenario from BaNaNaS (OpenTTD\'s content service) into the running server and write a copy that runs AgentBridge (<name>_agent.sav in the server\'s save folder). A scenario loaded as-is would not start AgentBridge. Needs a server started by `launch` with AgentBridge running. The server briefly loads the scenario, so run it before players join; without --load true the game that was running is restored afterwards.',
+    args: z.object({
+      search: z.string().min(2).optional().describe('text in the scenario name; must match exactly one (the error lists the candidates with their ids)'),
+      content_id: int().optional().describe('numeric BaNaNaS content id, as listed by --search or by the console\'s `content state`'),
+      name: z.string().optional().describe('save name prefix; default: made from the scenario name'),
+      load: bool().default(false).describe('true = leave the server running the prepared scenario'),
+      script_opcodes: int().min(500).max(250000).default(100000).describe('GameScript opcodes per tick stored in the copy (a scenario brings its own, usually 10000)'),
+    }),
+    run: (ctx, a) => prepareScenario(ctx.cfg, { search: a.search, contentId: a.content_id, name: a.name, load: a.load, scriptOpcodes: a.script_opcodes }),
   },
 
   // ---- relay (host only: who may play which company) ---------------------------

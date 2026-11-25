@@ -94,3 +94,64 @@ export function spliceChunks(target, donor, ids) {
   parseSavegame(out); // self-check: the result must parse to the end marker
   return out;
 }
+
+// ---- table fields ---------------------------------------------------------------------------
+// A CH_TABLE chunk's first element is its header: (type byte, gamma-length name) pairs ended by
+// a zero type byte; each later element is one record with the fields in header order.
+// Type byte: low nibble = SLE_FILE_* (1/2 = 8 bit, 3/4 = 16, 5/6 = 32, 7/8 = 64, 9 = string id,
+// 10 = string, 11 = struct), bit 4 = the field is a list with a gamma count first. Integers are big-endian.
+
+const CH_TABLE = 3;
+const FILE_TYPE_MASK = 0x0f;
+const FILE_HAS_LENGTH = 0x10;
+const FILE_STRUCT = 11;
+const FILE_SIZES = [0, 1, 1, 2, 2, 4, 4, 8, 8, 2, 1];
+
+/**
+ * Return a copy of `buf` with integer fields of the first record of table chunk `chunkId` set:
+ * `values` is { fieldName: integer }. Used for game settings (chunk PATS, names like
+ * "construction.command_pause_level") that the console refuses to change in a network game.
+ * Returns { buf, previous: { fieldName: old value } }. Throws if a field is missing or not a plain integer.
+ */
+export function patchTableFields(buf, chunkId, values) {
+  const chunk = parseSavegame(buf).chunks.find((c) => c.id === chunkId);
+  if (!chunk) throw new Error(`savegame: no ${chunkId} chunk`);
+  if ((buf[chunk.start + 4] & CH_TYPE_MASK) !== CH_TABLE) throw new Error(`savegame: chunk ${chunkId} is not a table`);
+  const out = Buffer.from(buf);
+  let [len, pos] = readGamma(out, chunk.start + 5);
+  const headerEnd = pos + len - 1;
+  const fields = [];
+  for (;;) {
+    const type = out[pos++];
+    if (type === 0) break;
+    let n;
+    [n, pos] = readGamma(out, pos);
+    fields.push({ type, name: out.toString('utf8', pos, pos + n) });
+    pos += n;
+  }
+  if (fields.some((f) => (f.type & FILE_TYPE_MASK) === FILE_STRUCT)) throw new Error(`savegame: chunk ${chunkId} has nested structs; not supported`);
+  if (pos !== headerEnd) throw new Error(`savegame: chunk ${chunkId} header is ${headerEnd - pos} bytes longer than its field list`);
+  [len, pos] = readGamma(out, pos);
+  if (len === 0) throw new Error(`savegame: chunk ${chunkId} has no record`);
+  const recordEnd = pos + len - 1;
+  const wanted = new Map(Object.entries(values));
+  const previous = {};
+  for (const f of fields) {
+    const size = FILE_SIZES[f.type & FILE_TYPE_MASK];
+    if (size === undefined || size === 0) throw new Error(`savegame: field ${f.name} has unknown type 0x${f.type.toString(16)}`);
+    let count = 1;
+    if (f.type & FILE_HAS_LENGTH) [count, pos] = readGamma(out, pos);
+    if (wanted.has(f.name)) {
+      const v = wanted.get(f.name);
+      if ((f.type & FILE_HAS_LENGTH) || size > 4) throw new Error(`savegame: field ${f.name} is not a plain 8/16/32-bit integer`);
+      if (!Number.isInteger(v) || v < 0 || v >= 2 ** (8 * size)) throw new Error(`savegame: ${v} does not fit field ${f.name} (${size} bytes)`);
+      previous[f.name] = out.readUIntBE(pos, size);
+      out.writeUIntBE(v, pos, size);
+      wanted.delete(f.name);
+    }
+    pos += count * size;
+  }
+  if (pos !== recordEnd) throw new Error(`savegame: chunk ${chunkId} record does not match its header (off by ${recordEnd - pos} bytes)`);
+  if (wanted.size) throw new Error(`savegame: chunk ${chunkId} has no field ${[...wanted.keys()].join(', ')}`);
+  return { buf: out, previous };
+}
