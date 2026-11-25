@@ -8,6 +8,13 @@ re-run `install-gamescript` when it changes.
 - `mcp --tools a,b,c` serves only those commands as MCP tools (every tool schema is sent with
   each model request; a few tight tools suit small models), with shorter server instructions.
   `mcp --compact true` returns tool results as single-line JSON.
+- GameScript v8 (the host re-runs `install-gamescript`; a running game picks it up when it is
+  loaded again): `loan` exec step.
+- `loan` (player, own company): show the loan, or change it with one of `--amount N` (set),
+  `--borrow N`, `--repay N` or `--max true`; `--dry_run true` predicts. The new loan is rounded up
+  to the loan interval; refused below 0, over `max_loan`, or when repaying needs more cash than
+  the company has. Returns loan, max_loan and money before and after. With an older running
+  GameScript it says to re-run `install-gamescript` and load the game again.
 
 ## 0.2.0 (2026-11-25)
 Per-player access replaces the shared admin password. BaNaNaS scenarios, goals and turn-based
