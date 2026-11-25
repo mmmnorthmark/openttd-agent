@@ -51,6 +51,26 @@ test('pathCells + depotCandidates find a depot beside a line that is only planne
   assert.equal(c[0].front[1], 20);
 });
 
+test('depotCandidates onLine: no depot beside another line that runs closer to the source', () => {
+  // An older straight line along x=12 runs right past the source; the new line (planned along y=20,
+  // with a curve near the source) is further away. Without onLine the old line wins.
+  const m = flat(40);
+  const old = new Map();
+  for (let y = 5; y <= 35; y++) old.set(`12,${y}`, 'r');
+  const plan = planPath(m, { x: 5, y: 20 }, { x: 30, y: 20 });
+  const cells = pathCells(plan, new Map(old));
+  const view = overlayMap(m, cells);
+  const any = depotCandidates(view, [6, 14]);
+  assert.equal(any[0].front[0], 12, 'the old line is nearest');
+  const mine = new Set(plan.tiles.map(([x, y]) => `${x},${y}`));
+  const own = depotCandidates(view, [6, 14], { onLine: mine });
+  assert.ok(own.length > 0);
+  for (const c of own) {
+    assert.ok(mine.has(c.front.join(',')), 'front is on the new line');
+    for (const e of c.ends) assert.ok(mine.has(e.join(',')), 'both joins are on the new line');
+  }
+});
+
 test('pickTrain: cheapest-to-run powered locomotive, wagon with the cargo first, forced ids checked', () => {
   const engines = [
     { id: 1, name: 'Fast', is_wagon: false, power: 900, running_cost: 3000, price: 20000 },

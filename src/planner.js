@@ -359,9 +359,11 @@ export function terminusCandidates(map, { targets, radius = 8, catchment = 3, pl
  * the map mirror. A line tile R is straight when both neighbours along one axis are rail and
  * neither neighbour across it is rail or station. The depot goes on a buildable flat tile across
  * from R at R's height, facing R. Tiles within 2 of a station tile are skipped (points live there).
+ * `onLine` (Set of "x,y"): only rail tiles of that line, and only where both neighbours along it are
+ * on it too. Without it any company's rail qualifies, so a depot may end up on another line.
  * Returns [{ depot:[x,y], front:[x,y], ends:[[x,y],[x,y]], dist }]; steps: depotSteps().
  */
-export function depotCandidates(map, near, { radius = 12, max = 20 } = {}) {
+export function depotCandidates(map, near, { radius = 12, max = 20, onLine = null } = {}) {
   const out = [];
   const inMap = (x, y) => x >= 1 && y >= 1 && x < map.sizeX - 1 && y < map.sizeY - 1;
   const isRail = (x, y) => inMap(x, y) && map.classAt(x, y) === 'r';
@@ -374,10 +376,12 @@ export function depotCandidates(map, near, { radius = 12, max = 20 } = {}) {
   for (let y = Math.max(1, ny - radius); y <= Math.min(map.sizeY - 2, ny + radius); y++) {
     for (let x = Math.max(1, nx - radius); x <= Math.min(map.sizeX - 2, nx + radius); x++) {
       if (!isRail(x, y) || nearStation(x, y) || map.slopeAt(x, y) !== 0) continue;
+      if (onLine && !onLine.has(`${x},${y}`)) continue;
       for (const [ax, ay] of [[1, 0], [0, 1]]) {
         const [cx, cy] = [ay, ax]; // across the line
         if (!isTrack(x - ax, y - ay) || !isTrack(x + ax, y + ay)) continue;
         if (isTrack(x - cx, y - cy) || isTrack(x + cx, y + cy)) continue;
+        if (onLine && (!onLine.has(`${x - ax},${y - ay}`) || !onLine.has(`${x + ax},${y + ay}`))) continue;
         for (const side of [-1, 1]) {
           const dx = x + side * cx; const dy = y + side * cy;
           if (!inMap(dx, dy) || !SITE_OK_CLASSES.has(map.classAt(dx, dy)) || map.slopeAt(dx, dy) !== 0 || map.heightAt(dx, dy) !== map.heightAt(x, y)) continue;

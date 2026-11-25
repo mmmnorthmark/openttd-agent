@@ -180,9 +180,9 @@ async function stationSites(s, company, end, toward, { platforms = 2, length = 4
  * build-line-depot: depot beside a straight piece of rail near `near` on `map` (default the mirror;
  * build-cargo-route passes a view with its planned line). Dry run checks the depot step only.
  */
-async function lineDepot(s, company, near, { radius = 12, railType, dryRun = false, map = s.map } = {}) {
+async function lineDepot(s, company, near, { radius = 12, railType, dryRun = false, map = s.map, onLine = null } = {}) {
   const rt = railType !== undefined ? { railType } : {};
-  const cands = depotCandidates(map, near, { radius });
+  const cands = depotCandidates(map, near, { radius, onLine });
   const tried = [];
   for (const c of cands.slice(0, 8)) {
     const steps = depotSteps(c);
@@ -198,6 +198,11 @@ async function lineDepot(s, company, near, { radius = 12, railType, dryRun = fal
       ...(ok ? { next: `vehicle-buy --depot_x ${depot.x} --depot_y ${depot.y} --engine <id>` } : { hint: 'a join failed: run build-track on the front tile toward each end, or try another --station' }) };
   }
   return { ok: false, candidates_on_map: cands.length, tried, hint: cands.length ? 'every spot failed its dry run; try --radius 20' : 'no straight piece of rail with free flat land beside it near there; try --radius 20 or another station' };
+}
+
+/** "x,y" keys of a planned route's own track: the line's tiles and both termini (terminusCells). */
+function routeTiles(line, cells) {
+  return new Set([...line.tiles.map(([x, y]) => `${x},${y}`), ...cells.keys()]);
 }
 
 /** Do two terminus sites (station-sites entries) share a tile? */
@@ -275,7 +280,9 @@ async function buildCargoRoute(s, company, a) {
 
   // 3. Depot beside the planned line near the source.
   const near = [src.connect_at.x, src.connect_at.y];
-  const depotCheck = await lineDepot(s, company, near, { radius: 12, railType, dryRun: true, map: overlayMap(s.map, pathCells(line, cells)) });
+  // Only beside this route's own track: other lines nearby are rail too, and a train bought in a
+  // depot on another line can never reach this route's stations.
+  const depotCheck = await lineDepot(s, company, near, { radius: 12, railType, dryRun: true, map: overlayMap(s.map, pathCells(line, cells)), onLine: routeTiles(line, cells) });
   if (!depotCheck.ok) return fail('depot', depotCheck.hint ?? 'no depot spot passed its dry run', { tried: depotCheck.tried });
   plan.depot = { ...depotCheck.depot, cost: depotCheck.cost };
 
@@ -324,7 +331,8 @@ async function buildCargoRoute(s, company, a) {
     }
     await s.refreshArea(...box);
     // The overlay marks what was just built in case the mirror rows lag behind.
-    const dep = await lineDepot(s, company, near, { radius: 12, railType, map: overlayMap(s.map, pathCells(realLine, terminusCells(dst, terminusCells(src)))) });
+    const realCells = terminusCells(dst, terminusCells(src));
+    const dep = await lineDepot(s, company, near, { radius: 12, railType, map: overlayMap(s.map, pathCells(realLine, realCells)), onLine: routeTiles(realLine, realCells) });
     spent += dep.cost ?? 0;
     if (dep.depot) built.push({ step: 'depot', x: dep.depot.x, y: dep.depot.y, front: dep.front, complete: dep.ok, cost: dep.cost });
     if (!dep.ok) return fail('depot', dep.hint ?? 'depot failed', { spent, depot_results: dep.results });
