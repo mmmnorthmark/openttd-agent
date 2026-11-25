@@ -25,32 +25,32 @@ class AgentBridge extends GSController {
 		this.builds_today = {};
 		this.events = [];
 		this.handlers = {
-			ping = this.CmdPing,
-			info = this.CmdInfo,
-			echo = this.CmdEcho,
-			companies = this.CmdCompanies,
-			cargos = this.CmdCargos,
-			towns = this.CmdTowns,
-			industries = this.CmdIndustries,
-			industry_types = this.CmdIndustryTypes,
-			dump_tiles = this.CmdDumpTiles,
-			get_rate = this.CmdGetRate,
-			set_rate = this.CmdSetRate,
-			airport_types = this.CmdAirportTypes,
-			check_airport = this.CmdCheckAirport,
-			test_build_road = this.CmdTestBuildRoad,
-			build_road = this.CmdBuildRoad,
-			stations = this.CmdStations,
-			vehicles = this.CmdVehicles,
-			vehicle = this.CmdVehicle,
-			engines = this.CmdEngines,
-			groups = this.CmdGroups,
-			depots = this.CmdDepots,
-			autorenew = this.CmdAutorenew,
-			events = this.CmdEvents,
-			exec = this.CmdExec,
-			rail_types = this.CmdRailTypes,
-			bridge_types = this.CmdBridgeTypes,
+			ping = "CmdPing",
+			info = "CmdInfo",
+			echo = "CmdEcho",
+			companies = "CmdCompanies",
+			cargos = "CmdCargos",
+			towns = "CmdTowns",
+			industries = "CmdIndustries",
+			industry_types = "CmdIndustryTypes",
+			dump_tiles = "CmdDumpTiles",
+			get_rate = "CmdGetRate",
+			set_rate = "CmdSetRate",
+			airport_types = "CmdAirportTypes",
+			check_airport = "CmdCheckAirport",
+			test_build_road = "CmdTestBuildRoad",
+			build_road = "CmdBuildRoad",
+			stations = "CmdStations",
+			vehicles = "CmdVehicles",
+			vehicle = "CmdVehicle",
+			engines = "CmdEngines",
+			groups = "CmdGroups",
+			depots = "CmdDepots",
+			autorenew = "CmdAutorenew",
+			events = "CmdEvents",
+			exec = "CmdExec",
+			rail_types = "CmdRailTypes",
+			bridge_types = "CmdBridgeTypes",
 		};
 	}
 }
@@ -86,7 +86,9 @@ function AgentBridge::HandleRequest(req) {
 	}
 	local result = null;
 	try {
-		result = this.handlers[req.cmd].call(this, args);
+		// Member call by name, never .call()/acall(): those are native functions and
+		// OpenTTD refuses DoCommands (fatal, script dies) with a native call on the stack.
+		result = this[this.handlers[req.cmd]](args);
 	} catch (e) {
 		GSLog.Error("AgentBridge: " + req.cmd + " failed: " + e);
 		this.Fail(req.id, client, "exception in " + req.cmd + ": " + e);
@@ -217,12 +219,19 @@ function AgentBridge::CmdCompanies(args) {
 	for (local c = GSCompany.COMPANY_FIRST; c <= GSCompany.COMPANY_LAST; c++) {
 		if (GSCompany.ResolveCompanyID(c) == GSCompany.COMPANY_INVALID) continue;
 		local q = GSCompany.CURRENT_QUARTER + 1; // last full quarter
+		local loan = 0, max_loan = 0;
+		{
+			// GetLoanAmount/GetMaxLoanAmount take no company arg: they read the current company.
+			local cm = GSCompanyMode(c);
+			loan = GSCompany.GetLoanAmount();
+			max_loan = GSCompany.GetMaxLoanAmount();
+		}
 		out.append({
 			id = c,
 			name = this.Str(GSCompany.GetName(c)),
 			money = GSCompany.GetBankBalance(c),
-			loan = GSCompany.GetLoanAmount(c),
-			max_loan = GSCompany.GetMaxLoanAmount(),
+			loan = loan,
+			max_loan = max_loan,
 			value = GSCompany.GetQuarterlyCompanyValue(c, q),
 			income = GSCompany.GetQuarterlyIncome(c, q),
 			expenses = GSCompany.GetQuarterlyExpenses(c, q),
