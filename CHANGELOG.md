@@ -3,7 +3,7 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-11-25)
 Per-player access replaces the shared admin password. BaNaNaS scenarios, goals and turn-based
 play. GameScript v7: the host re-runs `install-gamescript` (a running game picks it up when it is
 loaded again).
