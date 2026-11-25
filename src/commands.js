@@ -606,15 +606,19 @@ export const COMMANDS = [
   },
   {
     name: 'build-road-station', group: 'build', session: true,
-    description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis).',
+    description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis; not on junctions). A normal (bay) stop also gets the road piece on front that joins its entrance.',
     args: z.object({ ...act, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join }),
-    run: (ctx, a) => run(ctx, a, [['road_station', a.x, a.y, a.front_x, a.front_y, a.kind === 'truck', a.drive_through, joinArg(a.join)]]),
+    run: (ctx, a) => run(ctx, a, [
+      ['road_station', a.x, a.y, a.front_x, a.front_y, a.kind === 'truck', a.drive_through, joinArg(a.join)],
+      // A bay stop's entrance is useless until the front tile has a road piece pointing into it.
+      ...(a.drive_through ? [] : [['road', a.front_x, a.front_y, a.x, a.y]]),
+    ]),
   },
   {
     name: 'build-road-depot', group: 'build', session: true,
-    description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile).',
+    description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile), plus the road piece on front that joins the entrance.',
     args: z.object({ ...act, ...point, ...front }),
-    run: (ctx, a) => run(ctx, a, [['road_depot', a.x, a.y, a.front_x, a.front_y]]),
+    run: (ctx, a) => run(ctx, a, [['road_depot', a.x, a.y, a.front_x, a.front_y], ['road', a.front_x, a.front_y, a.x, a.y]]),
   },
 
   // ---- build: bridges, tunnels, land ------------------------------------------------------

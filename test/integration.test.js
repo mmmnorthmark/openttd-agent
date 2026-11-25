@@ -83,3 +83,9 @@ test('build-track sends one rail piece from -> tile -> to', async () => {
   assert.equal(req.cmd, 'exec');
   assert.deepEqual(req.args.steps[0], ['rail', 30, 12, 30, 11, 31, 11]);
 });
+
+test('build-road-depot also joins its entrance to the road', async () => {
+  await cli('build-road-depot', '--x', '27', '--y', '62', '--front_x', '26', '--front_y', '62');
+  const steps = fake.received.at(-1).args.steps;
+  assert.deepEqual(steps[1], ['road', 26, 62, 27, 62]);
+});
