@@ -142,7 +142,7 @@ Security notes, so nobody is surprised:
 | relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player` |
 | game | `status`, `companies`, `chat`, `rate`, `goal-status` |
 | host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance` |
-| world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns), `acceptance`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
+| world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns; town to town for passengers and mail), `acceptance`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
 | operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
 | operate: change | `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot`, `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace`, `loan` (`--amount N`, `--borrow N`, `--repay N` or `--max true`; GameScript v8) |
 | build: rail | `build-cargo-route` (stations, line, depot, train, orders in one call), `station-sites`, `build-line-depot`, `rail-types`, `build-rail` (planned path), `build-track` (one piece, for junctions and depot spurs), `build-rail-station`, `build-rail-depot`, `build-signal`, `build-terminus`, `build-passing-loop` |
@@ -161,6 +161,10 @@ openttd-agent find-cargo-pairs --cargo wood --source_type forest --dest_type saw
 
 # Goods from a factory to towns that accept them
 openttd-agent find-cargo-pairs --cargo goods --dest_kind town
+
+# Passengers between two towns, then feed the names to build-cargo-route
+openttd-agent find-cargo-pairs --cargo passengers --min_distance 30
+openttd-agent build-cargo-route --from_town Bigton --to_town Smallham --cargo passengers --dry_run true
 
 # A whole rail route in one call: check and price it first, then build it
 openttd-agent build-cargo-route --from_industry 6 --to_industry 9 --cargo "iron ore" --dry_run true

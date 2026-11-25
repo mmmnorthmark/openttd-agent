@@ -15,6 +15,11 @@ re-run `install-gamescript` when it changes.
   to the loan interval; refused below 0, over `max_loan`, or when repaying needs more cash than
   the company has. Returns loan, max_loan and money before and after. With an older running
   GameScript it says to re-run `install-gamescript` and load the game again.
+- `find-cargo-pairs` pairs town with town for passengers and mail (cargos marked passenger or
+  mail in `cargos`): `--cargo passengers` returned no candidates because towns were never sources.
+  The source is a town with its last-month production from `towns`; the destination another town
+  whose centre accepts the cargo. Both ends have `kind: "town"` and a `name` that
+  `build-cargo-route --from_town <name> --to_town <name>` takes. Industry sources are unchanged.
 
 ## 0.2.0 (2026-11-25)
 Per-player access replaces the shared admin password. BaNaNaS scenarios, goals and turn-based
