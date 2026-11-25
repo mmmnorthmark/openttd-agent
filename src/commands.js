@@ -882,6 +882,13 @@ export const COMMANDS_BY_NAME = new Map(COMMANDS.map((c) => [c.name, c]));
 export async function runCommand(ctx, name, rawArgs = {}) {
   const cmd = COMMANDS_BY_NAME.get(name);
   if (!cmd) throw new Error(`unknown command '${name}'. Run: openttd-agent help`);
+  // Refuse unknown keys: a mistyped or `--help` flag must never run the command with defaults
+  // (`turn-advance --help` once advanced the game 30 days).
+  const known = Object.keys(cmd.args.shape ?? {});
+  const unknown = Object.keys(rawArgs ?? {}).filter((k) => !known.includes(k));
+  if (unknown.length) {
+    throw new Error(`unknown argument${unknown.length > 1 ? 's' : ''} for ${name}: ${unknown.map((k) => `--${k}`).join(', ')}. Valid: ${known.map((k) => `--${k}`).join(' ') || '(none)'}. Nothing was run.`);
+  }
   const parsed = cmd.args.safeParse(rawArgs);
   if (!parsed.success) throw new Error(`bad arguments for ${name}: ${z.prettifyError(parsed.error)}`);
   // Player with a relay configured: the host's relay runs every game command (it holds the admin connection and the map mirror).

@@ -63,10 +63,20 @@ function printHelp() {
   process.stdout.write(lines.join('\n') + '\n');
 }
 
+function printCommandHelp(name) {
+  const c = describeCommands().find((x) => x.name === name);
+  if (!c) throw new Error(`unknown command '${name}'. Run: openttd-agent help`);
+  const props = c.args.properties ?? {};
+  const lines = [`${c.name}: ${c.description}`, ''];
+  for (const [k, v] of Object.entries(props)) lines.push(`  --${k}  ${v.type ?? ''}${v.enum ? ' (' + v.enum.join('|') + ')' : ''}${v.default !== undefined ? ' default ' + JSON.stringify(v.default) : ''}${v.description ? '  ' + v.description : ''}`);
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
 async function main() {
   const [name, ...rest] = process.argv.slice(2);
   if (!name || name === 'help' || name === '--help' || name === '-h') return printHelp();
   if (name === 'version' || name === '--version') return console.log(VERSION);
+  if (rest.includes('--help') || rest.includes('-h')) return printCommandHelp(name);
   if (name === 'commands') return console.log(JSON.stringify(describeCommands(), null, 2));
   if (name === 'mcp') { const { startMcp } = await import('../src/mcp.js'); return startMcp(); }
   if (name === 'daemon') return void startDaemon();

@@ -89,3 +89,14 @@ test('build-road-depot also joins its entrance to the road', async () => {
   const steps = fake.received.at(-1).args.steps;
   assert.deepEqual(steps[1], ['road', 26, 62, 27, 62]);
 });
+
+test('unknown flags are refused and nothing runs; --help prints command help', async () => {
+  const before = fake.received.length;
+  await assert.rejects(run(process.execPath, [BIN, 'build-road', '--x1', '1', '--y1', '1', '--x2', '2', '--y2', '1', '--bogus', '1'], { env }), (e) => {
+    assert.match(JSON.parse(e.stdout).error, /unknown argument for build-road: --bogus/);
+    return true;
+  });
+  assert.equal(fake.received.filter((r) => r.cmd === 'exec' || r.cmd === 'build_road').length, fake.received.slice(0, before).filter((r) => r.cmd === 'exec' || r.cmd === 'build_road').length);
+  const help = (await run(process.execPath, [BIN, 'turn-advance', '--help'], { env })).stdout;
+  assert.match(help, /^turn-advance: /);
+});
