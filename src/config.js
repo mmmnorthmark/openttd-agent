@@ -1,5 +1,6 @@
-// Player config: ~/.openttd-agent/config.json, overridable by env vars.
-// Each player keeps their own (host address, admin password, company id).
+// Config: ~/.openttd-agent/config.json, overridable by env vars.
+// Host: admin_password (never leaves this machine) + relay_port.
+// Player: relay (the host's relay URL) + relay_token. No admin password.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -9,10 +10,13 @@ export const CONFIG_DIR = process.env.OPENTTD_AGENT_HOME ?? path.join(os.homedir
 export const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 
 export const DEFAULTS = {
-  host: '127.0.0.1',          // LAN IP of the machine hosting the game
+  host: '127.0.0.1',          // where the admin port is (the relay host talks to its own machine)
   admin_port: 3977,
-  admin_password: '',
-  company: null,              // your company id (0-based, as shown by `companies`)
+  admin_password: '',         // host only; players never get it
+  company: null,              // direct mode: company id to act as. Relay mode: the host decides
+  relay: '',                  // player: http://<host-LAN-IP>:<relay_port>; when set, game commands go there
+  relay_token: '',            // player: token printed once by the host's relay-add-player
+  relay_port: 47978,          // host: port `openttd-agent relay` listens on
   daemon_port: 47977,         // local daemon (127.0.0.1 only)
   max_builds_per_minute: 0,   // client-side throttle, 0 = unlimited (full speed)
   tile_refresh_rows_per_sec: 4, // background map refresh speed after the first full load
@@ -20,7 +24,7 @@ export const DEFAULTS = {
 
 const ENV = {
   host: 'OPENTTD_AGENT_HOST', admin_port: 'OPENTTD_AGENT_ADMIN_PORT', admin_password: 'OPENTTD_AGENT_ADMIN_PASSWORD',
-  company: 'OPENTTD_AGENT_COMPANY', daemon_port: 'OPENTTD_AGENT_DAEMON_PORT', max_builds_per_minute: 'OPENTTD_AGENT_MAX_BUILDS_PER_MINUTE',
+  company: 'OPENTTD_AGENT_COMPANY', relay: 'OPENTTD_AGENT_RELAY', relay_token: 'OPENTTD_AGENT_RELAY_TOKEN', relay_port: 'OPENTTD_AGENT_RELAY_PORT', daemon_port: 'OPENTTD_AGENT_DAEMON_PORT', max_builds_per_minute: 'OPENTTD_AGENT_MAX_BUILDS_PER_MINUTE',
 };
 
 export function loadConfig() {
@@ -47,5 +51,5 @@ export function saveConfig(updates) {
 }
 
 export function redacted(cfg) {
-  return { ...cfg, admin_password: cfg.admin_password ? '***' : '' };
+  return { ...cfg, admin_password: cfg.admin_password ? '***' : '', relay_token: cfg.relay_token ? '***' : '' };
 }
