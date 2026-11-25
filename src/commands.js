@@ -118,6 +118,78 @@ async function acceptanceAt(s, points, { w = 1, h = 1, radius = 4, cargos } = {}
 }
 const OLD_GS = 'the running AgentBridge is older than v7 and has no acceptance query; the host runs install-gamescript and reloads the game';
 
+/** Town by id or exact name (case-insensitive). */
+const findTown = (towns, v) => towns.find((t) => String(t.id) === String(v) || t.name.toLowerCase() === String(v).toLowerCase());
+
+/**
+ * One end of a line: { industry } | { town } | { x, y } -> { targets: tiles to be near, catchment, what, point: [x,y] }.
+ * Industry targets are its industry tiles (searched in a 5x5 box from its north tile).
+ */
+function lineEnd(s, { towns, industries }, end) {
+  if (end.industry !== undefined) {
+    const ind = industries.find((i) => i.id === end.industry);
+    if (!ind) throw new Error(`industry ${end.industry} not found; run: openttd-agent industries`);
+    const tiles = [];
+    for (let y = ind.y; y < ind.y + 5; y++) for (let x = ind.x; x < ind.x + 5; x++) if (s.map.classAt(x, y) === 'i') tiles.push([x, y]);
+    return { targets: tiles.length ? tiles : [[ind.x, ind.y]], catchment: 3, what: `${ind.type_name} ${ind.id} at ${ind.x},${ind.y}`, point: [ind.x + 1, ind.y + 1], kind: 'industry', industry: ind };
+  }
+  if (end.town !== undefined) {
+    const t = findTown(towns, end.town);
+    if (!t) throw new Error(`town '${end.town}' not found; run: openttd-agent towns`);
+    return { targets: [[t.x, t.y]], catchment: 4, what: `${t.name} centre ${t.x},${t.y}`, point: [t.x, t.y], kind: 'town', town: t };
+  }
+  if (end.x !== undefined && end.y !== undefined) return { targets: [[end.x, end.y]], catchment: 2, what: `tile ${end.x},${end.y}`, point: [end.x, end.y], kind: 'tile' };
+  throw new Error('give --industry, --town, or --x and --y');
+}
+
+/**
+ * station-sites: terminus spots near `end`, points facing `toward` (another end, or null), each
+ * dry-run checked as `company`. opts: platforms, length, radius, limit. Used by station-sites and build-cargo-route.
+ */
+async function stationSites(s, company, end, toward, { platforms = 2, length = 4, radius = 8, limit = 3, railType } = {}) {
+  const [economy] = await Promise.all([s.economy(), s.ensureTiles()]);
+  const here = lineEnd(s, economy, end);
+  const there = toward ? lineEnd(s, economy, toward).point : null;
+  const cands = terminusCandidates(s.map, { targets: here.targets, radius, catchment: here.catchment, platforms, length, toward: there, max: 40 });
+  const sites = []; let checked = 0;
+  for (const c of cands) {
+    if (sites.length >= limit || checked >= limit * 4) break;
+    checked++;
+    const t = terminusSteps({ x: c.x, y: c.y, axis: c.axis, platforms: c.platforms, length: c.length, exitHigh: c.exit === 'high', join: -1 });
+    const res = await s.exec(company, t.steps, { dryRun: true, ...(railType !== undefined ? { railType } : {}) });
+    const bad = (res.results ?? []).filter((r) => !r.ok && r.op !== 'signal');
+    if (bad.length) continue;
+    sites.push({ x: c.x, y: c.y, axis: c.axis, exit: c.exit, platforms: c.platforms, length: c.length, cost: res.cost, connect_at: t.connect_at,
+      tiles_from_target: c.gap, build: `build-terminus --x ${c.x} --y ${c.y} --axis ${c.axis} --exit ${c.exit} --platforms ${c.platforms} --length ${c.length}` });
+  }
+  return { target: here.what, candidates_on_map: cands.length, dry_runs: checked, sites,
+    ...(sites.length ? {} : { hint: `no site passed: try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform` }) };
+}
+
+/**
+ * build-line-depot: depot beside a straight piece of rail near `near` on `map` (default the mirror;
+ * build-cargo-route passes a view with its planned line). Dry run checks the depot step only.
+ */
+async function lineDepot(s, company, near, { radius = 12, railType, dryRun = false, map = s.map } = {}) {
+  const rt = railType !== undefined ? { railType } : {};
+  const cands = depotCandidates(map, near, { radius });
+  const tried = [];
+  for (const c of cands.slice(0, 8)) {
+    const steps = depotSteps(c);
+    const check = await s.exec(company, [steps[0]], { dryRun: true, ...rt });
+    if (!(check.results ?? []).every((r) => r.ok)) { tried.push({ depot: c.depot, error: check.results?.[0]?.error }); continue; }
+    const depot = { x: c.depot[0], y: c.depot[1] };
+    if (dryRun) return { ok: true, dry_run: true, depot, front: { x: c.front[0], y: c.front[1] }, cost: check.cost, tried };
+    s.throttleBuild();
+    const res = await s.exec(company, steps, rt);
+    await s.refreshArea(c.depot[0] - 1, c.depot[1] - 1, c.depot[0] + 1, c.depot[1] + 1);
+    const ok = (res.results ?? []).every((r) => r.ok);
+    return { ok, depot, front: { x: c.front[0], y: c.front[1] }, cost: res.cost, results: res.results, tried,
+      ...(ok ? { next: `vehicle-buy --depot_x ${depot.x} --depot_y ${depot.y} --engine <id>` } : { hint: 'a join failed: run build-track on the front tile toward each end, or try another --station' }) };
+  }
+  return { ok: false, candidates_on_map: cands.length, tried, hint: cands.length ? 'every spot failed its dry run; try --radius 20' : 'no straight piece of rail with free flat land beside it near there; try --radius 20 or another station' };
+}
+
 /** Run exec steps as the company (client throttle + GS rate gate apply). */
 async function run(ctx, a, steps, opts = {}) {
   const { s, company } = await mine(ctx, a);
@@ -808,22 +880,7 @@ export const COMMANDS = [
       else throw new Error('give --station, or --x and --y');
       await s.ensureTiles();
       await s.refreshArea(Math.max(0, near[0] - a.radius - 1), Math.max(0, near[1] - a.radius - 1), near[0] + a.radius + 1, near[1] + a.radius + 1);
-      const cands = depotCandidates(s.map, near, { radius: a.radius });
-      const tried = [];
-      for (const c of cands.slice(0, 8)) {
-        const steps = depotSteps(c);
-        const check = await s.exec(company, [steps[0]], { dryRun: true, railType: a.rail_type });
-        if (!(check.results ?? []).every((r) => r.ok)) { tried.push({ depot: c.depot, error: check.results?.[0]?.error }); continue; }
-        const depot = { x: c.depot[0], y: c.depot[1] };
-        if (a.dry_run) return { ok: true, dry_run: true, depot, front: { x: c.front[0], y: c.front[1] }, cost: check.cost, tried };
-        s.throttleBuild();
-        const res = await s.exec(company, steps, { railType: a.rail_type });
-        await s.refreshArea(c.depot[0] - 1, c.depot[1] - 1, c.depot[0] + 1, c.depot[1] + 1);
-        const ok = (res.results ?? []).every((r) => r.ok);
-        return { ok, depot, front: { x: c.front[0], y: c.front[1] }, cost: res.cost, results: res.results, tried,
-          ...(ok ? { next: `vehicle-buy --depot_x ${depot.x} --depot_y ${depot.y} --engine <id>` } : { hint: 'a join failed: run build-track on the front tile toward each end, or try another --station' }) };
-      }
-      return { ok: false, candidates_on_map: cands.length, tried, hint: cands.length ? 'every spot failed its dry run; try --radius 20' : 'no straight piece of rail with free flat land beside it near there; try --radius 20 or another station' };
+      return lineDepot(s, company, near, { radius: a.radius, railType: a.rail_type, dryRun: a.dry_run });
     },
   },
   {
@@ -853,48 +910,9 @@ export const COMMANDS = [
     }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const [{ towns, industries }] = await Promise.all([s.economy(), s.ensureTiles()]);
-      const findTown = (v) => towns.find((t) => String(t.id) === String(v) || t.name.toLowerCase() === String(v).toLowerCase());
-      const industryTiles = (ind) => {
-        const t = [];
-        for (let y = ind.y; y < ind.y + 5; y++) for (let x = ind.x; x < ind.x + 5; x++) if (s.map.classAt(x, y) === 'i') t.push([x, y]);
-        return t.length ? t : [[ind.x, ind.y]];
-      };
-      let targets; let catchment = 3; let what;
-      if (a.industry !== undefined) {
-        const ind = industries.find((i) => i.id === a.industry);
-        if (!ind) throw new Error(`industry ${a.industry} not found; run: openttd-agent industries`);
-        targets = industryTiles(ind); what = `${ind.type_name} ${ind.id} at ${ind.x},${ind.y}`;
-      } else if (a.town !== undefined) {
-        const t = findTown(a.town);
-        if (!t) throw new Error(`town '${a.town}' not found; run: openttd-agent towns`);
-        targets = [[t.x, t.y]]; catchment = 4; what = `${t.name} centre ${t.x},${t.y}`;
-      } else if (a.x !== undefined && a.y !== undefined) {
-        targets = [[a.x, a.y]]; catchment = 2; what = `tile ${a.x},${a.y}`;
-      } else throw new Error('give --industry, --town, or --x and --y');
-      let toward = null;
-      if (a.toward_industry !== undefined) {
-        const ti = industries.find((i) => i.id === a.toward_industry);
-        if (!ti) throw new Error(`industry ${a.toward_industry} not found`);
-        toward = [ti.x + 1, ti.y + 1];
-      } else if (a.toward_town !== undefined) {
-        const t = findTown(a.toward_town); if (!t) throw new Error(`town '${a.toward_town}' not found`);
-        toward = [t.x, t.y];
-      } else if (a.toward_x !== undefined && a.toward_y !== undefined) toward = [a.toward_x, a.toward_y];
-      const cands = terminusCandidates(s.map, { targets, radius: a.radius, catchment, platforms: a.platforms, length: a.length, toward, max: 40 });
-      const sites = []; let checked = 0;
-      for (const c of cands) {
-        if (sites.length >= a.limit || checked >= a.limit * 4) break;
-        checked++;
-        const t = terminusSteps({ x: c.x, y: c.y, axis: c.axis, platforms: c.platforms, length: c.length, exitHigh: c.exit === 'high', join: -1 });
-        const res = await s.exec(company, t.steps, { dryRun: true });
-        const bad = (res.results ?? []).filter((r) => !r.ok && r.op !== 'signal');
-        if (bad.length) continue;
-        sites.push({ x: c.x, y: c.y, axis: c.axis, exit: c.exit, platforms: c.platforms, length: c.length, cost: res.cost, connect_at: t.connect_at,
-          tiles_from_target: c.gap, build: `build-terminus --x ${c.x} --y ${c.y} --axis ${c.axis} --exit ${c.exit} --platforms ${c.platforms} --length ${c.length}` });
-      }
-      return { target: what, candidates_on_map: cands.length, dry_runs: checked, sites,
-        ...(sites.length ? {} : { hint: 'no site passed: try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform' }) };
+      const toward = a.toward_industry !== undefined ? { industry: a.toward_industry } : a.toward_town !== undefined ? { town: a.toward_town }
+        : a.toward_x !== undefined && a.toward_y !== undefined ? { x: a.toward_x, y: a.toward_y } : null;
+      return stationSites(s, company, { industry: a.industry, town: a.town, x: a.x, y: a.y }, toward, a);
     },
   },
   {
