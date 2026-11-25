@@ -56,6 +56,7 @@ class AgentBridge extends GSController {
 			exec = "CmdExec",
 			rail_types = "CmdRailTypes",
 			bridge_types = "CmdBridgeTypes",
+			acceptance = "CmdAcceptance",
 			goal_set = "CmdGoalSet",
 			goal_status = "CmdGoalStatus",
 			goal_clear = "CmdGoalClear",
@@ -64,7 +65,7 @@ class AgentBridge extends GSController {
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v6 started");
+	GSLog.Info("AgentBridge v7 started");
 	this.RestoreGoals();
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
@@ -222,7 +223,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 6,
+		bridge_version = 7,
 		event_seq = this.event_seq,
 		goals = this.goals.len(),
 	};
@@ -368,6 +369,33 @@ function AgentBridge::TileClass(t) {
 	if (GSTile.IsRoughTile(t)) return "h";
 	if (GSTile.IsBuildable(t)) return "b";
 	return "o";
+}
+
+// args: points = [[x, y], ...], optional w, h (station size, default 1), radius (catchment, default 4),
+// cargos = [cargo ids] (default: every cargo). Rows: [point_index, cargo, acceptance] for acceptance > 0;
+// 8 or more means a station of that size there would accept the cargo. Invalid tiles/cargos are skipped.
+function AgentBridge::CmdAcceptance(args) {
+	local w = ("w" in args) ? args.w : 1;
+	local h = ("h" in args) ? args.h : 1;
+	local r = ("radius" in args) ? args.radius : 4;
+	local cargos = [];
+	if ("cargos" in args) {
+		cargos = args.cargos;
+	} else {
+		foreach (c, _ in GSCargoList()) cargos.append(c);
+	}
+	local out = [];
+	for (local i = 0; i < args.points.len(); i++) {
+		local p = args.points[i];
+		local tile = GSMap.GetTileIndex(p[0], p[1]);
+		if (!GSMap.IsValidTile(tile)) continue;
+		foreach (c in cargos) {
+			if (!GSCargo.IsValidCargo(c)) continue;
+			local v = GSTile.GetCargoAcceptance(tile, c, w, h, r);
+			if (v > 0) out.append([i, c, v]);
+		}
+	}
+	return out;
 }
 
 // Airport types buildable right now (depends on date and NewGRFs).
