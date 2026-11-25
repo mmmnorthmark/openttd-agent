@@ -25,7 +25,7 @@ function dumpRows({ y0, y1, x0 = 0, x1 = FAKE_MAP - 1 }) {
 }
 
 const GS = {
-  info: () => ({ tick: 1, date: 1, year: 1950, month: 1, day: 1, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: false, towns: 2, industries: 3, bridge_version: 3, event_seq: 2 }),
+  info: () => ({ tick: 1, date: 1, year: 1950, month: 1, day: 1, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: false, towns: 2, industries: 3, bridge_version: 4, event_seq: 2 }),
   cargos: () => [{ id: 0, label: 'PASS', name: 'Passengers', passengers: true }, { id: 7, label: 'WOOD', name: 'Wood', passengers: false }],
   industry_types: () => [{ id: 3, name: 'Forest', produces: [7], accepts: [] }, { id: 4, name: 'Sawmill', produces: [], accepts: [7] }],
   industries: () => [
@@ -70,6 +70,9 @@ const GS = {
     { seq: 1, date: '1950-1-3', type: 'industry_open', industry: 9, industry_type: 3, x: 5, y: 5 },
     { seq: 2, date: '1950-2-1', type: 'vehicle_crashed', company: 0, vehicle: 11, x: 14, y: 20, reason: 0, victims: 2 },
   ].filter((e) => e.seq > (a.since ?? 0)),
+  rail_types: () => [[0, 'Railway construction', 0, 60], [1, 'Electrified railway construction', 0, 75]],
+  bridge_types: (a) => [[0, 'Wooden rail bridge', 32, 100 * a.length, 0, 16], [2, 'Steel girder bridge', 112, 300 * a.length, 0, 400]],
+  airport_types: () => [{ type: 0, name: 'small', buildable_now: true, width: 4, height: 3, coverage_radius: 4, price: 5000, monthly_maintenance: 300 }],
   // exec: every step costs 10 and returns value 100+index; a step whose op is 'veh_sell'
   // on vehicle 404, or any step with op 'bogus', fails.
   exec: (a) => {

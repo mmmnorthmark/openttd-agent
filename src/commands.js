@@ -9,6 +9,7 @@ import { doctor, installGamescript, launch } from './setup.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES } from './operate.js';
+import { planPath, railSteps, roadSteps, terminusSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, DEFAULT_COSTS } from './world.js';
 
 const int = () => z.coerce.number().int();
@@ -26,6 +27,44 @@ async function mine(ctx, a) {
   const s = await ctx.session();
   return { s, company: s.companyOrThrow(a.company) };
 }
+
+const joinArg = (v) => {
+  if (v === 'new') return -1;
+  if (v === 'adjacent') return -2;
+  if (!/^\d+$/.test(String(v))) throw new Error(`join must be 'new', 'adjacent' or a station id (see stations), got '${v}'`);
+  return Number(v);
+};
+const join = { join: z.string().default('new').describe("'new' station, 'adjacent' = join a touching station, or a station id to join (may be a few tiles away)") };
+const front = { front_x: int().describe('tile the entrance faces (next to x,y)'), front_y: int() };
+const bridgeArg = { bridge: z.string().default('cheapest').describe("'cheapest', 'fastest' or a bridge type id (see bridge-types)") };
+const bridgeType = (v) => (v === 'cheapest' ? -1 : v === 'fastest' ? -2 : Number(v));
+const transport = (v) => ({ rail: 0, road: 1, water: 2 })[v];
+
+/** Plan a rail or road path on fresh tiles, then dry-run or build it. */
+async function buildPath(ctx, a, mode) {
+  const { s, company } = await mine(ctx, a);
+  const box = [Math.min(a.x1, a.x2) - a.margin, Math.min(a.y1, a.y2) - a.margin, Math.max(a.x1, a.x2) + a.margin, Math.max(a.y1, a.y2) + a.margin];
+  await s.refreshArea(...box);
+  const plan = planPath(s.map, { x: a.x1, y: a.y1 }, { x: a.x2, y: a.y2 },
+    { mode, margin: a.margin, startDir: dirIndex(a.start_dir), endDir: dirIndex(a.end_dir), maxBridge: a.max_bridge });
+  if (!plan.reachable) return plan;
+  const steps = (mode === 'rail' ? railSteps : roadSteps)(plan, { bridgeType: bridgeType(a.bridge) });
+  const out = { reachable: true, ...plan.stats, ...(a.show_path ? { path: plan.tiles } : {}) };
+  if (a.plan_only) return { ...out, steps_total: steps.length, steps };
+  if (!a.dry_run) s.throttleBuild();
+  const res = await s.exec(company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}) });
+  if (!a.dry_run) await s.refreshArea(...box);
+  return { ...out, ...res };
+}
+const pathArgs = {
+  ...act, x1: int(), y1: int(), x2: int(), y2: int(),
+  start_dir: z.enum(DIR_NAMES).optional().describe('force the first step out of x1,y1: sw=+x, se=+y, ne=-x, nw=-y'),
+  end_dir: z.enum(DIR_NAMES).optional().describe('force the direction of the last step into x2,y2'),
+  margin: int().min(2).max(80).default(20).describe('how far outside the two points the path may wander'),
+  max_bridge: int().min(3).max(40).default(12), ...bridgeArg,
+  plan_only: bool().default(false).describe('return the planned steps without contacting the game'),
+  show_path: bool().default(false).describe('include the tile list'),
+};
 
 /** Run exec steps as the company (client throttle + GS rate gate apply). */
 async function run(ctx, a, steps, opts = {}) {
@@ -487,6 +526,158 @@ export const COMMANDS = [
     description: 'Rename a vehicle.',
     args: z.object({ ...act, vehicle: int(), name: z.string().min(1) }),
     run: (ctx, a) => run(ctx, a, [['veh_rename', a.vehicle, a.name]]),
+  },
+
+  // ---- build: rail -------------------------------------------------------------------
+  {
+    name: 'rail-types', group: 'build', session: true,
+    description: 'Rail types your company can build: id, name, max speed (0 = unlimited), track cost per tile. Pass the id as rail_type.',
+    args: z.object({ ...who }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      return (await s.gs.call('rail_types', { company })).map(([id, name, max_speed, track_cost]) => ({ id, name, max_speed, track_cost }));
+    },
+  },
+  {
+    name: 'bridge-types', group: 'build', session: true,
+    description: 'Bridge types that can span `length` tiles (both ends included): id, name, max speed, price.',
+    args: z.object({ length: int().min(2), type: z.enum(['rail', 'road']).default('rail') }),
+    run: async (ctx, a) => (await (await ctx.session()).gs.call('bridge_types', { length: a.length, vehicle_type: transport(a.type) }))
+      .map(([id, name, max_speed, price, min_length, max_length]) => ({ id, name, max_speed, price, min_length, max_length })),
+  },
+  {
+    name: 'build-rail', group: 'build', session: true,
+    description: 'Plan and build a rail line between two anchor tiles. Anchors are where the line connects (a station end tile, the tile in front of a depot, existing track, or connect_at from build-terminus): track is laid on every tile strictly between them. The planner prefers flat and straight, avoids houses, industries and stations, crosses roads on the level and bridges water, rail and roads where it must. Use dry_run=true first for the cost; each step reports ok/error. On failure nothing after the failed step is built: fix (terraform, demolish, other anchors) and run again; already-built track is kept.',
+    args: z.object({ ...pathArgs, rail_type: int().optional().describe('see rail-types; default: first available') }),
+    run: (ctx, a) => buildPath(ctx, a, 'rail'),
+  },
+  {
+    name: 'build-rail-station', group: 'build', session: true,
+    description: 'Build a rail station with its lowest-x/y corner at x,y. axis=x: platforms run along x and are stacked along y (axis=y: the reverse). Trains enter at either end of a platform.',
+    args: z.object({ ...act, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(20).default(1), length: int().min(1).max(20).default(4), ...join, rail_type: int().optional() }),
+    run: (ctx, a) => run(ctx, a, [['rail_station', a.x, a.y, a.axis === 'y', a.platforms, a.length, joinArg(a.join)]], { railType: a.rail_type }),
+  },
+  {
+    name: 'build-rail-depot', group: 'build', session: true,
+    description: 'Build a rail depot at x,y with its entrance facing front (a tile next to it that has or will get track). Connect it with build-rail using the front tile as an anchor.',
+    args: z.object({ ...act, ...point, ...front, rail_type: int().optional() }),
+    run: (ctx, a) => run(ctx, a, [['rail_depot', a.x, a.y, a.front_x, a.front_y]], { railType: a.rail_type }),
+  },
+  {
+    name: 'build-signal', group: 'build', session: true,
+    description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it. The track must exist (a dry run before the track is built fails).',
+    args: z.object({ ...act, ...point, ...front, type: z.enum(Object.keys(SIGNAL_TYPES)).default('path'), two_way: bool().default(false), remove: bool().default(false) }),
+    run: (ctx, a) => run(ctx, a, [a.remove ? ['signal_remove', a.x, a.y, a.front_x, a.front_y]
+      : ['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]),
+  },
+  {
+    name: 'build-terminus', group: 'build', session: true,
+    description: 'Template: terminus station (platforms x length, lowest corner at x,y, platforms along axis) with points joining all platforms to one track and a path signal at every platform exit. exit=high puts the points at the high-coordinate end. Needs flat land: the station plus platforms+2 tiles beyond the exit end. Returns connect_at {x,y,dir}: continue with build-rail --x1 <x> --y1 <y> --start_dir <dir>. In a dry run the signal steps fail because the track is not there yet; ignore those.',
+    args: z.object({ ...act, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(8).default(2), length: int().min(1).max(20).default(5),
+      exit: z.enum(['high', 'low']).default('high'), ...join, rail_type: int().optional() }),
+    run: async (ctx, a) => {
+      const t = terminusSteps({ x: a.x, y: a.y, axis: a.axis, platforms: a.platforms, length: a.length, exitHigh: a.exit === 'high', join: joinArg(a.join) });
+      return { ...(await run(ctx, a, t.steps, { railType: a.rail_type })), connect_at: t.connect_at };
+    },
+  },
+  {
+    name: 'build-passing-loop', group: 'build', session: true,
+    description: 'Template: passing loop for a single-track line. The main track runs length+2 tiles from x,y in direction dir; a second track is laid beside it (side=1 or -1 picks which side) with one-way path signals so trains in each direction take their own track. Existing main track is kept. Needs flat land. Returns the two end tiles to connect to.',
+    args: z.object({ ...act, ...point, dir: z.enum(DIR_NAMES).default('sw').describe('sw=+x, se=+y, ne=-x, nw=-y'), length: int().min(2).max(30).default(6),
+      side: int().default(1), rail_type: int().optional() }),
+    run: async (ctx, a) => {
+      const t = passingLoopSteps({ x: a.x, y: a.y, dir: dirIndex(a.dir), length: a.length, side: a.side < 0 ? -1 : 1 });
+      return { ...(await run(ctx, a, t.steps, { railType: a.rail_type })), ends: t.ends };
+    },
+  },
+
+  // ---- build: road ---------------------------------------------------------------------
+  {
+    name: 'build-road-path', group: 'build', session: true,
+    description: 'Plan and build a road between two tiles (both included), reusing existing roads where that is cheaper, going round houses and industries, bridging water and rail where it must. dry_run=true for the cost first.',
+    args: z.object({ ...pathArgs }),
+    run: (ctx, a) => buildPath(ctx, a, 'road'),
+  },
+  {
+    name: 'build-road-station', group: 'build', session: true,
+    description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis).',
+    args: z.object({ ...act, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join }),
+    run: (ctx, a) => run(ctx, a, [['road_station', a.x, a.y, a.front_x, a.front_y, a.kind === 'truck', a.drive_through, joinArg(a.join)]]),
+  },
+  {
+    name: 'build-road-depot', group: 'build', session: true,
+    description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile).',
+    args: z.object({ ...act, ...point, ...front }),
+    run: (ctx, a) => run(ctx, a, [['road_depot', a.x, a.y, a.front_x, a.front_y]]),
+  },
+
+  // ---- build: bridges, tunnels, land ------------------------------------------------------
+  {
+    name: 'build-bridge', group: 'build', session: true,
+    description: 'Build a rail, road or water (aqueduct) bridge between two tiles in a straight line (the ramps go on those tiles).',
+    args: z.object({ ...act, type: z.enum(['rail', 'road', 'water']).default('rail'), x1: int(), y1: int(), x2: int(), y2: int(), ...bridgeArg, rail_type: int().optional() }),
+    run: (ctx, a) => run(ctx, a, [['bridge', transport(a.type), a.x1, a.y1, a.x2, a.y2, bridgeType(a.bridge)]], { railType: a.rail_type }),
+  },
+  {
+    name: 'build-tunnel', group: 'build', session: true,
+    description: 'Build a rail or road tunnel starting at x,y, a tile at the foot of a slope; the game finds the other end straight through the hill.',
+    args: z.object({ ...act, type: z.enum(['rail', 'road']).default('rail'), ...point, rail_type: int().optional() }),
+    run: (ctx, a) => run(ctx, a, [['tunnel', transport(a.type), a.x, a.y]], { railType: a.rail_type }),
+  },
+  {
+    name: 'terraform', group: 'build', session: true,
+    description: 'Change land. op=level: flatten the rectangle x0,y0..x1,y1 to the height of the north corner of tile x0,y0. op=raise / lower: move the given corners of every tile in the rectangle one level (corners: 1 west, 2 south, 4 east, 8 north; 15 = whole tile). dry_run=true first: terraforming is expensive.',
+    args: z.object({ ...act, op: z.enum(['level', 'raise', 'lower']).default('level'), x0: int(), y0: int(), x1: int().optional(), y1: int().optional(), corners: int().min(1).max(15).default(15) }),
+    run: (ctx, a) => {
+      const x1 = a.x1 ?? a.x0, y1 = a.y1 ?? a.y0;
+      if (a.op === 'level') return run(ctx, a, [['level', a.x0, a.y0, x1 + 1, y1 + 1]]);
+      if ((Math.abs(x1 - a.x0) + 1) * (Math.abs(y1 - a.y0) + 1) > 100) throw new Error('area too large for raise/lower; max 100 tiles per call');
+      const steps = [];
+      for (let y = Math.min(a.y0, y1); y <= Math.max(a.y0, y1); y++) for (let x = Math.min(a.x0, x1); x <= Math.max(a.x0, x1); x++) steps.push([a.op, x, y, a.corners]);
+      return run(ctx, a, steps);
+    },
+  },
+  {
+    name: 'demolish', group: 'build', session: true,
+    description: "Clear the rectangle x0,y0..x1,y1 (trees, rough land, your own track/road/buildings). Refuses the whole rectangle, clearing nothing, if any tile belongs to another company, an industry, a town road, or is a town building; allow_houses=true permits town buildings (the town's opinion of you drops).",
+    args: z.object({ ...act, x0: int(), y0: int(), x1: int().optional(), y1: int().optional(), allow_houses: bool().default(false) }),
+    run: async (ctx, a) => {
+      const xs = [a.x0, a.x1 ?? a.x0].sort((p, q) => p - q), ys = [a.y0, a.y1 ?? a.y0].sort((p, q) => p - q);
+      if ((xs[1] - xs[0] + 1) * (ys[1] - ys[0] + 1) > 400) throw new Error('area too large; max 400 tiles per call');
+      const res = await run(ctx, a, [['demolish', xs[0], ys[0], xs[1], ys[1], a.allow_houses]]);
+      return { ...res, tiles_cleared: res.results[0]?.value ?? 0 };
+    },
+  },
+
+  // ---- build: water and air -----------------------------------------------------------------
+  {
+    name: 'build-dock', group: 'build', session: true,
+    description: 'Build a ship dock on the sloped coast tile x,y (the land half; the water half extends into the sea).',
+    args: z.object({ ...act, ...point, ...join }),
+    run: (ctx, a) => run(ctx, a, [['dock', a.x, a.y, joinArg(a.join)]]),
+  },
+  {
+    name: 'build-buoy', group: 'build', session: true,
+    description: 'Place a buoy on the water tile x,y (a waypoint for ship orders; ships get lost on long legs without them).',
+    args: z.object({ ...act, ...point }),
+    run: (ctx, a) => run(ctx, a, [['buoy', a.x, a.y]]),
+  },
+  {
+    name: 'build-water-depot', group: 'build', session: true,
+    description: 'Build a ship depot on water at x,y; it covers two tiles along the axis towards front.',
+    args: z.object({ ...act, ...point, ...front }),
+    run: (ctx, a) => run(ctx, a, [['water_depot', a.x, a.y, a.front_x, a.front_y]]),
+  },
+  {
+    name: 'build-airport', group: 'build', session: true,
+    description: 'Build an airport with its lowest-x/y corner at x,y. airport = type name (see airport-types); find a spot with airport-sites.',
+    args: z.object({ ...act, ...point, airport: z.string().default('small'), ...join }),
+    run: async (ctx, a) => {
+      const types = await (await ctx.session()).gs.call('airport_types');
+      const at = types.find((t) => t.name === lc(a.airport));
+      if (!at) throw new Error(`unknown airport '${a.airport}'. Available: ${types.map((t) => t.name).join(', ')}`);
+      return run(ctx, a, [['airport', a.x, a.y, at.type, joinArg(a.join)]]);
+    },
   },
 ];
 
