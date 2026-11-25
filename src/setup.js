@@ -83,17 +83,21 @@ export function doctor() {
   return report;
 }
 
+function removeIfSymlink(p) {
+  try { if (fs.lstatSync(p).isSymbolicLink()) fs.unlinkSync(p); } catch { /* does not exist */ }
+}
+
 /** Copy the bundled GameScript into <personal>/game/AgentBridge (host only). */
 export function installGamescript({ personalDir = findPersonalDir() } = {}) {
   const src = path.join(PACKAGE_ROOT, 'gamescript', GS_NAME);
   const dst = path.join(personalDir, 'game', GS_NAME);
   const before = readGsVersion(dst);
   fs.mkdirSync(path.dirname(dst), { recursive: true });
-  if (fs.existsSync(dst) && fs.lstatSync(dst).isSymbolicLink()) fs.unlinkSync(dst); // dev symlink: replace link only
+  removeIfSymlink(dst); // dev symlink (possibly dangling): replace the link only
   fs.cpSync(src, dst, { recursive: true, force: true });
   const ai = path.join(personalDir, 'ai', 'IdleAI');
   fs.mkdirSync(path.dirname(ai), { recursive: true });
-  if (fs.existsSync(ai) && fs.lstatSync(ai).isSymbolicLink()) fs.unlinkSync(ai);
+  removeIfSymlink(ai);
   fs.cpSync(path.join(PACKAGE_ROOT, 'ai', 'IdleAI'), ai, { recursive: true, force: true });
   const result = { installed_to: dst, version_before: before, version_now: readGsVersion(dst), also_installed: ai };
   log.info('setup', 'gamescript installed', result);
