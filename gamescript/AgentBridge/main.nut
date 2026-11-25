@@ -49,12 +49,14 @@ class AgentBridge extends GSController {
 			autorenew = this.CmdAutorenew,
 			events = this.CmdEvents,
 			exec = this.CmdExec,
+			rail_types = this.CmdRailTypes,
+			bridge_types = this.CmdBridgeTypes,
 		};
 	}
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v3 started");
+	GSLog.Info("AgentBridge v4 started");
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
 		while (GSEventController.IsEventWaiting()) {
@@ -205,7 +207,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 3,
+		bridge_version = 4,
 		event_seq = this.event_seq,
 	};
 }
@@ -671,6 +673,13 @@ function AgentBridge::CmdExec(args) {
 	local keep = ("keep_going" in args) ? args.keep_going : dry;
 	local mode = GSCompanyMode(company);
 	local test = dry ? GSTestMode() : null;
+	if ("rail_type" in args) {
+		GSRail.SetCurrentRailType(args.rail_type);
+	} else {
+		local rail_types = GSRailTypeList();
+		if (rail_types.Count() > 0) GSRail.SetCurrentRailType(rail_types.Begin());
+	}
+	GSRoad.SetCurrentRoadType(("road_type" in args) ? args.road_type : GSRoad.ROADTYPE_ROAD);
 	local rows = [];
 	local total = 0;
 	local failed = 0;
@@ -776,6 +785,123 @@ function AgentBridge::ExecStep(company, s, dry) {
 		case "veh_rename": return [GSVehicle.SetName(s[1], s[2]), 0];
 		// [op, source_vehicle, source_wagon, dest_vehicle, dest_wagon]
 		case "veh_move_wagon": return [GSVehicle.MoveWagonChain(s[1], s[2], s[3], s[4]), 0];
+		// -- rail: [op, from_x, from_y, tile_x, tile_y, to_x, to_y] builds on tile..(to - 1), connecting towards from and to
+		case "rail": return [this.OrBuilt(GSRail.BuildRail(this.T(s[1], s[2]), this.T(s[3], s[4]), this.T(s[5], s[6]))), 0];
+		case "rail_remove": return [GSRail.RemoveRail(this.T(s[1], s[2]), this.T(s[3], s[4]), this.T(s[5], s[6])), 0];
+		// [op, x, y, front_x, front_y, signal_type]: the signal faces trains coming from front (GSRail.SIGNALTYPE_*)
+		case "signal": return [GSRail.BuildSignal(this.T(s[1], s[2]), this.T(s[3], s[4]), s[5]), 0];
+		case "signal_remove": return [GSRail.RemoveSignal(this.T(s[1], s[2]), this.T(s[3], s[4])), 0];
+		// [op, x, y, along_y (false = platforms along x), platforms, length, station (-1 new, -2 join adjacent, else id)]
+		case "rail_station":
+			return [GSRail.BuildRailStation(this.T(s[1], s[2]), s[3] ? GSRail.RAILTRACK_NW_SE : GSRail.RAILTRACK_NE_SW, s[4], s[5], this.StationArg(s[6])), 0];
+		// [op, x, y, front_x, front_y]
+		case "rail_depot": return [GSRail.BuildRailDepot(this.T(s[1], s[2]), this.T(s[3], s[4])), 0];
+		// -- road: [op, x1, y1, x2, y2] straight
+		case "road": return [this.OrBuilt(GSRoad.BuildRoad(this.T(s[1], s[2]), this.T(s[3], s[4]))), 0];
+		case "road_remove": return [GSRoad.RemoveRoad(this.T(s[1], s[2]), this.T(s[3], s[4])), 0];
+		// [op, x, y, front_x, front_y, truck, drive_through, station]
+		case "road_station": {
+			local kind = s[5] ? GSRoad.ROADVEHTYPE_TRUCK : GSRoad.ROADVEHTYPE_BUS;
+			if (s[6]) return [GSRoad.BuildDriveThroughRoadStation(this.T(s[1], s[2]), this.T(s[3], s[4]), kind, this.StationArg(s[7])), 0];
+			return [GSRoad.BuildRoadStation(this.T(s[1], s[2]), this.T(s[3], s[4]), kind, this.StationArg(s[7])), 0];
+		}
+		case "road_depot": return [GSRoad.BuildRoadDepot(this.T(s[1], s[2]), this.T(s[3], s[4])), 0];
+		// -- bridges and tunnels: [op, vehicle_type, x1, y1, x2, y2, bridge_type (-1 cheapest, -2 fastest)] / [op, vehicle_type, x, y]
+		case "bridge": {
+			local a = this.T(s[2], s[3]);
+			local b = this.T(s[4], s[5]);
+			local kind = s[6] >= 0 ? s[6] : this.PickBridge(GSMap.DistanceManhattan(a, b) + 1, s[6] == -2);
+			if (kind < 0) return [false, 0, "no bridge type can span " + (GSMap.DistanceManhattan(a, b) + 1) + " tiles; run: openttd-agent bridge-types"];
+			return [GSBridge.BuildBridge(s[1], kind, a, b), kind];
+		}
+		case "tunnel": return [GSTunnel.BuildTunnel(s[1], this.T(s[2], s[3])), 0];
+		// -- water and air: [op, x, y, station] / [op, x, y] / [op, x, y, front_x, front_y] / [op, x, y, airport_type, station]
+		case "dock": return [GSMarine.BuildDock(this.T(s[1], s[2]), this.StationArg(s[3])), 0];
+		case "buoy": return [GSMarine.BuildBuoy(this.T(s[1], s[2])), 0];
+		case "water_depot": return [GSMarine.BuildWaterDepot(this.T(s[1], s[2]), this.T(s[3], s[4])), 0];
+		case "airport": return [GSAirport.BuildAirport(this.T(s[1], s[2]), s[3], this.StationArg(s[4])), 0];
+		// -- land: [op, x0, y0, x1, y1, allow_houses]; refuses the whole rectangle if any tile is protected
+		case "demolish": {
+			for (local y = s[2]; y <= s[4]; y++) {
+				for (local x = s[1]; x <= s[3]; x++) {
+					local why = this.DemolishRefusal(company, this.T(x, y), s[5]);
+					if (why != null) return [false, 0, "refused: tile " + x + "," + y + " " + why + "; nothing was demolished"];
+				}
+			}
+			local done = 0;
+			for (local y = s[2]; y <= s[4]; y++) {
+				for (local x = s[1]; x <= s[3]; x++) {
+					if (!GSTile.DemolishTile(this.T(x, y))) return [false, done, "tile " + x + "," + y + ": " + this.Str(GSError.GetLastErrorString()) + " (" + done + " tiles cleared before it)"];
+					done++;
+				}
+			}
+			return [true, done];
+		}
+		// [op, x0, y0, x1, y1]: corner points; everything is levelled to the height of the north corner of x0,y0
+		case "level": return [GSTile.LevelTiles(this.T(s[1], s[2]), this.T(s[3], s[4])), 0];
+		// [op, x, y, corners]: bitmask 1 west, 2 south, 4 east, 8 north (15 = whole tile)
+		case "raise": return [GSTile.RaiseTile(this.T(s[1], s[2]), s[3]), 0];
+		case "lower": return [GSTile.LowerTile(this.T(s[1], s[2]), s[3]), 0];
 	}
 	return [false, 0, "unknown exec op: " + s[0]];
+}
+
+// ---- Construct helpers ----------------------------------------------------------
+
+function AgentBridge::T(x, y) { return GSMap.GetTileIndex(x, y); }
+
+// Building something that is already there counts as success (paths may reuse track/road).
+function AgentBridge::OrBuilt(ok) { return ok || GSError.GetLastError() == GSError.ERR_ALREADY_BUILT; }
+
+function AgentBridge::StationArg(v) {
+	if (v == -1) return GSBaseStation.STATION_NEW;
+	if (v == -2) return GSBaseStation.STATION_JOIN_ADJACENT;
+	return v;
+}
+
+// Cheapest (or fastest) bridge type for a length in tiles including both ends; -1 if none.
+function AgentBridge::PickBridge(length, fastest) {
+	local best = -1;
+	local best_score = 0;
+	foreach (b, _ in GSBridgeList_Length(length)) {
+		local score = fastest ? -GSBridge.GetMaxSpeed(b) : GSBridge.GetPrice(b, length);
+		if (best < 0 || score < best_score) {
+			best = b;
+			best_score = score;
+		}
+	}
+	return best;
+}
+
+// Why the company may not demolish this tile, or null if it may. The game itself still applies
+// its own rules (town rating, money) on top.
+function AgentBridge::DemolishRefusal(company, tile, allow_houses) {
+	if (!GSMap.IsValidTile(tile)) return "is outside the map";
+	if (GSIndustry.IsValidIndustry(GSIndustry.GetIndustryID(tile))) return "is part of an industry";
+	if (GSTile.IsHouseTile(tile)) return allow_houses ? null : "is a town building (allow_houses=true permits it; the town's opinion of you drops)";
+	local owner = GSTile.GetOwner(tile);
+	if (owner != GSCompany.COMPANY_INVALID && owner != company) return "belongs to company " + owner;
+	if (owner == GSCompany.COMPANY_INVALID && (GSRoad.IsRoadTile(tile) || GSTile.IsStationTile(tile) || GSBridge.IsBridgeTile(tile) || GSTunnel.IsTunnelTile(tile))) return "is town or public infrastructure";
+	return null;
+}
+
+// args: company. Rail types the company can build. Rows: [id, name, max_speed (0 = no limit), track_cost_per_tile]
+function AgentBridge::CmdRailTypes(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local out = [];
+	foreach (rt, _ in GSRailTypeList()) {
+		out.append([rt, this.Str(GSRail.GetName(rt)), GSRail.GetMaxSpeed(rt), GSRail.GetBuildCost(rt, GSRail.BT_TRACK)]);
+	}
+	return out;
+}
+
+// args: length (tiles including both ends), vehicle_type (0 rail, 1 road).
+// Rows: [id, name, max_speed, price, min_length, max_length]
+function AgentBridge::CmdBridgeTypes(args) {
+	local out = [];
+	foreach (b, _ in GSBridgeList_Length(args.length)) {
+		out.append([b, this.Str(GSBridge.GetName(b, args.vehicle_type)), GSBridge.GetMaxSpeed(b), GSBridge.GetPrice(b, args.length),
+			GSBridge.GetMinLength(b), GSBridge.GetMaxLength(b)]);
+	}
+	return out;
 }
