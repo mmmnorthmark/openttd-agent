@@ -151,7 +151,7 @@ export function routeEffort(map, a, b, { costs = DEFAULT_COSTS, margin = 24, ign
   };
 }
 
-class MinHeap {
+export class MinHeap {
   constructor() { this.items = []; this.prios = []; }
   get size() { return this.items.length; }
   push(item, prio) {
