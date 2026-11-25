@@ -353,3 +353,49 @@ export function terminusCandidates(map, { targets, radius = 8, catchment = 3, pl
   out.sort((a, b) => a.score - b.score);
   return out.slice(0, max);
 }
+
+/**
+ * Depot spots beside a straight piece of existing rail near `near` [x,y], best first, using only
+ * the map mirror. A line tile R is straight when both neighbours along one axis are rail and
+ * neither neighbour across it is rail or station. The depot goes on a buildable flat tile across
+ * from R at R's height, facing R. Tiles within 2 of a station tile are skipped (points live there).
+ * Returns [{ depot:[x,y], front:[x,y], ends:[[x,y],[x,y]], dist }]; steps: depotSteps().
+ */
+export function depotCandidates(map, near, { radius = 12, max = 20 } = {}) {
+  const out = [];
+  const inMap = (x, y) => x >= 1 && y >= 1 && x < map.sizeX - 1 && y < map.sizeY - 1;
+  const isRail = (x, y) => inMap(x, y) && map.classAt(x, y) === 'r';
+  const isTrack = (x, y) => inMap(x, y) && (map.classAt(x, y) === 'r' || map.classAt(x, y) === 's');
+  const nearStation = (x, y) => {
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) if (inMap(x + dx, y + dy) && map.classAt(x + dx, y + dy) === 's') return true;
+    return false;
+  };
+  const [nx, ny] = near;
+  for (let y = Math.max(1, ny - radius); y <= Math.min(map.sizeY - 2, ny + radius); y++) {
+    for (let x = Math.max(1, nx - radius); x <= Math.min(map.sizeX - 2, nx + radius); x++) {
+      if (!isRail(x, y) || nearStation(x, y) || map.slopeAt(x, y) !== 0) continue;
+      for (const [ax, ay] of [[1, 0], [0, 1]]) {
+        const [cx, cy] = [ay, ax]; // across the line
+        if (!isTrack(x - ax, y - ay) || !isTrack(x + ax, y + ay)) continue;
+        if (isTrack(x - cx, y - cy) || isTrack(x + cx, y + cy)) continue;
+        for (const side of [-1, 1]) {
+          const dx = x + side * cx; const dy = y + side * cy;
+          if (!inMap(dx, dy) || !SITE_OK_CLASSES.has(map.classAt(dx, dy)) || map.slopeAt(dx, dy) !== 0 || map.heightAt(dx, dy) !== map.heightAt(x, y)) continue;
+          const dist = Math.abs(x - nx) + Math.abs(y - ny) + (map.classAt(dx, dy) === 't' ? 0.5 : 0);
+          out.push({ depot: [dx, dy], front: [x, y], ends: [[x - ax, y - ay], [x + ax, y + ay]], dist });
+        }
+      }
+    }
+  }
+  out.sort((a, b) => a.dist - b.dist);
+  return out.slice(0, max);
+}
+
+/** Steps for one depotCandidates() entry: the depot, then two track pieces joining it both ways along the line. */
+export function depotSteps({ depot, front, ends }) {
+  return [
+    ['rail_depot', depot[0], depot[1], front[0], front[1]],
+    ['rail', depot[0], depot[1], front[0], front[1], ends[0][0], ends[0][1]],
+    ['rail', depot[0], depot[1], front[0], front[1], ends[1][0], ends[1][1]],
+  ];
+}

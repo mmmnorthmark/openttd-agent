@@ -14,7 +14,7 @@ import { prepareScenario } from './scenario.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow } from './operate.js';
-import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
+import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, depotCandidates, depotSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, DEFAULT_COSTS } from './world.js';
 
 const int = () => z.coerce.number().int();
@@ -747,6 +747,40 @@ export const COMMANDS = [
     description: 'Build a rail depot at x,y with its entrance facing front (a tile next to it that has or will get track). Connect it with build-rail using the front tile as an anchor.',
     args: z.object({ ...act, ...point, ...front, rail_type: int().optional() }),
     run: (ctx, a) => run(ctx, a, [['rail_depot', a.x, a.y, a.front_x, a.front_y]], { railType: a.rail_type }),
+  },
+  {
+    name: 'build-line-depot', group: 'build', session: true,
+    description: 'Find a spot beside a straight piece of your existing rail line near a station (or a tile), build a rail depot there and join it to the line both ways, in one call. Use this instead of choosing a depot spot by hand. dry_run=true checks the depot only. Returns depot {x,y} for vehicle-buy --depot_x --depot_y. Example: --station 4',
+    args: z.object({ ...act, station: int().optional().describe('one of your stations (see stations): search near it'), x: int().optional(), y: int().optional(),
+      radius: int().min(3).max(30).default(12), rail_type: int().optional() }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      let near;
+      if (a.station !== undefined) {
+        const st = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).find((t) => t.id === a.station);
+        if (!st) throw new Error(`station ${a.station} is not one of company ${company}'s stations. Run: openttd-agent stations`);
+        near = [st.x, st.y];
+      } else if (a.x !== undefined && a.y !== undefined) near = [a.x, a.y];
+      else throw new Error('give --station, or --x and --y');
+      await s.ensureTiles();
+      await s.refreshArea(Math.max(0, near[0] - a.radius - 1), Math.max(0, near[1] - a.radius - 1), near[0] + a.radius + 1, near[1] + a.radius + 1);
+      const cands = depotCandidates(s.map, near, { radius: a.radius });
+      const tried = [];
+      for (const c of cands.slice(0, 8)) {
+        const steps = depotSteps(c);
+        const check = await s.exec(company, [steps[0]], { dryRun: true, railType: a.rail_type });
+        if (!(check.results ?? []).every((r) => r.ok)) { tried.push({ depot: c.depot, error: check.results?.[0]?.error }); continue; }
+        const depot = { x: c.depot[0], y: c.depot[1] };
+        if (a.dry_run) return { ok: true, dry_run: true, depot, front: { x: c.front[0], y: c.front[1] }, cost: check.cost, tried };
+        s.throttleBuild();
+        const res = await s.exec(company, steps, { railType: a.rail_type });
+        await s.refreshArea(c.depot[0] - 1, c.depot[1] - 1, c.depot[0] + 1, c.depot[1] + 1);
+        const ok = (res.results ?? []).every((r) => r.ok);
+        return { ok, depot, front: { x: c.front[0], y: c.front[1] }, cost: res.cost, results: res.results, tried,
+          ...(ok ? { next: `vehicle-buy --depot_x ${depot.x} --depot_y ${depot.y} --engine <id>` } : { hint: 'a join failed: run build-track on the front tile toward each end, or try another --station' }) };
+      }
+      return { ok: false, candidates_on_map: cands.length, tried, hint: cands.length ? 'every spot failed its dry run; try --radius 20' : 'no straight piece of rail with free flat land beside it near there; try --radius 20 or another station' };
+    },
   },
   {
     name: 'build-track', group: 'build', session: true,

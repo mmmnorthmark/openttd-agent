@@ -132,3 +132,34 @@ test('terminusCandidates: sites stay on flat buildable land within reach, facing
   const best = c[0];
   assert.ok(best.connect_at.y > 12 || best.connect_at.x < 10, 'points face toward (0,30)');
 });
+
+test('depotCandidates: depot beside a straight line piece, away from the station', async () => {
+  const { depotCandidates, depotSteps } = await import('../src/planner.js');
+  const { TileMap } = await import('../src/world.js');
+  const m = new TileMap(32, 32);
+  // flat clear at height 1; rail along y=10 from x=5..20, station tiles x=3..4 on y=10, a curve going up at x=20
+  const rows = [];
+  for (let y = 0; y < 32; y++) {
+    let r = `${y},0,`;
+    for (let x = 0; x < 32; x++) {
+      const c = y === 10 && x >= 3 && x <= 4 ? 's' : (y === 10 && x >= 5 && x <= 20) || (x === 20 && y < 10 && y >= 5) ? 'r' : 'b';
+      r += '01' + '0' + c;
+    }
+    rows.push(r);
+  }
+  rows.forEach((r) => m.applyRow(r));
+  const c = depotCandidates(m, [4, 10]);
+  assert.ok(c.length > 0);
+  for (const d of c) {
+    assert.equal(m.classAt(...d.depot), 'b');
+    assert.ok(d.front[0] >= 7, 'not within 2 tiles of the station');
+    assert.ok(d.front[0] <= 19, 'not at the curve');
+    assert.equal(d.front[1], 10);
+    assert.equal(Math.abs(d.depot[1] - 10), 1, 'depot is across the line');
+  }
+  assert.deepEqual(c[0].front, [7, 10], 'closest straight piece first');
+  const steps = depotSteps(c[0]);
+  assert.equal(steps.length, 3);
+  assert.deepEqual(steps[1].slice(5), [6, 10]);
+  assert.deepEqual(steps[2].slice(5), [8, 10]);
+});
