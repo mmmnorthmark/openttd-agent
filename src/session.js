@@ -155,3 +155,21 @@ export class Session {
     this._buildTimes.push(now);
   }
 }
+
+/**
+ * A per-player face of one shared Session (used by the relay): its own cfg
+ * (company, max_builds_per_minute) and build throttle; the admin connection,
+ * map mirror and caches stay on `base`. Methods that write session state are
+ * pinned to `base` so two players never load the mirror twice.
+ * `throttle` is { times: [] }, kept by the caller so it outlives the view.
+ */
+export function playerView(base, cfg, throttle) {
+  const view = Object.create(base);
+  view.cfg = cfg;
+  Object.defineProperty(view, '_buildTimes', { get: () => throttle.times, set: (v) => { throttle.times = v; } });
+  view.ensureTiles = () => base.ensureTiles();
+  view.refreshArea = (...a) => base.refreshArea(...a);
+  view.economy = (o) => base.economy(o);
+  view.exec = (...a) => base.exec(...a);
+  return view;
+}
