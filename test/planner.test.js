@@ -107,3 +107,28 @@ test('passing loop: main track, loop track with four curve pieces, two one-way p
   assert.deepEqual(t.ends, [{ x: 20, y: 20 }, { x: 25, y: 20 }]);
   assert.throws(() => passingLoopSteps({ x: 1, y: 1, length: 1 }), /at least 2/);
 });
+
+test('terminusCandidates: sites stay on flat buildable land within reach, facing `toward`', async () => {
+  const { terminusCandidates, terminusFootprint } = await import('../src/planner.js');
+  const { TileMap } = await import('../src/world.js');
+  const m = new TileMap(32, 32);
+  // all clear flat at height 1, an industry block at 10..12,10..12, houses column at x=16
+  const rows = [];
+  for (let y = 0; y < 32; y++) {
+    let r = `${y},0,`;
+    for (let x = 0; x < 32; x++) r += '01' + '0' + (x >= 10 && x <= 12 && y >= 10 && y <= 12 ? 'i' : x === 16 ? 'o' : 'b');
+    rows.push(r);
+  }
+  rows.forEach((r) => m.applyRow(r));
+  const targets = [[10, 10], [12, 12]];
+  const c = terminusCandidates(m, { targets, toward: [0, 30], platforms: 2, length: 4 });
+  assert.ok(c.length > 0);
+  for (const s of c) {
+    const { tiles, station } = terminusFootprint({ ...s, exitHigh: s.exit === 'high' });
+    assert.ok(tiles.every(([x, y]) => m.classAt(x, y) === 'b'), 'footprint avoids industry and houses');
+    const gap = Math.max(Math.max(station.x0 - 12, 0, 10 - station.x1), Math.max(station.y0 - 12, 0, 10 - station.y1));
+    assert.ok(gap <= 3, 'within catchment');
+  }
+  const best = c[0];
+  assert.ok(best.connect_at.y > 12 || best.connect_at.x < 10, 'points face toward (0,30)');
+});

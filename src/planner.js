@@ -295,3 +295,61 @@ export function passingLoopSteps({ x, y, dir = 0, length = 6, side = 1 }) {
     ends: [{ x: P(0, 0)[0], y: P(0, 0)[1] }, { x: P(length + 1, 0)[0], y: P(length + 1, 0)[1] }],
   };
 }
+
+// ---- terminus site search -------------------------------------------------------------------
+
+const SITE_OK_CLASSES = new Set(['b', 't', 'f', 'h']); // clear, trees, farm, rough: buildable without demolishing
+
+/**
+ * Footprint of terminusSteps(): the station rectangle plus `platforms + 2` tiles of points beyond
+ * the exit end, `platforms` wide. Returns { tiles: [[x,y]...], station: {x0,y0,x1,y1} }.
+ */
+export function terminusFootprint({ x, y, axis = 'x', platforms = 2, length = 4, exitHigh = true }) {
+  const alongY = axis === 'y';
+  const w = alongY ? platforms : length;
+  const h = alongY ? length : platforms;
+  const station = { x0: x, y0: y, x1: x + w - 1, y1: y + h - 1 };
+  const tiles = [];
+  for (let ty = station.y0; ty <= station.y1; ty++) for (let tx = station.x0; tx <= station.x1; tx++) tiles.push([tx, ty]);
+  const throat = platforms + 2;
+  for (let a = 1; a <= throat; a++) {
+    for (let l = 0; l < platforms; l++) {
+      if (alongY) tiles.push([x + l, exitHigh ? station.y1 + a : station.y0 - a]);
+      else tiles.push([exitHigh ? station.x1 + a : station.x0 - a, y + l]);
+    }
+  }
+  return { tiles, station };
+}
+
+/**
+ * Candidate terminus placements near target tiles, best first, using only the map mirror:
+ * every footprint tile buildable (clear/trees/farm/rough), flat and at one height; the station
+ * within `catchment` tiles (Chebyshev) of some target tile. Ranked by distance from connect_at to
+ * `toward` (the other end of the planned line) when given, else by closeness to the target.
+ */
+export function terminusCandidates(map, { targets, radius = 8, catchment = 3, platforms = 2, length = 4, toward = null, max = 40 }) {
+  const out = [];
+  const xs = targets.map((t) => t[0]); const ys = targets.map((t) => t[1]);
+  const bx0 = Math.max(0, Math.min(...xs) - radius); const bx1 = Math.min(map.sizeX - 1, Math.max(...xs) + radius);
+  const by0 = Math.max(0, Math.min(...ys) - radius); const by1 = Math.min(map.sizeY - 1, Math.max(...ys) + radius);
+  for (let y = by0; y <= by1; y++) for (let x = bx0; x <= bx1; x++) {
+    for (const axis of ['x', 'y']) for (const exitHigh of [true, false]) {
+      const { tiles, station } = terminusFootprint({ x, y, axis, platforms, length, exitHigh });
+      if (!tiles.every(([tx, ty]) => tx >= 1 && ty >= 1 && tx < map.sizeX - 1 && ty < map.sizeY - 1)) continue;
+      const h0 = map.heightAt(tiles[0][0], tiles[0][1]);
+      if (!tiles.every(([tx, ty]) => SITE_OK_CLASSES.has(map.classAt(tx, ty)) && map.slopeAt(tx, ty) === 0 && map.heightAt(tx, ty) === h0)) continue;
+      let gap = Infinity;
+      for (const [tx, ty] of targets) {
+        const dx = Math.max(station.x0 - tx, 0, tx - station.x1); const dy = Math.max(station.y0 - ty, 0, ty - station.y1);
+        gap = Math.min(gap, Math.max(dx, dy));
+      }
+      if (gap > catchment) continue;
+      const { connect_at } = terminusSteps({ x, y, axis, platforms, length, exitHigh });
+      const score = toward ? Math.abs(connect_at.x - toward[0]) + Math.abs(connect_at.y - toward[1]) : gap;
+      const trees = tiles.filter(([tx, ty]) => map.classAt(tx, ty) === 't').length;
+      out.push({ x, y, axis, exit: exitHigh ? 'high' : 'low', platforms, length, connect_at, gap, trees, score: score + trees * 0.1 });
+    }
+  }
+  out.sort((a, b) => a.score - b.score);
+  return out.slice(0, max);
+}
