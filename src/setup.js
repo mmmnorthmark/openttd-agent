@@ -1,8 +1,11 @@
 // Host/player setup: locate OpenTTD, install the GameScript, write a launch
 // profile, start the game. Never edits the user's own openttd.cfg: launch
 // profiles live in ~/.openttd-agent/profiles/<name>/ and OpenTTD is started with
-// `-c <profile>/openttd.cfg` from inside that folder (OpenTTD reads
-// secrets.cfg/private.cfg from the working directory when -c is used).
+// `-c <profile>/openttd.cfg`. With -c, OpenTTD uses the cfg's folder as its
+// config and personal dir (secrets.cfg, saves, log), and still scans the normal
+// personal dir (~/Documents/OpenTTD etc.) for baseset, game scripts and AIs.
+// secrets.cfg is only read when openttd.cfg has [version] ini_version >= 1;
+// without it OpenTTD reads secrets from openttd.cfg itself (15.3 settings.cpp).
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,6 +17,8 @@ import { log } from './log.js';
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const GS_NAME = 'AgentBridge';
+// OpenTTD 15.x INIFILE_VERSION (IFV_REMOVE_GENERATION_SEED). Needed so secrets.cfg is honoured.
+export const INI_VERSION = 7;
 
 export function personalDirCandidates() {
   const home = os.homedir();
@@ -149,13 +154,16 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
       server_game_type: 'local', server_name: serverName, pause_on_join: 'false',
     };
     patches.game_scripts = { [GS_NAME]: `command_delay_ticks=${commandDelayTicks},max_builds_per_day=${maxBuildsPerDay}` };
-    patches.game_creation = { map_x: mapBits, map_y: mapBits, ...(seed !== undefined ? { generation_seed: seed } : {}) };
+    patches.game_creation = { map_x: mapBits, map_y: mapBits }; // seed goes on the command line (-G); ini v7 dropped generation_seed
     fs.writeFileSync(path.join(dir, 'secrets.cfg'), `[network]\nadmin_password = ${adminPassword}\n`, { mode: 0o600 });
   }
-  fs.writeFileSync(cfgPath, patchIni(fs.readFileSync(cfgPath, 'utf8'), patches));
+  let cfgText = fs.readFileSync(cfgPath, 'utf8');
+  if (!/^\s*\[version\]\s*$/m.test(cfgText)) cfgText = `[version]\nini_version = ${INI_VERSION}\n\n${cfgText}`;
+  cfgText = cfgText.replace(/^\s*generation_seed\s*=.*\n?/m, '');
+  fs.writeFileSync(cfgPath, patchIni(cfgText, patches));
 
   const args = ['-c', cfgPath];
-  if (mode === 'dedicated') args.push('-D', `${bind}:${gamePort}`, '-d', 'script=3');
+  if (mode === 'dedicated') args.push('-D', `${bind}:${gamePort}`, '-d', 'script=4');
   if (mode === 'join') {
     if (!joinHost) throw new Error('joinHost is required for mode=join (the host machine LAN IP)');
     args.push('-n', `${joinHost}:${gamePort}`);
