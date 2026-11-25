@@ -58,7 +58,12 @@ openttd-agent status
 | setup | `doctor`, `install-gamescript`, `configure`, `show-config`, `launch` |
 | game | `status`, `companies`, `chat`, `rate` |
 | world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
-| build (your company) | `test-build-road`, `build-road` (rail, stations and vehicles are next) |
+| operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
+| operate: change | `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot`, `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace` |
+| build (your company) | `test-build-road`, `build-road` |
+
+Every command that changes the game takes `--dry_run true` (cost and feasibility only) and
+`--company <id>` (default: your configured company).
 
 Examples:
 
@@ -72,6 +77,19 @@ openttd-agent town-gaps --min_population 1000
 
 # Where could I put a small airport near Bigton?
 openttd-agent airport-sites --town Bigton --airport small
+
+# Run a strategy as a group: loss-making trains, stations with poor ratings, what's new
+openttd-agent vehicles --type rail --max_profit_last_year 0
+openttd-agent stations --max_rating_pct 40 --min_waiting 100
+openttd-agent engines --type rail --cargo wood
+openttd-agent events --since 0
+
+# Buy a train at a depot, give it orders, start it
+openttd-agent vehicle-buy --depot_x 13 --depot_y 22 --engine 5            # -> vehicles: [11]
+openttd-agent vehicle-buy --depot_x 13 --depot_y 22 --engine 27 --cargo wood --attach_to 11 --count 5
+openttd-agent order-add --vehicle 11 --station 3 --flags full_load_any,non_stop
+openttd-agent order-add --vehicle 11 --station 4 --flags unload,non_stop
+openttd-agent vehicle-start --vehicles 11
 
 # Chain many calls in one process
 printf '%s\n' '{"name":"status"}' '{"name":"town-gaps"}' | openttd-agent batch

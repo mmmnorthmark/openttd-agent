@@ -9,3 +9,7 @@ Research and design history: ~/code-local/openttd-agent-research/FINDINGS.md.
 - Tests: `npm test` (fake admin server in test/fake-server.js mirrors GS commands; extend it with every new GS command).
 - Verified GS API names against OpenTTD 15.3 headers (src/script/api). Check new ones the same way before use.
 - Personal skills live in the private repo `openttd-agent-skills`, not here.
+- State changes are **exec steps**: add an op to `ExecStep` in main.nut, mirror it in the fake server's `exec`, and build the step list in the command (`run(ctx, a, steps)`). Never add a one-off GS build handler.
+- Row decoders for operate data live in `src/operate.js` (pure, unit-tested).
+- Not exposed to GameScripts in 15.3 (don't promise them): vehicle breakdown count, service interval, vehicle-lost/unprofitable/engine-available events, production-change events.
+- The GS has not been compiled by OpenTTD yet if `status` has never run against a real game: there is no Squirrel compiler on this machine, so a syntax slip in main.nut only shows in `openttd.log` (`-d script=3`).
