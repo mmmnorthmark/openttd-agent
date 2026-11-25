@@ -27,7 +27,7 @@ export class Session {
 
   async connect() {
     const { host, admin_port: port, admin_password: password } = this.cfg;
-    if (!password) throw new Error('admin_password is not set. Run: openttd-agent configure --admin_password <password> (same as on the host)');
+    if (!password) throw new Error('no relay and no admin_password configured. Player: openttd-agent configure --relay http://<host-LAN-IP>:47978 --token <token from the host>. Host: openttd-agent launch (generates and saves the admin password).');
     this.admin = new AdminClient({ host, port, password, name: `openttd-agent-${process.pid}` });
     await this.admin.connect();
     this.admin.subscribe(UPDATE.CHAT, FREQ.AUTOMATIC);
