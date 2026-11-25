@@ -57,6 +57,7 @@ class AgentBridge extends GSController {
 			rail_types = "CmdRailTypes",
 			bridge_types = "CmdBridgeTypes",
 			acceptance = "CmdAcceptance",
+			rail_tiles = "CmdRailTiles",
 			goal_set = "CmdGoalSet",
 			goal_status = "CmdGoalStatus",
 			goal_clear = "CmdGoalClear",
@@ -65,7 +66,7 @@ class AgentBridge extends GSController {
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v8 started");
+	GSLog.Info("AgentBridge v9 started");
 	this.RestoreGoals();
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
@@ -486,7 +487,8 @@ function AgentBridge::CmdStations(args) {
 }
 
 // args: company. Rows: [id, name, type, engine, engine_name, age_days, max_age_days, reliability_pct,
-//   profit_this_year, profit_last_year, value, state, x, y, group, order_count, unit_number, running_cost, shared_orders]
+//   profit_this_year, profit_last_year, value, state, x, y, group, order_count, unit_number, running_cost, shared_orders,
+//   current_order, dest_x, dest_y, dest_station, speed]   (the last five since v9; -1 when there is no order/destination)
 // type: 0 rail, 1 road, 2 water, 3 air. state: 0 running, 1 stopped, 2 in depot, 3 at station, 4 broken, 5 crashed.
 function AgentBridge::CmdVehicles(args) {
 	local mode = GSCompanyMode(this.CheckCompany(args));
@@ -494,11 +496,17 @@ function AgentBridge::CmdVehicles(args) {
 	foreach (v, _ in GSVehicleList()) {
 		local tile = GSVehicle.GetLocation(v);
 		local e = GSVehicle.GetEngineType(v);
+		local count = GSOrder.GetOrderCount(v);
+		local cur = count > 0 ? GSOrder.ResolveOrderPosition(v, GSOrder.ORDER_CURRENT) : -1;
+		local dest = cur >= 0 ? GSOrder.GetOrderDestination(v, cur) : -1;
+		local dest_ok = cur >= 0 && GSMap.IsValidTile(dest);
+		local dest_station = dest_ok && GSOrder.IsGotoStationOrder(v, cur) ? GSStation.GetStationID(dest) : -1;
 		out.append([v, this.Str(GSVehicle.GetName(v)), GSVehicle.GetVehicleType(v), e, this.Str(GSEngine.GetName(e)),
 			GSVehicle.GetAge(v), GSVehicle.GetMaxAge(v), GSVehicle.GetReliability(v),
 			GSVehicle.GetProfitThisYear(v), GSVehicle.GetProfitLastYear(v), GSVehicle.GetCurrentValue(v),
 			GSVehicle.GetState(v), GSMap.GetTileX(tile), GSMap.GetTileY(tile), GSVehicle.GetGroupID(v),
-			GSOrder.GetOrderCount(v), GSVehicle.GetUnitNumber(v), GSVehicle.GetRunningCost(v), GSVehicle.HasSharedOrders(v)]);
+			count, GSVehicle.GetUnitNumber(v), GSVehicle.GetRunningCost(v), GSVehicle.HasSharedOrders(v),
+			cur, dest_ok ? GSMap.GetTileX(dest) : -1, dest_ok ? GSMap.GetTileY(dest) : -1, dest_station, GSVehicle.GetCurrentSpeed(v)]);
 	}
 	return out;
 }
@@ -526,6 +534,7 @@ function AgentBridge::CmdVehicle(args) {
 		x = GSMap.GetTileX(tile), y = GSMap.GetTileY(tile), speed = GSVehicle.GetCurrentSpeed(v), group = GSVehicle.GetGroupID(v),
 		wagons = GSVehicle.GetNumWagons(v), length = GSVehicle.GetLength(v), capacity = cap, shared_orders = GSVehicle.HasSharedOrders(v),
 		order_count = count, current_order = count > 0 ? GSOrder.ResolveOrderPosition(v, GSOrder.ORDER_CURRENT) : -1,
+		unit_number = GSVehicle.GetUnitNumber(v), rail_type = GSVehicle.GetVehicleType(v) == GSVehicle.VT_RAIL ? GSEngine.GetRailType(e) : -1,
 	}];
 	for (local i = 0; i < count; i++) {
 		local kind = "other";
@@ -547,6 +556,54 @@ function AgentBridge::CmdVehicle(args) {
 		}
 		local valid = GSMap.IsValidTile(dest);
 		out.append([i, kind, valid ? GSMap.GetTileX(dest) : -1, valid ? GSMap.GetTileY(dest) : -1, GSOrder.GetOrderFlags(v, i), station, name, jump]);
+	}
+	return out;
+}
+
+// args: x0, y0, x1, y1 (at most 32x32 tiles). Every tile a train can use, for tracing connectivity in the client
+// (src/connectivity.js). Rows: [x, y, kind, tracks, station, a, b, owner, rail_type, signals] (v9)
+// kind: "t" track, "x" level crossing, "s" station, "w" waypoint (tracks = GSRail.GetRailTracks bits),
+//   "d" depot (a, b = front tile), "b" bridge head, "u" tunnel head (a, b = other end; tracks 0).
+// station: station id or -1. signals: bit d = one-way path signal facing the neighbour in direction d,
+//   bit 4+d = any signal facing it; d: 0 +x, 1 +y, 2 -x, 3 -y.
+function AgentBridge::CmdRailTiles(args) {
+	local x0 = max(0, args.x0), y0 = max(0, args.y0);
+	local x1 = min(GSMap.GetMapSizeX() - 1, args.x1), y1 = min(GSMap.GetMapSizeY() - 1, args.y1);
+	if ((x1 - x0 + 1) * (y1 - y0 + 1) > 1024) throw "area too large; max 32x32 tiles";
+	local dx = [1, 0, -1, 0], dy = [0, 1, 0, -1];
+	local out = [];
+	for (local y = y0; y <= y1; y++) {
+		for (local x = x0; x <= x1; x++) {
+			local t = GSMap.GetTileIndex(x, y);
+			local kind = "";
+			local a = -1, b = -1, tracks = 0, sig = 0;
+			if (GSRail.IsRailDepotTile(t)) {
+				kind = "d";
+				local f = GSRail.GetRailDepotFrontTile(t);
+				a = GSMap.GetTileX(f); b = GSMap.GetTileY(f);
+			} else if (GSRail.IsRailTile(t)) {
+				tracks = GSRail.GetRailTracks(t);
+				if (GSRail.IsRailStationTile(t)) kind = "s";
+				else if (GSRail.IsRailWaypointTile(t)) kind = "w";
+				else if (GSRail.IsLevelCrossingTile(t)) kind = "x";
+				else {
+					kind = "t";
+					for (local d = 0; d < 4; d++) {
+						local st = GSRail.GetSignalType(t, GSMap.GetTileIndex(x + dx[d], y + dy[d]));
+						if (st == GSRail.SIGNALTYPE_NONE) continue;
+						sig = sig | (1 << (4 + d));
+						if (st == GSRail.SIGNALTYPE_PBS_ONEWAY) sig = sig | (1 << d);
+					}
+				}
+			} else if ((GSBridge.IsBridgeTile(t) || GSTunnel.IsTunnelTile(t)) && GSTile.HasTransportType(t, GSTile.TRANSPORT_RAIL)) {
+				kind = GSBridge.IsBridgeTile(t) ? "b" : "u";
+				local o = kind == "b" ? GSBridge.GetOtherBridgeEnd(t) : GSTunnel.GetOtherTunnelEnd(t);
+				a = GSMap.GetTileX(o); b = GSMap.GetTileY(o);
+			}
+			if (kind == "") continue;
+			local station = GSStation.GetStationID(t);
+			out.append([x, y, kind, tracks, GSStation.IsValidStation(station) ? station : -1, a, b, GSTile.GetOwner(t), GSRail.GetRailType(t), sig]);
+		}
 	}
 	return out;
 }
