@@ -85,6 +85,9 @@ Every state change (vehicles, orders, groups, construction) is one **step** in a
 - Optional `rail_type` / `road_type` select the track type for the whole request.
 - `rail` and `road` steps count "already built" as success, so a plan can be re-run.
 - `demolish` checks every tile of its rectangle first and refuses all of it if one is protected.
+- `loan` (v8): `["loan", "set", loan]`, `["loan", "add", delta]` (negative = repay) or
+  `["loan", "max", 0]`. The target loan is rounded up to the loan interval; refused below 0, over
+  `max_loan`, or when the bank balance would go below 0. Row value = the target loan.
 - Step formats are listed in `ExecStep` in main.nut. The client keeps a request under ~7 kB and 150 steps.
 
 ## events

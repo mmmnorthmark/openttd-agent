@@ -65,7 +65,7 @@ class AgentBridge extends GSController {
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v7 started");
+	GSLog.Info("AgentBridge v8 started");
 	this.RestoreGoals();
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
@@ -223,7 +223,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 7,
+		bridge_version = 8,
 		event_seq = this.event_seq,
 		goals = this.goals.len(),
 	};
@@ -996,6 +996,9 @@ function AgentBridge::ExecStep(company, s, dry) {
 			if (s[3] != null) ok = GSCompany.SetAutoRenewMoney(s[3]) && ok;
 			return [ok, 0];
 		}
+		// -- loan (v8): [op, "set", loan] / [op, "add", delta (negative = repay)] / [op, "max", 0].
+		// The target is rounded up to a multiple of GetLoanInterval(). value: the target loan.
+		case "loan": return this.LoanStep(company, s[1], s[2]);
 		// -- orders: [op, vehicle, x, y, flags, position (-1 append)]
 		case "order_add": {
 			local tile = GSMap.GetTileIndex(s[2], s[3]);
@@ -1097,6 +1100,29 @@ function AgentBridge::ExecStep(company, s, dry) {
 		case "lower": return [GSTile.LowerTile(this.T(s[1], s[2]), s[3]), 0];
 	}
 	return [false, 0, "unknown exec op: " + s[0]];
+}
+
+// Runs inside CmdExec's GSCompanyMode, so GetLoanAmount/GetMaxLoanAmount read this company.
+// Own refusals first: SetLoanAmount's preconditions fail with a bare ERR_PRECONDITION_FAILED.
+function AgentBridge::LoanStep(company, kind, n) {
+	local cur = GSCompany.GetLoanAmount();
+	local max = GSCompany.GetMaxLoanAmount();
+	local step = GSCompany.GetLoanInterval();
+	local want = n;
+	if (kind == "max") {
+		want = max;
+	} else if (kind == "add") {
+		want = cur + n;
+	} else if (kind != "set") {
+		return [false, 0, "unknown loan kind: " + kind + " (set, add, max)"];
+	}
+	if (want < 0) return [false, 0, "refused: loan would be " + want + ", below 0 (current loan " + cur + ")"];
+	if (want % step != 0) want += step - want % step;
+	if (want > max) return [false, want, "refused: loan " + want + " is over max_loan " + max + " (loan interval " + step + ")"];
+	local cash = GSCompany.GetBankBalance(company);
+	if (want - cur + cash < 0) return [false, want, "refused: repaying " + (cur - want) + " needs that much cash; bank balance is " + cash];
+	if (!GSCompany.SetLoanAmount(want)) return [false, want];
+	return [true, want];
 }
 
 // ---- Construct helpers ----------------------------------------------------------
