@@ -34,12 +34,18 @@ export function stationsFromRows(rows, cargos) {
 
 export function vehiclesFromRows(rows) {
   return rows.map(([id, name, type, engine, engine_name, age_days, max_age_days, reliability_pct, profit_this_year, profit_last_year,
-    value, state, x, y, group, order_count, unit_number, running_cost, shared_orders]) => ({
+    value, state, x, y, group, order_count, unit_number, running_cost, shared_orders, ...v9]) => ({
     id, name, type: VEHICLE_TYPES[type] ?? type, engine, engine_name, age_days, max_age_days,
     age_pct: max_age_days > 0 ? Math.round(100 * age_days / max_age_days) : 0, reliability_pct,
     profit_this_year, profit_last_year, value, running_cost, state: VEHICLE_STATES[state] ?? state, x, y,
     group: group === 0xFFFF || group === 0xFFFE ? null : group, order_count, unit_number, shared_orders,
+    ...(v9.length >= 5 ? currentOrder(v9) : {}),
   }));
+}
+
+// AgentBridge v9 appends [current_order, dest_x, dest_y, dest_station, speed] to each vehicles row.
+function currentOrder([current_order, dest_x, dest_y, dest_station, speed]) {
+  return { current_order, dest: dest_x >= 0 ? { x: dest_x, y: dest_y } : null, dest_station, speed };
 }
 
 export function enginesFromRows(rows, cargos) {
