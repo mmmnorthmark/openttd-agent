@@ -56,7 +56,7 @@ class AgentBridge extends GSController {
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v4 started");
+	GSLog.Info("AgentBridge v5 started");
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
 		while (GSEventController.IsEventWaiting()) {
@@ -64,6 +64,8 @@ function AgentBridge::Start() {
 			if (ev == null) continue;
 			if (ev.GetEventType() == GSEvent.ET_ADMIN_PORT) {
 				this.HandleRequest(GSEventAdminPort.Convert(ev).GetObject());
+			} else {
+				this.RecordEvent(ev);
 			}
 		}
 		GSController.Sleep(1);
@@ -209,7 +211,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 4,
+		bridge_version = 5,
 		event_seq = this.event_seq,
 	};
 }

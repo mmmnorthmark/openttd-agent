@@ -25,7 +25,7 @@ function dumpRows({ y0, y1, x0 = 0, x1 = FAKE_MAP - 1 }) {
 }
 
 const GS = {
-  info: () => ({ tick: 1, date: 1, year: 1950, month: 1, day: 1, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: false, towns: 2, industries: 3, bridge_version: 4, event_seq: 2 }),
+  info: () => ({ tick: 1, date: 1, year: 1950, month: 1, day: 1, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: false, towns: 2, industries: 3, bridge_version: 5, event_seq: 2 }),
   cargos: () => [{ id: 0, label: 'PASS', name: 'Passengers', passengers: true }, { id: 7, label: 'WOOD', name: 'Wood', passengers: false }],
   industry_types: () => [{ id: 3, name: 'Forest', produces: [7], accepts: [] }, { id: 4, name: 'Sawmill', produces: [], accepts: [7] }],
   industries: () => [
