@@ -13,7 +13,7 @@ import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
-  encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES } from './operate.js';
+  encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, DEFAULT_COSTS } from './world.js';
 
@@ -46,6 +46,32 @@ const front = { front_x: int().describe('tile the entrance faces (next to x,y)')
 const bridgeArg = { bridge: z.string().default('cheapest').describe("'cheapest', 'fastest' or a bridge type id (see bridge-types)") };
 const bridgeType = (v) => (v === 'cheapest' ? -1 : v === 'fastest' ? -2 : Number(v));
 const transport = (v) => ({ rail: 0, road: 1, water: 2 })[v];
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const gameDate = (i) => `${i.year}-${String(i.month).padStart(2, '0')}-${String(i.day).padStart(2, '0')}`;
+
+/** Pause or unpause over the server console and wait until the game reports it. Returns the fresh GS info. */
+async function setPaused(s, want) {
+  let info = await s.gs.call('info');
+  if (info.paused === want) return info;
+  await s.admin.rcon(want ? 'pause' : 'unpause');
+  const deadline = Date.now() + 10000;
+  while (info.paused !== want) {
+    if (Date.now() > deadline) {
+      throw new Error(want ? 'the game did not pause within 10s' : 'the game is still paused 10s after `unpause`: something else holds it (network.min_active_clients waiting for players, or a GameScript pause)');
+    }
+    await sleep(100);
+    info = await s.gs.call('info');
+  }
+  return info;
+}
+
+/** What players may do while paused: construction.command_pause_level (3 = everything). Fixed for a running network game. */
+async function pauseLevel(s) {
+  const line = (await s.admin.rcon('setting command_pause_level')).join(' ');
+  const level = Number(/is '(\d)'/.exec(line)?.[1] ?? NaN);
+  return { command_pause_level: level, while_paused: ['nothing', 'orders and vehicle management only (no building)', 'everything except terraforming', 'everything'][level] ?? 'unknown' };
+}
 
 /** Plan a rail or road path on fresh tiles, then dry-run or build it. */
 async function buildPath(ctx, a, mode) {
@@ -232,6 +258,87 @@ export const COMMANDS = [
     run: async (ctx, a) => {
       const s = await ctx.session();
       return Object.keys(a).length ? s.gs.call('set_rate', a) : s.gs.call('get_rate');
+    },
+  },
+  {
+    name: 'goal-status', group: 'game', session: true,
+    description: "Your company's goal, with fresh progress: per target the amount, progress so far, pct and done; status active/done/failed (or none), deadline_year and days_left. Cargo progress counts deliveries since the goal was set; VALUE is the current company value. The same goal shows in the game's goal window.",
+    args: z.object({ ...who }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const rows = await s.gs.call('goal_status', { company });
+      return rows.length ? goalFromRow(rows[0]) : { company, status: 'none', note: 'no goal set for this company (the host sets one with goal-set)' };
+    },
+  },
+
+  // ---- host (needs the game; refused through the relay) --------------------------
+  {
+    name: 'goal-set', group: 'host', session: true,
+    description: "HOST ONLY: set (or replace) a company's goal: deliver amounts of cargo and/or reach a company value by the end of deadline_year. Counting starts now. AgentBridge tracks it (a game runs one GameScript, so a goal script cannot run next to it), shows it in the goal window and settles it: done when every target was reached, failed when the deadline year ends first (events goal_done / goal_failed).",
+    args: z.object({
+      ...who, deadline_year: int().describe('the goal must be met by 31 December of this year'),
+      targets: z.union([z.string(), z.array(z.any())]).describe("'COAL:3000,PASS:3000,VALUE:500000': cargo labels as `cargos` lists them, VALUE = company value"),
+    }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const targets = parseGoalTargets(a.targets, [...s.cargos.values()].map((c) => c.label));
+      return goalFromRow((await s.gs.call('goal_set', { company, deadline_year: a.deadline_year, targets }))[0]);
+    },
+  },
+  {
+    name: 'pause', group: 'host', session: true,
+    description: 'HOST ONLY: pause the game for everyone. The GameScript keeps answering, so agents can look and plan; whether they can also build while paused is `while_paused` in the result (games started or prepared by openttd-agent allow everything).',
+    args: z.object({}),
+    run: async (ctx) => {
+      const s = await ctx.session();
+      const info = await setPaused(s, true);
+      return { paused: info.paused, date: gameDate(info), ...(await pauseLevel(s)) };
+    },
+  },
+  {
+    name: 'unpause', group: 'host', session: true,
+    description: 'HOST ONLY: let the game run again.',
+    args: z.object({}),
+    run: async (ctx) => {
+      const info = await setPaused(await ctx.session(), false);
+      return { paused: info.paused, date: gameDate(info) };
+    },
+  },
+  {
+    name: 'turn-advance', group: 'host', session: true,
+    description: 'HOST ONLY: turn-based play. Unpause, let `days` game days pass (about 2.2 s each; multiplayer has no fast-forward), pause again, and return the new date and the events that happened. Use it in a loop: think and build while paused, then advance. The game ends paused even if the wait fails.',
+    args: z.object({ days: int().min(1).max(366).default(30).describe('game days to run; a month is ~30 (about 66 s of real time)') }),
+    run: async (ctx, a) => {
+      const s = await ctx.session();
+      const started = Date.now();
+      const before = await s.gs.call('info');
+      let now = before;
+      let stalled = '';
+      try {
+        now = await setPaused(s, false);
+        const deadline = Date.now() + a.days * 4000 + 20000;
+        while (now.date < before.date + a.days) {
+          if (Date.now() > deadline) { stalled = `only ${now.date - before.date} of ${a.days} days passed in ${Math.round((Date.now() - started) / 1000)}s; is the server overloaded?`; break; }
+          await sleep(200);
+          now = await s.gs.call('info');
+        }
+      } finally {
+        now = await setPaused(s, true);
+      }
+      if (stalled) throw new Error(`turn-advance: ${stalled} The game is paused at ${gameDate(now)}.`);
+      const events = await s.gs.call('events', { since: before.event_seq });
+      s._economy.at = 0; // a turn passed: towns and industries changed
+      return { from: gameDate(before), to: gameDate(now), days_advanced: now.date - before.date, paused: now.paused,
+        real_seconds: Math.round((Date.now() - started) / 100) / 10, latest_seq: events.length ? events.at(-1).seq : before.event_seq, events };
+    },
+  },
+  {
+    name: 'goal-clear', group: 'host', session: true,
+    description: "HOST ONLY: remove a company's goal and its goal window entries.",
+    args: z.object({ ...who }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      return { company, ...(await s.gs.call('goal_clear', { company })) };
     },
   },
 

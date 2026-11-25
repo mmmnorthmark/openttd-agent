@@ -122,3 +122,27 @@ export function execSummary(steps, replies, dryRun) {
     cost, money, ...(stopped ? { stopped } : {}), ...(failed.length ? { first_error: failed[0].error ?? 'failed' } : {}), results,
   };
 }
+
+// ---- goals (GS rows: see CmdGoalStatus in main.nut) -----------------------------------------
+
+/** "COAL:3000,pass:3000,VALUE:500000" | [["COAL", 3000]] | [{cargo, amount}] -> [[LABEL, amount], ...]; VALUE = company value. */
+export function parseGoalTargets(input, cargoLabels) {
+  const raw = typeof input === 'string'
+    ? input.split(',').filter((p) => p.trim() !== '').map((p) => p.split(':'))
+    : (input ?? []).map((t) => (Array.isArray(t) ? t : [t.cargo, t.amount]));
+  if (!raw.length) throw new Error("no targets given; use e.g. --targets COAL:3000,PASS:3000 ('VALUE:<amount>' = company value)");
+  const known = ['VALUE', ...cargoLabels];
+  return raw.map(([label, amount]) => {
+    const l = String(label ?? '').trim().toUpperCase();
+    const n = Number(String(amount ?? '').trim());
+    if (!known.includes(l)) throw new Error(`unknown goal cargo '${label}'. Use a cargo label of this game (${cargoLabels.join(', ')}) or VALUE`);
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`goal amount for ${l} must be a whole number above 0, got '${amount}'`);
+    return [l, n];
+  });
+}
+
+/** One GS goal row -> readable goal. */
+export function goalFromRow(g) {
+  return { company: g.company, status: g.status, deadline_year: g.deadline_year, days_left: g.days_left, set_date: g.set_date,
+    targets: g.targets.map(([cargo, amount, progress, done]) => ({ cargo, amount, progress, pct: Math.min(100, Math.floor((progress * 100) / amount)), done })) };
+}

@@ -20,10 +20,15 @@ class AgentBridge extends GSController {
 	perday_override = -1;
 	events = null;           // ring buffer of event tables, oldest first
 	event_seq = 0;           // seq of the newest recorded event
+	goals = null;            // one table per company with a goal, see CmdGoalSet
+	goal_month = 0;          // year * 12 + month of the last monthly goal update
+	world_stamp = "";        // identifies this map; saved with the goals (see RestoreGoals)
+	loaded = null;           // table handed to Load(), consumed in Start()
 
 	constructor() {
 		this.builds_today = {};
 		this.events = [];
+		this.goals = [];
 		this.handlers = {
 			ping = "CmdPing",
 			info = "CmdInfo",
@@ -51,12 +56,16 @@ class AgentBridge extends GSController {
 			exec = "CmdExec",
 			rail_types = "CmdRailTypes",
 			bridge_types = "CmdBridgeTypes",
+			goal_set = "CmdGoalSet",
+			goal_status = "CmdGoalStatus",
+			goal_clear = "CmdGoalClear",
 		};
 	}
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v5 started");
+	GSLog.Info("AgentBridge v6 started");
+	this.RestoreGoals();
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
 		while (GSEventController.IsEventWaiting()) {
@@ -68,12 +77,14 @@ function AgentBridge::Start() {
 				this.RecordEvent(ev);
 			}
 		}
+		if (this.goals.len() > 0 && this.MonthNow() != this.goal_month) this.UpdateGoals();
 		GSController.Sleep(1);
 	}
 }
 
-function AgentBridge::Save() { return {}; }
-function AgentBridge::Load(version, data) {}
+// Save() must stay cheap and may not call the API: it only hands over what is already in memory.
+function AgentBridge::Save() { return { world = this.world_stamp, goals = this.goals, goal_month = this.goal_month }; }
+function AgentBridge::Load(version, data) { this.loaded = data; }
 
 function AgentBridge::HandleRequest(req) {
 	if (typeof req != "table" || !("id" in req) || !("cmd" in req)) {
@@ -211,8 +222,9 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 5,
+		bridge_version = 6,
 		event_seq = this.event_seq,
+		goals = this.goals.len(),
 	};
 }
 
@@ -640,14 +652,19 @@ function AgentBridge::RecordEvent(ev) {
 			break;
 		}
 	}
-	if (d == null) return;
-	local today = GSDate.GetCurrentDate();
+	if (d != null) this.PushEvent(d);
+}
+
+// Stamp an event table with seq and date and put it in the ring buffer.
+function AgentBridge::PushEvent(d) {
 	this.event_seq++;
 	d.seq <- this.event_seq;
-	d.date <- GSDate.GetYear(today) + "-" + GSDate.GetMonth(today) + "-" + GSDate.GetDayOfMonth(today);
+	d.date <- this.DateStr(GSDate.GetCurrentDate());
 	this.events.append(d);
 	if (this.events.len() > MAX_EVENTS) this.events.remove(0);
 }
+
+function AgentBridge::DateStr(d) { return GSDate.GetYear(d) + "-" + GSDate.GetMonth(d) + "-" + GSDate.GetDayOfMonth(d); }
 
 function AgentBridge::SubsidyEvent(name, id) {
 	local d = { type = name, subsidy = id };
@@ -670,6 +687,203 @@ function AgentBridge::CmdEvents(args) {
 		if (d.seq > since) out.append(d);
 	}
 	return out;
+}
+
+// ---- Goals ----------------------------------------------------------------------
+//
+// A game runs one GameScript, so AgentBridge hosts the goals itself. One goal per company:
+//   { company, deadline_year, set_date, status ("active" | "done" | "failed"),
+//     targets = [{ cargo (id, -1 = company value), label, name, amount, progress, shown, goal (GSGoal id), done }] }
+// Cargo progress is what the company delivered since the goal was set. It is read from town
+// delivery monitors: every delivery is counted for the town its station belongs to (also
+// deliveries to industries, 15.3 cargomonitor.cpp AddCargoDelivery), so the sum over all towns
+// counts each delivery once. Company value is the current value, not a sum.
+// Everything here runs as deity (no GSCompanyMode): GSGoal commands require it.
+
+function AgentBridge::MonthNow() {
+	local d = GSDate.GetCurrentDate();
+	return GSDate.GetYear(d) * 12 + GSDate.GetMonth(d);
+}
+
+function AgentBridge::CargoByLabel(label) {
+	foreach (c, _ in GSCargoList()) {
+		if (GSCargo.GetCargoLabel(c) == label) return c;
+	}
+	return -1;
+}
+
+// Deliveries of cargo by company since the last call, summed over all towns. keep = false stops the monitors.
+function AgentBridge::ReadDeliveries(company, cargo, keep) {
+	local sum = 0;
+	foreach (town, _ in GSTownList()) {
+		local n = GSCargoMonitor.GetTownDeliveryAmount(company, cargo, town, keep);
+		if (n > 0) sum += n;
+	}
+	return sum;
+}
+
+function AgentBridge::GoalIndex(company) {
+	for (local i = 0; i < this.goals.len(); i++) {
+		if (this.goals[i].company == company) return i;
+	}
+	return -1;
+}
+
+function AgentBridge::GoalText(t, deadline_year) {
+	if (t.cargo < 0) return "Reach a company value of " + t.amount + " by the end of " + deadline_year;
+	return "Deliver " + t.amount + " " + t.name + " by the end of " + deadline_year;
+}
+
+// args: company, deadline_year, targets = [[cargo label or "VALUE", amount], ...]. Replaces the company's goal.
+function AgentBridge::CmdGoalSet(args) {
+	local company = this.CheckCompany(args);
+	if (!("deadline_year" in args) || !("targets" in args) || args.targets.len() == 0) throw "goal_set needs deadline_year and at least one target";
+	local today = GSDate.GetCurrentDate();
+	if (args.deadline_year < GSDate.GetYear(today)) throw "deadline_year " + args.deadline_year + " is in the past (it is " + GSDate.GetYear(today) + ")";
+	// Check every target before changing anything.
+	local targets = [];
+	foreach (pair in args.targets) {
+		local t = { cargo = -1, label = "VALUE", name = "company value", amount = pair[1], progress = 0, shown = -1, goal = -1, done = false };
+		if (pair[0] != "VALUE") {
+			t.cargo = this.CargoByLabel(pair[0]);
+			if (t.cargo < 0) throw "unknown cargo label '" + pair[0] + "'; run: openttd-agent cargos";
+			t.label = pair[0];
+			t.name = this.Str(GSCargo.GetName(t.cargo));
+		}
+		if (t.amount <= 0) throw "target amount for " + t.label + " must be above 0";
+		foreach (other in targets) {
+			if (other.label == t.label) throw "target " + t.label + " is listed twice";
+		}
+		targets.append(t);
+	}
+	this.RemoveGoal(company);
+	local g = { company = company, deadline_year = args.deadline_year, set_date = this.DateStr(today), status = "active", targets = targets };
+	foreach (t in targets) {
+		t.goal = GSGoal.New(company, this.GoalText(t, g.deadline_year), GSGoal.GT_COMPANY, company);
+		if (!GSGoal.IsValidGoal(t.goal)) GSLog.Warning("AgentBridge: could not create the goal window entry for " + t.label + "; goal_status still tracks it");
+		if (t.cargo >= 0) this.ReadDeliveries(company, t.cargo, true); // starts the monitors; counts from zero
+	}
+	this.goals.append(g);
+	this.UpdateGoals();
+	return [this.GoalView(g)];
+}
+
+// args: company. Removes the company's goal and its goal window entries.
+function AgentBridge::CmdGoalClear(args) {
+	local company = this.CheckCompany(args);
+	return { removed = this.RemoveGoal(company) };
+}
+
+function AgentBridge::RemoveGoal(company) {
+	local i = this.GoalIndex(company);
+	if (i < 0) return false;
+	foreach (t in this.goals[i].targets) {
+		if (GSGoal.IsValidGoal(t.goal)) GSGoal.Remove(t.goal);
+		if (t.cargo >= 0) this.ReadDeliveries(company, t.cargo, false);
+	}
+	this.goals.remove(i);
+	return true;
+}
+
+// args: optional company. Fresh progress. One row per goal:
+// { company, status, deadline_year, days_left, set_date, targets = [[label, amount, progress, done], ...] }
+function AgentBridge::CmdGoalStatus(args) {
+	this.UpdateGoals();
+	local out = [];
+	foreach (g in this.goals) {
+		if (("company" in args) && args.company != g.company) continue;
+		out.append(this.GoalView(g));
+	}
+	return out;
+}
+
+function AgentBridge::GoalView(g) {
+	local rows = [];
+	foreach (t in g.targets) rows.append([t.label, t.amount, t.progress, t.done]);
+	local left = GSDate.GetDate(g.deadline_year + 1, 1, 1) - GSDate.GetCurrentDate();
+	return { company = g.company, status = g.status, deadline_year = g.deadline_year, days_left = left < 0 ? 0 : left, set_date = g.set_date, targets = rows };
+}
+
+// Read progress of every active goal, update the goal window, and settle goals that are met or out of time.
+// Runs monthly from the main loop and on every goal_set / goal_status.
+function AgentBridge::UpdateGoals() {
+	this.goal_month = this.MonthNow();
+	local year = GSDate.GetYear(GSDate.GetCurrentDate());
+	foreach (g in this.goals) {
+		if (g.status != "active") continue;
+		if (GSCompany.ResolveCompanyID(g.company) == GSCompany.COMPANY_INVALID) {
+			g.status = "failed"; // company gone (bankrupt or merged)
+			continue;
+		}
+		local open = 0;
+		foreach (t in g.targets) {
+			if (t.cargo < 0) {
+				t.progress = GSCompany.GetQuarterlyCompanyValue(g.company, GSCompany.CURRENT_QUARTER);
+			} else {
+				t.progress += this.ReadDeliveries(g.company, t.cargo, true);
+			}
+			if (!t.done && t.progress >= t.amount) {
+				t.done = true;
+				GSGoal.SetCompleted(t.goal, true);
+			}
+			if (!t.done) open++;
+			if (t.progress != t.shown) {
+				t.shown = t.progress;
+				GSGoal.SetProgress(t.goal, t.progress + " / " + t.amount + " (" + (t.progress * 100 / t.amount) + "%)");
+			}
+		}
+		if (open == 0) {
+			this.FinishGoal(g, "done");
+		} else if (year > g.deadline_year) {
+			this.FinishGoal(g, "failed");
+		}
+	}
+}
+
+function AgentBridge::FinishGoal(g, status) {
+	g.status = status;
+	foreach (t in g.targets) {
+		if (t.cargo >= 0) this.ReadDeliveries(g.company, t.cargo, false);
+		if (status == "failed" && !t.done) GSGoal.SetProgress(t.goal, "Not reached: " + t.progress + " / " + t.amount);
+	}
+	this.PushEvent({ type = "goal_" + status, company = g.company, deadline_year = g.deadline_year });
+	GSLog.Info("AgentBridge: goal of company " + g.company + " " + status);
+}
+
+// Identifies the map: size and where the lowest-numbered town is.
+function AgentBridge::WorldStamp() {
+	local first = -1;
+	foreach (town, _ in GSTownList()) {
+		if (first < 0 || town < first) first = town;
+	}
+	return GSMap.GetMapSizeX() + "x" + GSMap.GetMapSizeY() + ":" + (first < 0 ? -1 : GSTown.GetLocation(first));
+}
+
+// Take over the goals from Load(). scenario-prepare copies this script's saved data from another
+// game into a scenario, so goals are only kept when they belong to this map and their goal
+// window entries still exist.
+function AgentBridge::RestoreGoals() {
+	this.world_stamp = this.WorldStamp();
+	local data = this.loaded;
+	this.loaded = null;
+	if (data == null || !("goals" in data) || !("world" in data)) return;
+	if (data.world != this.world_stamp) {
+		if (data.goals.len() > 0) GSLog.Info("AgentBridge: saved goals belong to another map; dropped");
+		return;
+	}
+	foreach (g in data.goals) {
+		local ok = true;
+		foreach (t in g.targets) {
+			if (!GSGoal.IsValidGoal(t.goal)) ok = false;
+		}
+		if (ok) {
+			this.goals.append(g);
+		} else {
+			GSLog.Warning("AgentBridge: saved goal of company " + g.company + " has no goal window entry in this game; dropped");
+		}
+	}
+	if ("goal_month" in data) this.goal_month = data.goal_month;
+	GSLog.Info("AgentBridge: restored " + this.goals.len() + " goal(s)");
 }
 
 // ---- Exec: every state-changing step goes through here ---------------------------

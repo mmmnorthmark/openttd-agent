@@ -24,9 +24,53 @@ function dumpRows({ y0, y1, x0 = 0, x1 = FAKE_MAP - 1 }) {
   return out;
 }
 
+const FAKE_CARGOS = [{ id: 0, label: 'PASS', name: 'Passengers', passengers: true }, { id: 7, label: 'WOOD', name: 'Wood', passengers: false }];
+
+// Goal rows as CmdGoalStatus sends them. Progress comes from state.delivered[label] (tests set it).
+function goalView(g, state) {
+  const targets = g.targets.map(([label, amount]) => [label, amount, state.delivered[label] ?? 0, (state.delivered[label] ?? 0) >= amount]);
+  const status = targets.every((t) => t[3]) ? 'done' : state.year > g.deadline_year ? 'failed' : 'active';
+  return { company: g.company, status, deadline_year: g.deadline_year, days_left: Math.max(0, (g.deadline_year + 1 - state.year) * 365), set_date: '1950-1-1', targets };
+}
+
+const fakeDays = (state) => state.daysRun + (state.paused ? 0 : Math.floor((Date.now() - state.runningSince) / state.dayMs));
+
+// Console commands the package uses. Returns the output lines.
+function fakeRcon(cmd, state) {
+  if (cmd === 'pause' || cmd === 'unpause') {
+    const want = cmd === 'pause';
+    if (state.paused !== want) {
+      if (want) state.daysRun = fakeDays(state); else state.runningSince = Date.now();
+      state.paused = want;
+    }
+    return [];
+  }
+  if (cmd === 'setting command_pause_level') return [`Current value for 'construction.command_pause_level' is '${state.pauseLevel}' (min: 0, max: 3, def: 1).`];
+  return [`ran: ${cmd}`];
+}
+
+// Handlers get (args, state); state is per fake server (see startFakeServer).
 const GS = {
-  info: () => ({ tick: 1, date: 1, year: 1950, month: 1, day: 1, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: false, towns: 2, industries: 3, bridge_version: 5, event_seq: 2 }),
-  cargos: () => [{ id: 0, label: 'PASS', name: 'Passengers', passengers: true }, { id: 7, label: 'WOOD', name: 'Wood', passengers: false }],
+  goal_set: (a, state) => {
+    if (a.deadline_year < state.year) throw new Error(`deadline_year ${a.deadline_year} is in the past (it is ${state.year})`);
+    for (const [label] of a.targets) if (label !== 'VALUE' && !FAKE_CARGOS.some((c) => c.label === label)) throw new Error(`unknown cargo label '${label}'; run: openttd-agent cargos`);
+    state.goals = state.goals.filter((g) => g.company !== a.company);
+    const g = { company: a.company, deadline_year: a.deadline_year, targets: a.targets };
+    state.goals.push(g);
+    return [goalView(g, state)];
+  },
+  goal_status: (a, state) => state.goals.filter((g) => a.company === undefined || g.company === a.company).map((g) => goalView(g, state)),
+  goal_clear: (a, state) => {
+    const had = state.goals.some((g) => g.company === a.company);
+    state.goals = state.goals.filter((g) => g.company !== a.company);
+    return { removed: had };
+  },
+  // The date runs at one game day per state.dayMs of real time while the game is not paused.
+  info: (_a, state) => {
+    const date = 1 + fakeDays(state);
+    return { tick: 1, date, year: state.year, month: 1, day: date, map_x: FAKE_MAP, map_y: FAKE_MAP, landscape: 0, paused: state.paused, towns: 2, industries: 3, bridge_version: 6, event_seq: 2, goals: state.goals.length };
+  },
+  cargos: () => FAKE_CARGOS,
   industry_types: () => [{ id: 3, name: 'Forest', produces: [7], accepts: [] }, { id: 4, name: 'Sawmill', produces: [], accepts: [7] }],
   industries: () => [
     [1, 3, 10, 20, [[7, 120, 0]], 0],
@@ -91,6 +135,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [] };
   const server = net.createServer((sock) => {
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));
@@ -110,7 +155,7 @@ export function startFakeServer({ password = 'pw' } = {}) {
           const base = { id: req.id, client: req.client };
           if (!handler) { send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: false, part: 0, last: true, error: `unknown cmd: ${req.cmd}` }))); continue; }
           let data;
-          try { data = handler(req.args ?? {}); } catch (e) {
+          try { data = handler(req.args ?? {}, state); } catch (e) {
             send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: false, part: 0, last: true, error: `exception in ${req.cmd}: ${e.message}` })));
             continue;
           }
@@ -126,12 +171,14 @@ export function startFakeServer({ password = 'pw' } = {}) {
         } else if (type === PKT.ADMIN_CHAT) {
           chats.push(body.subarray(6, body.length - 1).toString('utf8'));
         } else if (type === PKT.ADMIN_RCON) {
-          send(PKT.SERVER_RCON, Buffer.concat([Buffer.from([1, 0]), cstr(`ran: ${r.str()}`)]));
+          const cmd = r.str();
+          state.rcons.push(cmd);
+          for (const line of fakeRcon(cmd, state)) send(PKT.SERVER_RCON, Buffer.concat([Buffer.from([1, 0]), cstr(line)]));
           send(PKT.SERVER_RCON_END, cstr('x'));
         }
       }
     });
     sock.on('error', () => {});
   });
-  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, received, chats })));
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, received, chats, state })));
 }

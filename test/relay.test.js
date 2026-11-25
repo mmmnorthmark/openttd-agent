@@ -96,7 +96,7 @@ test('every command that changes the game or reads company data takes a company 
 
 test('host-only commands are refused for players', async () => {
   for (const [name, args] of [['launch', { mode: 'dedicated', admin_password: 'sent-by-player' }], ['install-gamescript', {}], ['configure', { admin_password: 'x' }],
-    ['show-config', {}], ['relay-add-player', { name: 'eve', company: 0 }], ['relay-list-players', {}], ['rate', { max_builds_per_day: 1 }], ['rcon', { command: 'quit' }], ['scenario-prepare', { search: 'mini' }]]) {
+    ['show-config', {}], ['relay-add-player', { name: 'eve', company: 0 }], ['relay-list-players', {}], ['rate', { max_builds_per_day: 1 }], ['rcon', { command: 'quit' }], ['scenario-prepare', { search: 'mini' }], ['goal-set', { deadline_year: 1960, targets: 'PASS:1' }], ['goal-clear', {}], ['pause', {}], ['unpause', {}], ['turn-advance', { days: 1 }]]) {
     const r = await call(tokens.alice, name, args);
     assert.equal(r.status, 403, name);
     assert.match(r.error, /relay refused/, name);
@@ -104,6 +104,14 @@ test('host-only commands are refused for players', async () => {
   assert.equal(fake.received.some((q) => q.cmd === 'set_rate'), false);
   assert.equal((await call(tokens.alice, 'rate')).ok, true, 'reading the rate is allowed');
   assert.equal(players.listPlayers().some((p) => p.name === 'eve'), false);
+});
+
+test('goal-status is served, as the player\'s own company only', async () => {
+  const mine = await call(tokens.alice, 'goal-status');
+  assert.equal(mine.ok, true);
+  assert.equal(mine.result.company, 0);
+  assert.equal(fake.received.at(-1).args.company, 0);
+  assert.equal((await call(tokens.alice, 'goal-status', { company: 1 })).status, 403);
 });
 
 test('pending player: world queries work, company commands wait for the host to bind', async () => {

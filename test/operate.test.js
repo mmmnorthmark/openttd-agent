@@ -105,3 +105,53 @@ test('a failed step is reported with its error; group-create returns the id', as
   assert.equal(ar.ok, true);
   assert.equal((await run('autorenew', {})).months, 6);
 });
+
+test('goals: set with cargo labels, status with pct, done and failed, clear', async () => {
+  assert.deepEqual(await run('goal-status', {}), { company: 0, status: 'none', note: 'no goal set for this company (the host sets one with goal-set)' });
+  const set = await run('goal-set', { deadline_year: 1954, targets: 'wood:3000, PASS:500,VALUE:100000' });
+  assert.deepEqual(fake.received.at(-1).args, { company: 0, deadline_year: 1954, targets: [['WOOD', 3000], ['PASS', 500], ['VALUE', 100000]] });
+  assert.equal(set.status, 'active');
+  assert.deepEqual(set.targets[0], { cargo: 'WOOD', amount: 3000, progress: 0, pct: 0, done: false });
+  fake.state.delivered = { WOOD: 1500, PASS: 800 };
+  const mid = await run('goal-status', {});
+  assert.deepEqual(mid.targets.map((t) => [t.cargo, t.pct, t.done]), [['WOOD', 50, false], ['PASS', 100, true], ['VALUE', 0, false]]);
+  assert.equal(mid.days_left, 5 * 365);
+  fake.state.year = 1955;
+  assert.equal((await run('goal-status', {})).status, 'failed');
+  fake.state.delivered = { WOOD: 3000, PASS: 800, VALUE: 100000 };
+  assert.equal((await run('goal-status', {})).status, 'done');
+  fake.state.year = 1950;
+  fake.state.delivered = {};
+  await assert.rejects(run('goal-set', { deadline_year: 1954, targets: 'COAL:10' }), /unknown goal cargo 'COAL'. Use a cargo label of this game \(PASS, WOOD\) or VALUE/);
+  await assert.rejects(run('goal-set', { deadline_year: 1954, targets: 'WOOD:lots' }), /whole number above 0/);
+  await assert.rejects(run('goal-set', { deadline_year: 1940, targets: 'WOOD:10' }), /in the past/);
+  assert.deepEqual(await run('goal-set', { deadline_year: 1951, targets: [{ cargo: 'pass', amount: 5 }], company: 3 }).then((g) => [g.company, g.targets.length]), [3, 1]);
+  assert.deepEqual(await run('goal-clear', {}), { company: 0, removed: true });
+  assert.equal((await run('goal-status', {})).status, 'none');
+  assert.equal((await run('goal-status', { company: 3 })).status, 'active');
+});
+
+test('pause / unpause go over the console and report what is allowed while paused', async () => {
+  const paused = await run('pause', {});
+  assert.deepEqual([paused.paused, paused.command_pause_level, paused.while_paused], [true, 3, 'everything']);
+  assert.equal(fake.state.rcons.filter((c) => c === 'pause').length, 1);
+  await run('pause', {});
+  assert.equal(fake.state.rcons.filter((c) => c === 'pause').length, 1, 'already paused: no second console command');
+  fake.state.pauseLevel = 1;
+  assert.match((await run('pause', {})).while_paused, /no building/);
+  fake.state.pauseLevel = 3;
+  assert.equal((await run('unpause', {})).paused, false);
+});
+
+test('turn-advance runs the wanted number of days and leaves the game paused', async () => {
+  await run('pause', {});
+  const turn = await run('turn-advance', { days: 4 });
+  assert.equal(turn.paused, true);
+  assert.ok(turn.days_advanced >= 4 && turn.days_advanced <= 30, `advanced ${turn.days_advanced}`);
+  assert.equal(turn.from, '1950-01-' + String(Number(turn.to.slice(-2)) - turn.days_advanced).padStart(2, '0'));
+  assert.deepEqual([turn.latest_seq, turn.events], [2, []], 'events since the turn began');
+  assert.equal(fake.state.paused, true);
+  const again = await run('turn-advance', { days: 1 });
+  assert.ok(again.days_advanced >= 1);
+  assert.equal(again.from, turn.to, 'no time passed between turns');
+});
