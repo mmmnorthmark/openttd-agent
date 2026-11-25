@@ -11,22 +11,71 @@ OpenTTD world and build for **your** company while you play the same company by 
 
 ## Install / update
 
-Needs Node 20+ and OpenTTD 15.x.
+Needs Node 20+ and OpenTTD 15.x with the original TTD graphics or OpenGFX (run OpenTTD once first).
+Nothing to clone: run it straight from GitHub with `npx`, pinned to a release tag.
 
 ```sh
-npx -y github:mmmnorthmark/openttd-agent#v0.2.0 doctor
+npx -y github:mmmnorthmark/openttd-agent#v0.2.0 doctor      # checks OpenTTD, graphics, GameScript
 ```
 
-To update, change the tag (`#v0.3.0`) wherever you reference it, and the **host** re-runs
-`install-gamescript`. See [CHANGELOG.md](CHANGELOG.md).
+Every example below writes `openttd-agent ...`. Either make that a short alias for the `npx` form:
 
-Optional: `npm i -g github:mmmnorthmark/openttd-agent#v0.2.0` gives you a plain `openttd-agent` command.
+```sh
+alias openttd-agent='npx -y github:mmmnorthmark/openttd-agent#v0.2.0'   # add to ~/.zshrc or ~/.bashrc
+```
 
-### Claude Code MCP config
+or install it once: `npm i -g github:mmmnorthmark/openttd-agent#v0.2.0`.
+
+**Versions.** Releases follow [semver](https://semver.org) and are git tags `vX.Y.Z`
+([CHANGELOG.md](CHANGELOG.md)); `main` may be ahead of the latest release. To update, change the
+tag wherever you use it (alias, MCP config), then the **host** re-runs `install-gamescript` and
+loads the game again (a running game keeps the GameScript it started with).
+
+### Use it from an agent
+
+Claude Code, as MCP tools:
 
 ```sh
 claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.2.0 mcp
 ```
+
+Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.2.0", "mcp"]`.
+Agents that run shell commands can use the CLI directly; it is often faster than MCP because they
+can chain calls (`batch`) and filter JSON.
+
+## Quick start: you, an agent and one company (about 10 minutes)
+
+```sh
+openttd-agent doctor                                        # all green?
+openttd-agent install-gamescript                            # copies AgentBridge into OpenTTD
+openttd-agent launch --mode dedicated --bind 127.0.0.1      # headless server on this machine, new 256x256 map
+```
+
+1. Open OpenTTD → Multiplayer → **Add server** `127.0.0.1:3979` → join → **New company**.
+2. Point openttd-agent at that company and look around:
+
+   ```sh
+   openttd-agent companies                     # find your company id (usually 0)
+   openttd-agent configure --company 0
+   openttd-agent status
+   openttd-agent find-cargo-pairs --cargo coal --limit 3
+   ```
+
+3. Build a whole route, price first:
+
+   ```sh
+   openttd-agent build-cargo-route --from_industry <source id> --to_industry <dest id> --cargo coal --dry_run true
+   openttd-agent build-cargo-route --from_industry <source id> --to_industry <dest id> --cargo coal
+   ```
+
+   Watch the stations, track, depot and train appear in your OpenTTD window.
+4. Hand it to your agent: "You run OpenTTD company 0 with the `openttd-agent` CLI (JSON output).
+   Start with `openttd-agent help`; use `<command> --help` for arguments and `--dry_run true`
+   before every build."
+
+To play from another machine (a laptop on the same network or VPN), launch with `--bind 0.0.0.0`
+and join `<this machine's IP>:3979`. Read the security notes under Game night first: the admin port
+is then reachable too.
 
 ## Game night
 
@@ -193,10 +242,14 @@ openttd-agent goal-clear --company 0
   year ends first. Both arrive as events (`goal_done`, `goal_failed`) in `events` and `turn-advance`.
 - Goals are saved with the game. Setting a goal again replaces it and restarts the count.
 
-## Turn-based play
+## Real time or turns
 
-For a brain that needs time to think: keep the game paused while it plans and builds, then let
-time pass in chunks. Host commands:
+**Real time is the normal game:** the clock runs while agents think, so a slow agent loses game
+time. That is the default; nothing to set up. Multiplayer has no fast-forward: a game day takes
+about 2 s, a year about 12 minutes, so give goals deadlines that fit the agent's speed.
+
+**Turn-based (optional)**, for an agent that needs time to think: keep the game paused while it
+plans and builds, then let time pass in chunks. Host commands:
 
 ```sh
 openttd-agent pause                    # -> { paused, date, while_paused: "everything" }
@@ -224,6 +277,30 @@ openttd-agent unpause
 - **`demolish` is guarded** in the GameScript: never another company's property, industries or town
   roads, and town buildings only with `--allow_houses true`.
 - The planner's slope rules are simpler than the game's; on hilly ground expect to iterate.
+
+## Tips for agents
+
+- **Discover, don't guess:** `openttd-agent help` lists commands; `openttd-agent <command> --help`
+  prints one command's arguments. Unknown flags are refused and nothing runs.
+- **Prefer the composite commands** (`build-cargo-route`, `station-sites`, `build-line-depot`,
+  `find-cargo-pairs`): one call each instead of a dozen small ones, and they place things with the
+  map mirror. Reading `tiles` to plan by hand is slow and error-prone; use it to look at a failure.
+- **Dry run, check every step's `ok`, then build.** On failure, read the error, change one thing,
+  and try once more; repeating the identical command will not help.
+- **Keep notes outside the game** (ids of what you built, the plan, what failed). Long games
+  outlast any one context window.
+- Slower or local models: keep each turn to a few composite calls; every call costs real time.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `no welcome from 127.0.0.1:3977` | The server isn't running or the admin password differs: `show-config`, then `launch` again. |
+| A command says AgentBridge is older than vN | The host runs `install-gamescript`, then loads the game again (`launch --load <save>`). |
+| GS replies stop; log says "The script died unexpectedly" | Look in the launch profile's `openttd.log`; report it with the command you ran. |
+| Can't join from another machine | Launch with `--bind 0.0.0.0` and allow OpenTTD through the firewall (TCP 3979). |
+| Changed the code, behaviour didn't change | `openttd-agent daemon-stop`; the next call starts a fresh daemon. |
+| A route builds but earns nothing | `stations`: does the drop station show the cargo? `acceptance --x --y --cargo <c>` at it should be >= 8. |
 
 ## Rate limiting
 
@@ -260,5 +337,8 @@ host's agent ──CLI/MCP──▶ openttd-agent ──────────
 ```sh
 npm install && npm test     # unit tests + a fake admin server end-to-end test
 ```
+
+Releasing: bump `version` in package.json, date the CHANGELOG section, update the `#vX.Y.Z`
+references in this README, commit, then `git tag -a vX.Y.Z -m vX.Y.Z` and push the branch with its tags.
 
 Config lives in `~/.openttd-agent/` (`config.json`, launch `profiles/` with the server's saves and downloaded content, and on the host `relay-players.json`, `relay-audit.jsonl`). Your own `openttd.cfg` is never modified.

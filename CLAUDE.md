@@ -8,10 +8,11 @@ Research and design history: ~/code-local/openttd-agent-research/FINDINGS.md.
 - OpenTTD 15.3 cannot bind the admin port separately from the game port (one bind list, `GetBindAddresses` in network.cpp).
 - One command registry: `src/commands.js`. CLI (`bin/`), daemon (`src/daemon.js`) and MCP (`src/mcp.js`) are thin wrappers. Add commands only there.
 - GS ↔ admin protocol: `docs/PROTOCOL.md`. Keep GS replies < 1100 B; return arrays for big data.
-- Bump `GetVersion()` in `gamescript/AgentBridge/info.nut` whenever main.nut changes; bump package semver + CHANGELOG per release; tag `vX.Y.Z`.
+- Bump `GetVersion()` in `gamescript/AgentBridge/info.nut` whenever main.nut changes.
+- Releases (Matthew, 2026-11-25): semver, one annotated tag `vX.Y.Z` per release. Release commit = package.json version + dated CHANGELOG section + README `#vX.Y.Z` references. `main` may run ahead under "(unreleased)". Agents commit and tag locally (NAS backup is automatic); Matthew pushes to GitHub with `--follow-tags`.
+- Public = generic mechanism only (explicit params, neutral defaults). Strategy, recipes, drivers and prompts belong to the private skills repo; never reference it here. No personal names, paths or IPs in code, tests or docs.
 - Tests: `npm test` (fake admin server in test/fake-server.js mirrors GS commands; extend it with every new GS command).
 - Verified GS API names against OpenTTD 15.3 headers (src/script/api). Check new ones the same way before use.
-- Personal skills live in the private repo `openttd-agent-skills`, not here.
 - State changes are **exec steps**: add an op to `ExecStep` in main.nut, mirror it in the fake server's `exec`, and build the step list in the command (`run(ctx, a, steps)`). Never add a one-off GS build handler.
 - Row decoders for operate data live in `src/operate.js` (pure, unit-tested).
 - Not exposed to GameScripts in 15.3 (don't promise them): vehicle breakdown count, service interval, vehicle-lost/unprofitable/engine-available events, production-change events.
