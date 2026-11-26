@@ -172,6 +172,8 @@ Behaviour changes agents must know:
   `last_command`, `calls_last_minute`, `calls_per_min_10min`, totals of calls, refusals and errors,
   `last_refusal` (since the relay started; the relay writes `~/.openttd-agent/relay-stats.json`
   every few seconds). Never served through the relay.
+- New `build-hq --x --y [--dry_run true]` (GS v12): build or move the company headquarters;
+  returns its location (`hq`). Live-tested.
 
 ## 0.6.0 (2026-11-25)
 

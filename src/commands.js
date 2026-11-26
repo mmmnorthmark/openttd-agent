@@ -1527,6 +1527,21 @@ export const COMMANDS = [
   },
 
   {
+    name: 'build-hq', group: 'build', session: true,
+    description: 'Build (or move) your company headquarters: 2x2 tiles with x,y the north corner, on flat clear land. Building it again elsewhere moves it (the old one goes). dry_run=true = cost only. AgentBridge v12.',
+    args: z.object({ ...act, ...point }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      await needV12(s, 'build-hq');
+      const res = await run(ctx, a, [['hq', a.x, a.y]]);
+      if (a.dry_run || !res.ok) return res;
+      const me = (await s.gs.call('companies')).find((c) => c.id === company);
+      const hq = me && me.hq >= 0 ? { x: me.hq % s.map.sizeX, y: Math.floor(me.hq / s.map.sizeX) } : null;
+      await s.refreshArea(a.x - 1, a.y - 1, a.x + 2, a.y + 2);
+      return { ...res, hq };
+    },
+  },
+  {
     name: 'sign', group: 'build', session: true,
     description: 'Put a sign on the map as your company (free, visible to everyone in the game; use it to mark planned plots and lines instead of placing track). Text up to 31 characters. The sign id is in `sign`. AgentBridge v12.',
     args: z.object({ ...act, ...point, text: z.string().min(1).max(31) }),

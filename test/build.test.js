@@ -363,3 +363,11 @@ test('depots: front and exit_dir (v12); build-rail-depot checks its front', asyn
   assert.equal(b.exit_dir, 'nw');
   assert.equal(b.front_joined, true);
 });
+
+test('build-hq: one hq step; refused on an older GameScript', async () => {
+  const res = await run('build-hq', { x: 20, y: 30, dry_run: true });
+  assert.equal(res.ok, true);
+  assert.deepEqual(fake.received.filter((q) => q.cmd === 'exec').at(-1).args.steps, [['hq', 20, 30]]);
+  fake.state.gsVersion = 11;
+  try { await assert.rejects(run('build-hq', { x: 20, y: 30 }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
+});
