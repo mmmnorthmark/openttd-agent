@@ -577,6 +577,22 @@ async function depotForRoute(s, company, a, id, { cmd }) {
   return { depot, route_check: coarse ? 'coarse_not_refuted' : 'connected', ...note };
 }
 
+/**
+ * Why `build-signal --remove` would fail, from GS `rail_tiles` (v9+): no rail, or no signal facing
+ * trains from front. null = go ahead (also when the running GameScript is too old to tell).
+ */
+async function signalRemoveRefusal(s, a) {
+  const d = TRACE_DIRS.findIndex(([dx, dy]) => a.x + dx === a.front_x && a.y + dy === a.front_y);
+  if (d < 0) return `front_not_adjacent: front (${a.front_x},${a.front_y}) must be a neighbour of (${a.x},${a.y})`;
+  if (((await s.gs.call('info')).bridge_version ?? 0) < 9) return null;
+  const [row] = await s.gs.call('rail_tiles', { x0: a.x, y0: a.y, x1: a.x, y1: a.y });
+  const t = row ? railTileFromRow(row) : null;
+  if (!t || t.kind !== 't') return `no_signal_here: (${a.x},${a.y}) is ${t ? 'not plain track (a station, depot, crossing, bridge or tunnel)' : 'not rail'}, so it has no signal`;
+  if (t.signals & (1 << (4 + d))) return null;
+  const others = [0, 1, 2, 3].filter((k) => t.signals & (1 << (4 + k))).map((k) => `(${a.x + TRACE_DIRS[k][0]},${a.y + TRACE_DIRS[k][1]})`);
+  return `no_signal_here: no signal on (${a.x},${a.y}) facing trains from (${a.front_x},${a.front_y})${others.length ? `; it has one facing trains from ${others.join(' and ')}: give that as --front_x/--front_y` : '; the tile has no signals'}`;
+}
+
 /** Run exec steps as the company (client throttle + GS rate gate apply). */
 async function run(ctx, a, steps, opts = {}) {
   const { s, company } = await mine(ctx, a);
@@ -1473,10 +1489,17 @@ export const COMMANDS = [
   },
   {
     name: 'build-signal', group: 'build', session: true,
-    description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it. The track must exist (a dry run before the track is built fails).',
+    description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it (refused with no_signal_here when there is none facing that way). The track must exist; in a template\'s dry run, signals on track it lays show skipped_in_dry_run.',
     args: z.object({ ...act, ...point, ...front, type: z.enum(Object.keys(SIGNAL_TYPES)).default('path'), two_way: bool().default(false), remove: bool().default(false) }),
-    run: (ctx, a) => run(ctx, a, [a.remove ? ['signal_remove', a.x, a.y, a.front_x, a.front_y]
-      : ['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]),
+    run: async (ctx, a) => {
+      if (a.remove) {
+        const { s } = await mine(ctx, a);
+        const why = await signalRemoveRefusal(s, a);
+        if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: why.split(':')[0], steps_done: 0, results: [] };
+        return run(ctx, a, [['signal_remove', a.x, a.y, a.front_x, a.front_y]]);
+      }
+      return run(ctx, a, [['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]);
+    },
   },
   {
     name: 'station-sites', group: 'build', session: true,

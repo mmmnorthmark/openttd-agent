@@ -266,3 +266,17 @@ test('owned land commands explain an older AgentBridge; airport-sites still work
     assert.ok(res.sites.length && res.sites.every((st) => !('owned' in st)));
   } finally { fake.state.gsVersion = 10; }
 });
+
+test('build-signal --remove: no_signal_here instead of ERR_PRECONDITION_FAILED', async () => {
+  const before = fake.received.filter((r) => r.cmd === 'exec').length;
+  const none = await run('build-signal', { x: 15, y: 20, front_x: 14, front_y: 20, remove: true });
+  assert.deepEqual([none.ok, none.first_error], [false, 'no_signal_here']);
+  assert.match(none.error, /the tile has no signals/);
+  const wrong = await run('build-signal', { x: 18, y: 20, front_x: 17, front_y: 20, remove: true });
+  assert.match(wrong.error, /one facing trains from \(19,20\): give that as --front_x/);
+  assert.equal(fake.received.filter((r) => r.cmd === 'exec').length, before, 'nothing was sent');
+  const ok = await run('build-signal', { x: 18, y: 20, front_x: 19, front_y: 20, remove: true });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(lastExec().steps, [['signal_remove', 18, 20, 19, 20]]);
+  assert.equal((await run('build-signal', { x: 5, y: 5, front_x: 7, front_y: 5, remove: true })).first_error, 'front_not_adjacent');
+});

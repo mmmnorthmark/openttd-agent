@@ -23,6 +23,9 @@ Behaviour changes agents must know:
   its `dry_run_error`, and the top-level `ok` counts only real problems.
 - `build-cargo-route` results carry `cost`, `vehicles[]`, and `complete` on every `built[]` entry.
 - `build-road` takes `--dry_run true` like every other build (it was refused as an unknown argument).
+- `build-signal --remove` on a tile without that signal returns `first_error: no_signal_here`
+  (and names the signal the tile does have, if any) instead of a bare ERR_PRECONDITION_FAILED;
+  nothing is sent to the game. Needs GameScript v9 to check; older ones run the step as before.
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

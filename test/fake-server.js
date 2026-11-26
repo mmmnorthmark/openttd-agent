@@ -101,7 +101,7 @@ function goalView(g, state) {
 function fakeRailRows(state) {
   const rows = [];
   for (let x = 10; x <= 12; x++) rows.push([x, 20, 's', 1, 3, -1, -1, 0, 0, 0]);
-  for (let x = 13; x <= 23; x++) rows.push([x, 20, 't', x === 13 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, 0]);
+  for (let x = 13; x <= 23; x++) rows.push([x, 20, 't', x === 13 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, x === 18 ? 1 << 4 : 0]); // (18,20): a path signal facing trains from (19,20)
   for (let x = 24; x <= 26; x++) rows.push([x, 20, 's', 1, 5, -1, -1, 0, 0, 0]);
   for (let x = 28; x <= 34; x++) rows.push([x, 40, 't', x === 31 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, 0]);
   rows.push([13, 21, 't', 2, -1, -1, -1, 0, 0, 0], [13, 22, 'd', 0, -1, 13, 21, 0, 0, 0],
