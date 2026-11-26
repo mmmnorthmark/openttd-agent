@@ -276,9 +276,14 @@ export function terminusSteps({ x, y, axis = 'x', platforms = 2, length = 5, exi
 }
 
 /**
- * Passing loop on a single line: main track on `length + 2` tiles from (x,y) in direction dir,
- * a parallel loop track beside it (side +1/-1), and one-way path signals so each direction
- * uses its own track. Track that already exists is kept.
+ * Passing loop on a single line, `length` >= 2, in frame P(along, lane) from (x,y) in direction dir:
+ * main track on P(-1..length+2, 0); points on P(0, 0) and P(length+1, 0); the loop track on
+ * P(0..length+1, 1) (curves at both ends). Trains heading `dir` use the main track, trains heading
+ * the other way the loop: one-way path signals on P(length, 0) (facing trains from P(length-1, 0))
+ * and P(2, 1) (facing trains from P(3, 1)). Each side then has `length - 1` clear tiles between the
+ * points a train comes in by and its exit signal, so a train of up to length - 2 tiles waits there
+ * with a tile to spare, clear of both points. Track that already exists is kept.
+ * Returns { steps, ends, clear_tiles, main: [[x,y]...], lane: [[x,y]...], signals: [[x,y,fx,fy]...], axis_bit }.
  */
 export function passingLoopSteps({ x, y, dir = 0, length = 6, side = 1 }) {
   if (length < 2) throw new Error('passing loop length must be at least 2');
@@ -288,12 +293,51 @@ export function passingLoopSteps({ x, y, dir = 0, length = 6, side = 1 }) {
   const loop = [P(-1, 0), P(0, 0)];
   for (let a = 0; a <= length + 1; a++) loop.push(P(a, 1));
   loop.push(P(length + 1, 0), P(length + 2, 0));
+  const signals = [[...P(length, 0), ...P(length - 1, 0)], [...P(2, 1), ...P(3, 1)]];
+  const lane = [];
+  for (let a = 0; a <= length + 1; a++) lane.push(P(a, 1));
   return {
     steps: [...railSteps({ tiles: main, bridges: [] }), ...railSteps({ tiles: loop, bridges: [] }),
-      ['signal', ...P(length, 0), ...P(length - 1, 0), SIGNAL_TYPES.path_oneway],
-      ['signal', ...P(1, 1), ...P(2, 1), SIGNAL_TYPES.path_oneway]],
+      ...signals.map((g) => ['signal', ...g, SIGNAL_TYPES.path_oneway])],
+    loopSteps: railSteps({ tiles: loop, bridges: [] }),
     ends: [{ x: P(0, 0)[0], y: P(0, 0)[1] }, { x: P(length + 1, 0)[0], y: P(length + 1, 0)[1] }],
+    clear_tiles: length - 1, main, lane, signals,
+    // GSRail track bit of a straight piece along dir: RAILTRACK_NE_SW (1) along x, RAILTRACK_NW_SE (2) along y.
+    axis_bit: dir % 2 === 0 ? 1 : 2,
   };
+}
+
+/** Steps that take a passingLoopSteps() loop out again: both signals, then the loop track and its points. The main track stays. */
+export function passingLoopRemoveSteps(loop) {
+  return [...loop.signals.map((g) => ['signal_remove', ...g]), ...loop.loopSteps.slice().reverse().map((st) => ['rail_remove', ...st.slice(1)])];
+}
+
+const LOOP_OK_CLASSES = new Set(['b', 't', 'f', 'k', 'h']); // buildable after auto-clearing
+
+/**
+ * First reason a passing loop cannot go here, or null. Main tiles must be straight plain track
+ * along the loop's axis (no points, crossings, stations or signals), or free land when the line is
+ * not built yet; loop tiles must be free land. railAt(x, y) -> rail_tiles tile or null; classAt from
+ * the map mirror. Returns { code, x, y, detail }.
+ */
+export function loopSiteProblem(loop, railAt, classAt) {
+  for (const [tx, ty] of loop.main) {
+    const t = railAt(tx, ty);
+    if (t) {
+      if (t.kind !== 't' || t.tracks !== loop.axis_bit) {
+        return { code: 'not_straight_at', x: tx, y: ty, detail: t.kind === 't' ? `track bits ${t.tracks} (points, a curve or crossing track), not one straight piece along the loop` : `a ${{ s: 'station', d: 'depot', w: 'waypoint', x: 'level crossing', b: 'bridge head', u: 'tunnel portal' }[t.kind] ?? t.kind} tile` };
+      }
+      if (t.signals) return { code: 'signal_at', x: tx, y: ty, detail: 'the main line already has a signal under the loop; remove it or move the loop' };
+      continue;
+    }
+    const c = classAt(tx, ty);
+    if (c === 'r') return { code: 'not_straight_at', x: tx, y: ty, detail: 'rail of another shape here' };
+    if (!LOOP_OK_CLASSES.has(c)) return { code: 'blocked_at', x: tx, y: ty, detail: `map class '${c}' (not free land or straight track)` };
+  }
+  for (const [tx, ty] of loop.lane) {
+    if (railAt(tx, ty) || classAt(tx, ty) === 'r') return { code: 'loop_side_occupied_at', x: tx, y: ty, detail: 'track already there; pick the other --side or another place' };
+  }
+  return null;
 }
 
 // ---- terminus site search -------------------------------------------------------------------

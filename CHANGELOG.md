@@ -77,6 +77,17 @@ Behaviour changes agents must know:
 - Fix: the rail trace read one-way path signals backwards (`rail_tiles` bit d is a signal facing
   trains that come from neighbour d, per OpenTTD's GetSignalType/HasSignalOnTrackdir), so
   `verify-route` could call a working one-way stretch blocked and a blocked one open.
+- **`build-passing-loop` geometry and safety.** Both sides now have the same `length - 1` clear
+  tiles between the points and the exit signal (the main side had one fewer: the loop's one-way
+  signal moved one tile in); results say `clear_tiles` and `fits_trains_up_to_tiles`.
+  `--train_tiles N` or `--for_vehicle ID` (longest train on that line) sets the default length
+  (train + 2) and refuses a loop that is too short (`loop_too_short`). Before building (GS v9)
+  every main-line tile under the footprint must be straight track along `dir` or free land
+  (`not_straight_at`, `blocked_at`, `signal_at` with `at {x,y}`) and the loop side free
+  (`loop_side_occupied_at`): loops at bends broke lines silently. After a real build:
+  `loop_check` (both directions through the loop) and, with `--for_vehicle`, `route_after`
+  (`connected` | `broken` with `first_gap`; broken sets ok false). `--remove true` with the same
+  arguments takes out the loop track and both signals, including the one on the main track.
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

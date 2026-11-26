@@ -297,3 +297,23 @@ test('road stops and depots: connected, --connect auto, decoded drive-through re
   const dry = await run('build-road-depot', { x: 38, y: 12, front_x: 38, front_y: 11, dry_run: true });
   assert.equal(dry.connected, undefined, 'a dry run builds nothing to check');
 });
+
+test('build-passing-loop: site check, train length, dry run ok, remove', async () => {
+  const sig = await run('build-passing-loop', { x: 15, y: 20, dir: 'sw', length: 4, dry_run: true });
+  assert.deepEqual([sig.ok, sig.first_error, sig.at], [false, 'signal_at', { x: 18, y: 20 }]);
+  const stn = await run('build-passing-loop', { x: 20, y: 20, dir: 'sw', length: 2, dry_run: true });
+  assert.deepEqual([stn.first_error, stn.at], ['not_straight_at', { x: 24, y: 20 }]);
+  assert.match(stn.error, /a station tile/);
+  const short = await run('build-passing-loop', { x: 5, y: 30, length: 4, train_tiles: 5, dry_run: true });
+  assert.equal(short.first_error, 'loop_too_short');
+  const fit = await run('build-passing-loop', { x: 5, y: 30, for_vehicle: 11, dry_run: true });
+  assert.deepEqual([fit.ok, fit.length, fit.train_tiles, fit.clear_tiles, fit.longest_train.vehicle], [true, 7, 5, 6, 11]);
+  assert.equal(fit.site_check, 'ok');
+  const built = await run('build-passing-loop', { x: 5, y: 30, length: 4 });
+  assert.equal(built.ok, true);
+  assert.ok(built.loop_check, 'a real build traces both directions');
+  assert.match(built.route_after, /not_checked/);
+  const rm = await run('build-passing-loop', { x: 5, y: 30, length: 4, remove: true });
+  assert.equal(rm.removed, true);
+  assert.deepEqual(lastExec().steps[0], ['signal_remove', 9, 30, 8, 30]);
+});

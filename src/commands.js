@@ -16,7 +16,7 @@ import { guide } from './guide.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
 import { vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
-import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
+import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
 import { traceRail, traceRoad, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, vehicleProblems, manhattan as tileDistance } from './problems.js';
@@ -577,6 +577,29 @@ async function routeLegs(s, company, tracer, stations, veh) {
     legs.push({ from: from.name, to: to.name, ...brief(await tracer.trace(await tracer.stationStarts(from), to)) });
   }
   return { connected: fromVehicle.every((r) => r.connected) && legs.every((r) => r.connected), from_vehicle: fromVehicle, legs };
+}
+
+/**
+ * Longest train on vehicle `id`'s line (same set of order stations), in tiles (GSVehicle.GetLength
+ * is in 1/16 tile). Looks at trains heading for one of its stations (AgentBridge v9), at most 20.
+ * Returns { tiles, vehicle, trains_checked }.
+ */
+async function longestTrainOnLine(s, company, id) {
+  const veh = await vehicleOf(s, company, id);
+  if (veh.type !== 'rail') throw new Error(`refused: vehicle ${id} is not a train`);
+  const detail = async (vid) => vehicleDetail(await s.gs.call('vehicle', { company, vehicle: vid }), s.cargos);
+  const own = await detail(id);
+  const stops = new Set(own.orders.filter((o) => o.kind === 'station').map((o) => o.station));
+  const same = (d) => { const st = new Set(d.orders.filter((o) => o.kind === 'station').map((o) => o.station)); return st.size === stops.size && [...st].every((x) => stops.has(x)); };
+  let best = { tiles: Math.ceil((own.length ?? 0) / 16), vehicle: id };
+  const others = vehiclesFromRows(await s.gs.call('vehicles', { company }))
+    .filter((v) => v.type === 'rail' && v.id !== id && (v.dest_station === undefined || stops.has(v.dest_station))).slice(0, 20);
+  for (const v of others) {
+    const d = await detail(v.id);
+    const tiles = Math.ceil((d.length ?? 0) / 16);
+    if (same(d) && tiles > best.tiles) best = { tiles, vehicle: v.id };
+  }
+  return { ...best, trains_checked: others.length + 1 };
 }
 
 // ---- depot guard (vehicle-clone, vehicle-buy --route_of) ---------------------------------
@@ -1783,12 +1806,66 @@ export const COMMANDS = [
   },
   {
     name: 'build-passing-loop', group: 'build', session: true,
-    description: 'Template: passing loop for a single-track line. The main track runs length+2 tiles from x,y in direction dir; a second track is laid beside it (side=1 or -1 picks which side) with one-way path signals so trains in each direction take their own track. Existing main track is kept. Needs flat land. Returns the two end tiles to connect to.',
-    args: z.object({ ...act, ...point, dir: z.enum(DIR_NAMES).default('sw').describe('sw=+x, se=+y, ne=-x, nw=-y'), length: int().min(2).max(30).default(6),
-      side: int().default(1), rail_type: int().optional() }),
+    description: 'Template: passing loop for a single-track line. The main track runs length+2 tiles from x,y in direction dir (sw=+x, se=+y, ne=-x, nw=-y); a second track is laid beside it (side=1 or -1) with one-way path signals: trains heading dir use the main track, the others the loop. Both sides have length-1 clear tiles between the points and the exit signal (fits trains up to length-2 tiles). Give --train_tiles N or --for_vehicle ID (the longest train on that vehicle\'s line is used): length then defaults to train+2, and a loop with fewer than train+1 clear tiles is refused (loop_too_short). Checked first (AgentBridge v9): every main-line tile must be straight track along dir, or free land (not_straight_at / blocked_at / signal_at {x,y}); loop tiles must be free (loop_side_occupied_at). After a real build: loop_check (both directions through the loop) and, with --for_vehicle, route_after (connected|broken with first_gap). remove=true with the same x,y,dir,length,side takes the loop track and both signals (including the one on the main track) out again; the main track stays.',
+    args: z.object({ ...act, ...point, dir: z.enum(DIR_NAMES).default('sw').describe('sw=+x, se=+y, ne=-x, nw=-y'), length: int().min(2).max(30).optional().describe('default: train tiles + 2, else 6'),
+      side: int().default(1), rail_type: int().optional(),
+      train_tiles: int().min(1).max(40).optional().describe('longest train that must wait in the loop, in tiles'),
+      for_vehicle: int().optional().describe('a train of this line: its longest train sets train_tiles; also traces its route after the build'),
+      remove: bool().default(false).describe('take out a loop built with the same arguments') }),
     run: async (ctx, a) => {
-      const t = passingLoopSteps({ x: a.x, y: a.y, dir: dirIndex(a.dir), length: a.length, side: a.side < 0 ? -1 : 1 });
-      return { ...(await run(ctx, a, t.steps, { railType: a.rail_type })), ends: t.ends };
+      const { s, company } = await mine(ctx, a);
+      const info = await s.gs.call('info');
+      const train = a.for_vehicle !== undefined ? await longestTrainOnLine(s, company, a.for_vehicle) : null;
+      const trainTiles = a.train_tiles ?? train?.tiles ?? null;
+      const length = a.length ?? (trainTiles ? trainTiles + 2 : 6);
+      if (length > 30) return { ok: false, dry_run: a.dry_run, error: `loop_too_long: trains of ${trainTiles} tiles need length ${length}; the template allows 30`, first_error: 'loop_too_long' };
+      const t = passingLoopSteps({ x: a.x, y: a.y, dir: dirIndex(a.dir), length, side: a.side < 0 ? -1 : 1 });
+      const geometry = { length, clear_tiles: t.clear_tiles, fits_trains_up_to_tiles: t.clear_tiles - 1, ends: t.ends, ...(trainTiles ? { train_tiles: trainTiles } : {}), ...(train ? { longest_train: train } : {}) };
+      if (a.remove) {
+        const res = await run(ctx, a, passingLoopRemoveSteps(t), { keepGoing: true });
+        if (!a.dry_run) await s.refreshArea(a.x - length - 3, a.y - length - 3, a.x + length + 3, a.y + length + 3);
+        return { ...res, removed: !a.dry_run && res.ok, ...geometry };
+      }
+      if (trainTiles && t.clear_tiles < trainTiles + 1) {
+        return { ok: false, dry_run: a.dry_run, error: `loop_too_short: length ${length} leaves ${t.clear_tiles} clear tiles per side; a ${trainTiles}-tile train needs ${trainTiles + 1}. Use --length ${trainTiles + 2} (or leave --length out)`, first_error: 'loop_too_short', ...geometry };
+      }
+      let siteCheck = 'skipped: the running AgentBridge is older than v9 (no rail_tiles)';
+      if ((info.bridge_version ?? 0) >= 9) {
+        const tiles = [...t.main, ...t.lane];
+        const xs = tiles.map((p) => p[0]), ys = tiles.map((p) => p[1]);
+        const box = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+        await s.refreshArea(...box);
+        const rows = await s.gs.call('rail_tiles', { x0: box[0], y0: box[1], x1: box[2], y1: box[3] });
+        const rail = new Map(rows.map((r) => [`${r[0]},${r[1]}`, railTileFromRow(r)]));
+        const problem = loopSiteProblem(t, (x, y) => rail.get(`${x},${y}`) ?? null, (x, y) => s.map.classAt(x, y));
+        if (problem) {
+          return { ok: false, dry_run: a.dry_run, error: `${problem.code}: (${problem.x},${problem.y}) ${problem.detail}. Nothing was built. A loop needs a straight, flat stretch of length+4 tiles of the line (no points, curves or signals) with free land beside it`,
+            first_error: problem.code, at: { x: problem.x, y: problem.y }, ...geometry };
+        }
+        siteCheck = 'ok';
+      }
+      const res = await run(ctx, a, t.steps, { railType: a.rail_type });
+      const out = { ...res, ...geometry, site_check: siteCheck };
+      if (a.dry_run || !res.ok) return out;
+      await s.refreshArea(a.x - length - 3, a.y - length - 3, a.x + length + 3, a.y + length + 3);
+      const tracer = await makeTracer(s, company, await s.gs.call('info'));
+      if (tracer.method === 'rail_tracks') {
+        const [m0, m1] = [t.main[0], t.main.at(-1)];
+        const through = async (from, to) => (await traceRail({ getTile: tracer.tileAt, starts: [{ x: from[0], y: from[1] }], isGoal: (q) => q.x === to[0] && q.y === to[1], goal: { x: to[0], y: to[1] }, company })).connected;
+        out.loop_check = { [`heading_${a.dir}`]: await through(m0, m1), heading_back: await through(m1, m0) };
+        out.loop_check.ok = out.loop_check[`heading_${a.dir}`] && out.loop_check.heading_back;
+      }
+      if (a.for_vehicle !== undefined) {
+        const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+        const veh = await vehicleOf(s, company, a.for_vehicle);
+        const legs = await routeLegs(s, company, tracer, stations, veh);
+        const bad = [...legs.legs, ...legs.from_vehicle].find((r) => !r.connected);
+        out.route_after = legs.connected ? { status: 'connected', method: tracer.method } : { status: 'broken', method: tracer.method, first_gap: bad?.first_gap ?? null, leg: bad?.from ? `${bad.from} -> ${bad.to}` : bad?.station_name ?? null };
+        if (!legs.connected) { out.ok = false; out.error = `route_broken: the line of vehicle ${a.for_vehicle} is broken after the loop was built${bad?.first_gap ? ` (first gap at (${bad.first_gap.x},${bad.first_gap.y}): ${bad.first_gap.reason})` : ''}; undo with the same command and --remove true`; out.first_error = 'route_broken'; }
+      } else {
+        out.route_after = 'not_checked: give --for_vehicle ID to trace a train\'s route through the loop';
+      }
+      return out;
     },
   },
 

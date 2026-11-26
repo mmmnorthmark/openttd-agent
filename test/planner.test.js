@@ -103,9 +103,29 @@ test('passing loop: main track, loop track with four curve pieces, two one-way p
   const t = passingLoopSteps({ x: 20, y: 20, length: 4 });
   assert.deepEqual(t.steps[0], ['rail', 19, 20, 20, 20, 26, 20]);
   assert.equal(t.steps.filter((s) => s[0] === 'rail').length, 6);
-  assert.deepEqual(t.steps.slice(-2), [['signal', 24, 20, 23, 20, 5], ['signal', 21, 21, 22, 21, 5]]);
+  assert.deepEqual(t.steps.slice(-2), [['signal', 24, 20, 23, 20, 5], ['signal', 22, 21, 23, 21, 5]]);
   assert.deepEqual(t.ends, [{ x: 20, y: 20 }, { x: 25, y: 20 }]);
+  // Equal clear run on both sides: main 21..23 (points at 20, signal at 24), loop 23..25 (points at 25,0; signal at 22,1).
+  assert.equal(t.clear_tiles, 3);
+  const mainClear = 24 - 20 - 1, loopClear = 25 - 22;
+  assert.equal(mainClear, loopClear);
   assert.throws(() => passingLoopSteps({ x: 1, y: 1, length: 1 }), /at least 2/);
+});
+
+test('passing loop: site check and remove steps', async () => {
+  const { loopSiteProblem, passingLoopRemoveSteps } = await import('../src/planner.js');
+  const t = passingLoopSteps({ x: 20, y: 20, length: 4 });
+  const straight = (x, y) => (y === 20 ? { kind: 't', tracks: 1, signals: 0 } : null);
+  assert.equal(loopSiteProblem(t, straight, () => 'b'), null);
+  const bend = (x, y) => (y === 20 ? { kind: 't', tracks: x === 23 ? 1 | 8 : 1, signals: 0 } : null);
+  assert.deepEqual(loopSiteProblem(t, bend, () => 'b').code, 'not_straight_at');
+  assert.deepEqual(loopSiteProblem(t, bend, () => 'b').x, 23);
+  assert.equal(loopSiteProblem(t, () => null, (x, y) => (x === 22 && y === 20 ? 'o' : 'b')).code, 'blocked_at');
+  assert.equal(loopSiteProblem(t, (x, y) => (y === 21 && x === 22 ? { kind: 't', tracks: 1, signals: 0 } : straight(x, y)), () => 'b').code, 'loop_side_occupied_at');
+  const rm = passingLoopRemoveSteps(t);
+  assert.deepEqual(rm.slice(0, 2), [['signal_remove', 24, 20, 23, 20], ['signal_remove', 22, 21, 23, 21]]);
+  assert.ok(rm.slice(2).every((st) => st[0] === 'rail_remove'));
+  assert.deepEqual(rm.at(-1), ['rail_remove', 19, 20, 20, 20, 20, 21], 'the points piece on the main track goes last');
 });
 
 test('terminusCandidates: sites stay on flat buildable land within reach, facing `toward`', async () => {
