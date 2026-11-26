@@ -569,3 +569,16 @@ test('sign, signs, sign-remove (v12)', async () => {
   assert.equal((await run('signs', {})).total, 0);
   await assert.rejects(run('sign', { x: 1, y: 1, text: 'x'.repeat(32) }), /31/);
 });
+
+test('vehicle-problems rows carry as_of and days_watched; --fresh restarts the history', async () => {
+  fake.state.trainInDepot = true;
+  try {
+    const r = await run('vehicle-problems', { trace: false });
+    const row = r.problems.find((p) => p.problem === 'stopped_in_depot');
+    assert.ok(row, JSON.stringify(r.problems));
+    assert.equal(typeof row.as_of, 'string');
+    assert.equal(typeof row.days_watched, 'number');
+    const f = await run('vehicle-problems', { trace: false, fresh: true });
+    assert.equal(f.problems.find((p) => p.problem === 'stopped_in_depot').days_watched, 0);
+  } finally { fake.state.trainInDepot = false; }
+});

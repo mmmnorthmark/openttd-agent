@@ -1612,12 +1612,13 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-problems', group: 'operate', session: true,
-    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), stalled_on_line (speed 0 on the same tile for stall_days, not at a station or broken down; the daemon samples every 15 s once vehicle-problems has run), deadlock (two such trains within 16 tiles: reverse one with vehicle-reverse), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot, stopped, old, broken_down, low_reliability, crashed. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
+    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), stalled_on_line (speed 0 on the same tile for stall_days, not at a station or broken down; the daemon samples every 15 s once vehicle-problems has run), deadlock (two such trains within 16 tiles: reverse one with vehicle-reverse), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot (with how long it has been parked), loose_wagons (wagons without a locomotive in a depot), stopped, old, broken_down, low_reliability, crashed. Every row has as_of (game date of this sample) and days_watched (how long the history behind it is); --fresh true starts the history again. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
     args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'),
       stuck_days: int().min(1).default(30).describe('game days without progress before a vehicle counts as stuck or lost'),
       stall_days: int().min(1).default(10).describe('game days standing still on one tile (speed 0, not at a station) before stalled_on_line / deadlock'),
       trace: bool().default(true).describe('check rail (and, AgentBridge v11, road) connectivity to each vehicle\'s destination'),
-      severity: z.enum(['all', 'action', 'info']).default('all').describe('action = only problems that need a command') }),
+      severity: z.enum(['all', 'action', 'info']).default('all').describe('action = only problems that need a command'),
+      fresh: bool().default(false).describe('forget the history kept for your vehicles first and judge on this sample only (after a fix, so old samples do not report it again)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const info = await s.gs.call('info');
@@ -1630,6 +1631,12 @@ export const COMMANDS = [
       const stationById = new Map(stations.map((st) => [st.id, st]));
       s.vehicleHistory ??= new Map();
       s.stallHistory ??= new Map();
+      s.depotHistory ??= new Map();
+      if (a.fresh) for (const h of [s.vehicleHistory, s.stallHistory, s.depotHistory]) for (const k of [...h.keys()]) if (k.startsWith(`${company}:`)) h.delete(k);
+      for (const v of vehicles) {
+        const k = `${company}:${v.id}`;
+        if (v.state !== 'in_depot') s.depotHistory.delete(k); else if (!s.depotHistory.has(k)) s.depotHistory.set(k, info.date);
+      }
       const stalls = new Map(vehicles.map((v) => [v.id, recordStall(s.stallHistory, `${company}:${v.id}`, { date: info.date, x: v.x, y: v.y, speed: v.speed, state: v.state })]));
       const longStalled = vehicles.filter((v) => { const e = stalls.get(v.id); return e && info.date - e.since >= a.stall_days && e.samples >= 2; });
       const partners = deadlockPartners(longStalled);
@@ -1675,8 +1682,9 @@ export const COMMANDS = [
             }
           }
         }
-        for (const p of vehicleProblems(v, { today: info.date, stuckDays: a.stuck_days, progress, reach, line, stall: stalls.get(v.id), stallDays: a.stall_days, partners: partners.get(v.id) })) {
-          if (a.severity === 'all' || a.severity === p.severity) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p });
+        for (const p of vehicleProblems(v, { today: info.date, stuckDays: a.stuck_days, progress, reach, line, stall: stalls.get(v.id), stallDays: a.stall_days, partners: partners.get(v.id), parkedDays: s.depotHistory.has(`${company}:${v.id}`) ? info.date - s.depotHistory.get(`${company}:${v.id}`) : null })) {
+          const seen = [s.vehicleHistory.get(`${company}:${v.id}`)?.first, s.stallHistory.get(`${company}:${v.id}`)?.since, s.depotHistory.get(`${company}:${v.id}`)].filter((d) => d !== undefined);
+          if (a.severity === 'all' || a.severity === p.severity) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p, as_of: gameDate(info), days_watched: seen.length ? info.date - Math.min(...seen) : 0 });
         }
       }
       const samples = vehicles.map((v) => s.vehicleHistory.get(`${company}:${v.id}`)).filter(Boolean);

@@ -150,6 +150,11 @@ Behaviour changes agents must know:
 - New `sign --x --y --text`, `signs`, `sign-remove --ids|--x --y|--text` (GS v12): free company
   signs to mark plots, instead of placing track as a marker (which cost money and could not be
   told apart from real track). Live-tested.
+- `vehicle-problems` rows carry `as_of` (game date of the sample) and `days_watched` (age of the
+  history behind the row); `--fresh true` forgets the history for your vehicles first (after a
+  fix, old samples no longer report it). `stopped_in_depot` says how long the vehicle has been
+  parked; wagons without a locomotive in a depot are `loose_wagons` (they were reported as a
+  parked train with unit number -1).
 
 ## 0.6.0 (2026-11-25)
 

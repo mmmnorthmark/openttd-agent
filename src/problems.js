@@ -75,13 +75,17 @@ const fmtTile = (p) => `(${p.x},${p.y})`;
  */
 export const INFO_PROBLEMS = new Set(['crashed', 'old', 'broken_down', 'low_reliability']);
 
-export function vehicleProblems(v, { today, stuckDays = 30, progress = null, reach = null, line = null, stall = null, stallDays = 10, partners = null } = {}) {
+export function vehicleProblems(v, { today, stuckDays = 30, progress = null, reach = null, line = null, stall = null, stallDays = 10, partners = null, parkedDays = null } = {}) {
   const out = [];
   const add = (problem, evidence, suggested_fix) => out.push({ problem, severity: INFO_PROBLEMS.has(problem) ? 'info' : 'action', evidence, suggested_fix });
   const dest = v.dest_name ? `${v.dest_name} ${v.dest ? fmtTile(v.dest) : ''}`.trim() : v.dest ? fmtTile(v.dest) : 'its destination';
   if (v.state === 'crashed') add('crashed', 'state crashed', 'nothing to do: the wreck disappears; replace the train if the line needs it');
   if (v.order_count === 0) add('no_orders', 'order_count 0', `give it orders: order-add --vehicle ${v.id} (or orders-copy from a working vehicle of the same line)`);
-  if (v.state === 'in_depot') add('stopped_in_depot', `in depot at ${fmtTile(v)}, not started`, `vehicle-start --vehicles ${v.id}, or vehicle-sell --vehicles ${v.id} if it is not needed`);
+  if (v.state === 'in_depot' && v.type === 'rail' && v.unit_number !== undefined && v.unit_number < 1) {
+    add('loose_wagons', `wagons without a locomotive in the depot at ${fmtTile(v)}${parkedDays !== null ? ` for ${parkedDays} days` : ''}`, `vehicle-sell --vehicles ${v.id} (they earn nothing), or attach them to a train in that depot`);
+  } else if (v.state === 'in_depot') {
+    add('stopped_in_depot', `in depot at ${fmtTile(v)}, not started${parkedDays !== null ? `; parked for ${parkedDays} days` : ''}`, `vehicle-start --vehicles ${v.id}, or vehicle-sell --vehicles ${v.id} if it is not needed (parked vehicles earn nothing and lower the rating's min_profit at 2 years old)`);
+  }
   if (v.state === 'stopped') add('stopped', `stopped outside a depot at ${fmtTile(v)}`, `vehicle-start --vehicles ${v.id}`);
 
   const net = v.type === 'road' ? 'road' : 'rail';

@@ -76,3 +76,10 @@ test('stall samples: standing still on one tile builds up, moving clears; two ne
   // Too short a stall: nothing.
   assert.deepEqual(vehicleProblems(v, { today: 105, stall: { x: 5, y: 5, since: 100, samples: 2 }, stallDays: 10 }), []);
 });
+
+test('parked days in stopped_in_depot; loose wagons', () => {
+  const parked = vehicleProblems(train({ state: 'in_depot' }), { today: 50, parkedDays: 40 });
+  assert.match(parked.find((p) => p.problem === 'stopped_in_depot').evidence, /parked for 40 days/);
+  const loose = vehicleProblems(train({ state: 'in_depot', unit_number: -1 }), { today: 50 });
+  assert.deepEqual(loose.map((p) => p.problem), ['loose_wagons']);
+});
