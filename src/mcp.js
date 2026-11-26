@@ -15,11 +15,12 @@ import { log } from './log.js';
 import { VERSION } from './version.js';
 
 const INSTRUCTIONS = `openttd-agent: read an OpenTTD world and build for your company.
+Not connected yet, or no company? Run guide first and follow its next step (read-only, no secrets).
 Start with doctor, then status. Analysis tools (towns, industries, find_cargo_pairs, town_gaps,
 route_effort, airport_sites, companies) are read-only. Build tools act as your configured company
 and are rate limited. Coordinates are tile x,y. The CLI exposes the same commands for scripting:
 \`openttd-agent <command> --arg value\` prints JSON.`;
-const SHORT_INSTRUCTIONS = 'openttd-agent: OpenTTD tools for your company. JSON results; coordinates are tile x,y. Builds take dry_run=true to check the cost first.';
+const SHORT_INSTRUCTIONS = 'openttd-agent: OpenTTD tools for your company. JSON results; coordinates are tile x,y. Builds take dry_run=true to check the cost first. Not connected or no company: run guide (if served) or `openttd-agent guide`.';
 
 const toolName = (command) => command.replaceAll('-', '_');
 

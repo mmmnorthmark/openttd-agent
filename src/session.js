@@ -27,13 +27,15 @@ export class Session {
 
   async connect() {
     const { host, admin_port: port, admin_password: password } = this.cfg;
-    if (!password) throw new Error('no relay and no admin_password configured. Player: openttd-agent configure --relay http://<host-LAN-IP>:47978 --token <token from the host>. Host: openttd-agent launch (generates and saves the admin password).');
+    if (!password) throw new Error('no relay and no admin_password configured. Player: openttd-agent configure --relay http://<host-LAN-IP>:47978 --token <token from the host>. Host: openttd-agent launch (generates and saves the admin password). Not sure which? run: openttd-agent guide');
     this.admin = new AdminClient({ host, port, password, name: `openttd-agent-${process.pid}` });
-    await this.admin.connect();
+    await this.admin.connect().catch((e) => {
+      throw new Error(`${e.message}. Is the server running (openttd-agent launch) and are host/admin_port right? run: openttd-agent guide`);
+    });
     this.admin.subscribe(UPDATE.CHAT, FREQ.AUTOMATIC);
     this.gs = new GSRpc(this.admin);
     this.info = await this.gs.call('info', {}, 10000).catch((e) => {
-      throw new Error(`connected to admin port but the AgentBridge GameScript did not answer: ${e.message}. On the host, run: openttd-agent install-gamescript, then start the game with AgentBridge selected (openttd-agent launch does this).`);
+      throw new Error(`connected to admin port but the AgentBridge GameScript did not answer: ${e.message}. On the host, run: openttd-agent install-gamescript, then start the game with AgentBridge selected (openttd-agent launch does this). Then run: openttd-agent guide`);
     });
     const [cargos, types] = await Promise.all([this.gs.call('cargos'), this.gs.call('industry_types')]);
     this.cargos = new Map(cargos.map((c) => [c.id, c]));
@@ -115,7 +117,7 @@ export class Session {
 
   companyOrThrow(company) {
     const c = company ?? this.cfg.company;
-    if (c === null || c === undefined || Number.isNaN(c)) throw new Error('no company set. Run: openttd-agent companies, then openttd-agent configure --company <id>');
+    if (c === null || c === undefined || Number.isNaN(c)) throw new Error('no company set. Run: openttd-agent companies, then openttd-agent configure --company <id> (or run: openttd-agent guide)');
     return c;
   }
 

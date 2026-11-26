@@ -42,3 +42,8 @@ test('guide (player) with an unreachable relay says so and stops there', async (
   assert.equal(relay.done, false);
   assert.doesNotMatch(JSON.stringify(g), /tok-secret/);
 });
+
+test('guide details drop the "run: openttd-agent guide" hint', async () => {
+  const g = await runCommand({ ...ctx, cfg: { ...ctx.cfg, relay: 'http://127.0.0.1:9', relay_token: 't' } }, 'guide', { role: 'player' });
+  assert.doesNotMatch(g.steps.find((s) => s.id === 'relay').detail, /openttd-agent guide/);
+});

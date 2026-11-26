@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // openttd-agent CLI.
 //   openttd-agent help                      list commands
+//   openttd-agent guide [--role host|player] setup checklist; follow "next"
 //   openttd-agent <command> [--key value]   run a command, JSON result on stdout
 //   openttd-agent <command> --args '{"k":1}'
 //   openttd-agent batch < calls.jsonl        one {"name","args"} per line -> one JSON result per line
@@ -49,7 +50,8 @@ async function execute(name, args, noDaemon) {
 function printHelp() {
   const groups = {};
   for (const c of describeCommands()) (groups[c.group] ??= []).push(c);
-  const lines = [`openttd-agent ${VERSION}`, '', 'Usage: openttd-agent <command> [--key value ...]   (JSON on stdout)', ''];
+  const lines = [`openttd-agent ${VERSION}`, '', 'Usage: openttd-agent <command> [--key value ...]   (JSON on stdout)',
+    'New here, not connected, or no company yet? Run: openttd-agent guide   and follow "next".', ''];
   for (const [g, cmds] of Object.entries(groups)) {
     lines.push(`${g}:`);
     for (const c of cmds) {

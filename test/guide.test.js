@@ -95,3 +95,13 @@ test('guide output never carries secrets', () => {
   const text = JSON.stringify(g);
   assert.doesNotMatch(text, /admin_password"|relay_token|Bearer/);
 });
+
+test('the common unset states point at guide', async () => {
+  const { Session } = await import('../src/session.js');
+  assert.throws(() => new Session({ company: null }).companyOrThrow(), /run: openttd-agent guide/);
+  await assert.rejects(new Session({ admin_password: '' }).connect(), /run: openttd-agent guide/);
+  const { relayHealth, callRelay } = await import('../src/relay-client.js');
+  assert.match((await relayHealth({ relay: 'http://127.0.0.1:9' })).error, /run: openttd-agent guide$/);
+  await assert.rejects(callRelay({ relay: 'http://127.0.0.1:9', relay_token: 't' }, 'status', {}, { timeoutMs: 2000 }), /run: openttd-agent guide$/);
+  await assert.rejects(new Session({ host: '127.0.0.1', admin_port: 9, admin_password: 'x' }).connect(), /run: openttd-agent guide$/);
+});

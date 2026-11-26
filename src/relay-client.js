@@ -4,7 +4,7 @@
 const clean = (url) => String(url).replace(/\/+$/, '');
 
 export async function callRelay(cfg, name, args = {}, { timeoutMs = 10 * 60_000 } = {}) {
-  if (!cfg.relay_token) throw new Error('relay is set but relay_token is not. Run: openttd-agent configure --relay <url> --token <token from the host>');
+  if (!cfg.relay_token) throw new Error('relay is set but relay_token is not. Run: openttd-agent configure --relay <url> --token <token from the host>, or run: openttd-agent guide');
   let res;
   try {
     res = await fetch(`${clean(cfg.relay)}/call`, {
@@ -27,6 +27,6 @@ export async function relayHealth(cfg) {
     const res = await fetch(`${clean(cfg.relay)}/health`, { signal: AbortSignal.timeout(3000) });
     return await res.json();
   } catch (e) {
-    return { ok: false, error: `cannot reach the relay at ${cfg.relay} (${e.cause?.code ?? e.message})` };
+    return { ok: false, error: `cannot reach the relay at ${cfg.relay} (${e.cause?.code ?? e.message}). run: openttd-agent guide` };
   }
 }

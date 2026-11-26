@@ -42,7 +42,7 @@ export function authorize(player, name, rawArgs = {}) {
   if (name === 'rate' && Object.keys(args).length > 0) throw new Refused('changing the rate limit is host-only; `rate` without arguments shows it');
   if ('company' in cmd.args.shape) {
     if (player.company === null || player.company === undefined) {
-      throw new Refused(`player '${player.name}' is not bound to a company yet. Ask the host to run: openttd-agent relay-set-company --name ${player.name} --company <id>`);
+      throw new Refused(`player '${player.name}' is not bound to a company yet. Ask the host to run: openttd-agent relay-set-company --name ${player.name} --company <id>. run: openttd-agent guide`);
     }
     const asked = args.company;
     if (asked !== undefined && asked !== null && asked !== '' && Number(asked) !== player.company) {
@@ -101,7 +101,7 @@ export function startRelay({ port = loadConfig().relay_port, bind = '0.0.0.0' } 
       player = playerForToken(bearer(req), loadPlayers()); // re-read each time: host changes apply at once
       if (!player) {
         audit({ outcome: 'auth_failed', remote });
-        return reply(401, { ok: false, error: 'relay: missing or unknown token. Ask the host for one (openttd-agent relay-add-player), then: openttd-agent configure --relay <url> --token <token>' });
+        return reply(401, { ok: false, error: 'relay: missing or unknown token. Ask the host for one (openttd-agent relay-add-player), then: openttd-agent configure --relay <url> --token <token>. run: openttd-agent guide' });
       }
       const parsed = JSON.parse((await readBody(req)) || '{}');
       name = parsed.name;

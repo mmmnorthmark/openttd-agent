@@ -26,7 +26,8 @@ import { VERSION } from './version.js';
 const GAME_TIMEOUT_MS = 8000;
 const PACKAGE_REF = (version) => `github:mmmnorthmark/openttd-agent#v${version}`;
 
-const short = (msg) => String(msg ?? '').split('\n')[0].slice(0, 240);
+// First line, without the "run: openttd-agent guide" hint that error messages end with (this is guide).
+const short = (msg) => String(msg ?? '').split('\n')[0].replace(/[.,]?\s*(Then |Not sure which\? |or )?run: openttd-agent guide\)?$/i, '').slice(0, 240);
 
 function withTimeout(promise, ms, what) {
   let timer;
@@ -85,12 +86,12 @@ export async function probeSetup(ctx, role) {
   if (wanted === 'host') {
     probes.players = (await attempt(() => listPlayers(), 1000, 'players')).value ?? [];
     const local = await attempt(() => relayHealth({ relay: `http://127.0.0.1:${cfg.relay_port}` }), 4000, 'relay');
-    probes.relay_local = local.ok ? { ok: Boolean(local.value.ok), version: local.value.version ?? null, ...(local.value.ok ? {} : { error: local.value.error }) } : local;
+    probes.relay_local = local.ok ? { ok: Boolean(local.value.ok), version: local.value.version ?? null, ...(local.value.ok ? {} : { error: short(local.value.error) }) } : local;
     probes.game = config.admin_password ? await probeGame(ctx) : { ok: false, error: 'no admin_password in the config (launch generates one)' };
   }
   if (wanted === 'player' && config.relay) {
     const h = await attempt(() => relayHealth(cfg), 4000, 'relay');
-    probes.relay = h.ok ? { ok: Boolean(h.value.ok), version: h.value.version ?? null, ...(h.value.ok ? {} : { error: h.value.error }) } : h;
+    probes.relay = h.ok ? { ok: Boolean(h.value.ok), version: h.value.version ?? null, ...(h.value.ok ? {} : { error: short(h.value.error) }) } : h;
     if (probes.relay.ok && config.token) {
       const s = await attempt(() => callRelay(cfg, 'status', {}, { timeoutMs: GAME_TIMEOUT_MS }), GAME_TIMEOUT_MS + 500, 'status');
       probes.status = s.ok ? { ok: true, my_company: s.value.my_company ?? null } : s;
