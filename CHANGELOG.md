@@ -40,6 +40,9 @@ Behaviour changes agents must know:
   trimmed to what the game window shows anyone (stations without vehicle counts; vehicles as
   `total` and `by_type` only). Every other command stays bound to the player's company.
   `vehicles --summary true` gives the counts for your own company (plus `by_state`).
+- A game without AgentBridge no longer piles up admin connections: a session whose GameScript
+  does not answer closes its admin connection at once (a daemon retrying every call filled the
+  server's admin slots: `read ECONNRESET`). The error names the likely cause and the fix.
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

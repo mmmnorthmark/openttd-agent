@@ -260,8 +260,10 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, money: 100000, loan: 300000, gsVersion: 10, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, money: 100000, loan: 300000, gsVersion: 10, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null };
   const server = net.createServer((sock) => {
+    state.openConnections++;
+    sock.on('close', () => { state.openConnections--; });
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));
     sock.on('data', (chunk) => {
@@ -276,7 +278,7 @@ export function startFakeServer({ password = 'pw' } = {}) {
         } else if (type === PKT.ADMIN_GAMESCRIPT) {
           const req = JSON.parse(r.str());
           received.push(req);
-          const handler = req.cmd === 'owned_land' && state.gsVersion < 10 ? undefined : GS[req.cmd];
+          const handler = (req.cmd === 'owned_land' && state.gsVersion < 10) || (req.cmd === 'info' && state.noGs) ? undefined : GS[req.cmd];
           const base = { id: req.id, client: req.client };
           if (!handler) { send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: false, part: 0, last: true, error: `unknown cmd: ${req.cmd}` }))); continue; }
           let data;

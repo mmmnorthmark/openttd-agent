@@ -102,3 +102,17 @@ test('unknown flags are refused and nothing runs; --help prints command help', a
   const help = (await run(process.execPath, [BIN, 'turn-advance', '--help'], { env })).stdout;
   assert.match(help, /^turn-advance: /);
 });
+
+test('a game without AgentBridge: connect fails with the launch hint and closes its admin connection', async () => {
+  const { startFakeServer } = await import('./fake-server.js');
+  const f2 = await startFakeServer({ password: 'pw' });
+  f2.state.noGs = true;
+  const { Session } = await import('../src/session.js');
+  try {
+    for (let i = 0; i < 3; i++) {
+      await assert.rejects(new Session({ host: '127.0.0.1', admin_port: f2.port, admin_password: 'pw', tile_refresh_rows_per_sec: 0 }).connect(), /did not answer.*\[game_scripts\]/);
+    }
+    for (let i = 0; i < 50 && f2.state.openConnections > 0; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(f2.state.openConnections, 0, 'no admin connection left open');
+  } finally { f2.server.close(); }
+});

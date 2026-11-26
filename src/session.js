@@ -35,9 +35,14 @@ export class Session {
     this.admin.subscribe(UPDATE.CHAT, FREQ.AUTOMATIC);
     this.gs = new GSRpc(this.admin);
     this.info = await this.gs.call('info', {}, 10000).catch((e) => {
-      throw new Error(`connected to admin port but the AgentBridge GameScript did not answer: ${e.message}. On the host, run: openttd-agent install-gamescript, then start the game with AgentBridge selected (openttd-agent launch does this). Then run: openttd-agent guide`);
+      // Close at once: a daemon retrying every call must not pile up admin connections (the
+      // server refuses new ones once its admin slots are full: "read ECONNRESET").
+      this.close();
+      throw new Error(`connected to admin port but the AgentBridge GameScript did not answer: ${e.message}. The game is running without AgentBridge. `
+        + 'On the host: openttd-agent install-gamescript, then start the game again with openttd-agent launch (it writes [game_scripts] so AgentBridge is the only game script; '
+        + 'an entry copied from your own openttd.cfg, e.g. "none =", used to win). A loaded save runs the GameScript stored in it: prepare it with scenario-prepare. Then run: openttd-agent guide');
     });
-    const [cargos, types] = await Promise.all([this.gs.call('cargos'), this.gs.call('industry_types')]);
+    const [cargos, types] = await Promise.all([this.gs.call('cargos'), this.gs.call('industry_types')]).catch((e) => { this.close(); throw e; });
     this.cargos = new Map(cargos.map((c) => [c.id, c]));
     this.types = new Map(types.map((t) => [t.id, t]));
     this.map = new TileMap(this.info.map_x, this.info.map_y);
