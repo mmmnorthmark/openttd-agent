@@ -23,6 +23,7 @@ import { traceRail, traceRoad, trackExits, adjacencyTrace, mirrorStationTiles, r
 import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
+import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
 
 const int = () => z.coerce.number().int();
@@ -580,6 +581,138 @@ async function buildCargoRoute(s, company, a) {
   } catch (e) {
     const last = built.at(-1)?.step ?? null;
     return fail(last ? `after ${last}` : 'source_station', e.message, { spent });
+  }
+}
+
+// ---- build-truck-route ------------------------------------------------------------------
+
+/**
+ * Composite road route: a truck (or bus) stop at each end, a road between them (reusing roads),
+ * a depot beside it near the source, road vehicles with orders, started, and a road trace.
+ * Mirrors buildCargoRoute: every placement is dry-run first; a failure reports what was built.
+ */
+async function buildTruckRoute(s, company, a) {
+  const plan = { dry_run: a.dry_run, company };
+  const built = [];
+  const fail = (step, error, extra = {}) => ({ ok: false, failed_step: step, error, first_error: errorCode(error), cost: extra.spent ?? 0, built, ...plan, ...extra,
+    hint: built.length ? 'nothing was demolished: continue from the failed step by hand (build-road-path, build-road-depot, vehicle-buy) using the tiles in built' : 'nothing was built' });
+  const cargo = cargoId(s.cargos, a.cargo);
+  const cargoInfo = s.cargos.get(cargo);
+  const bus = !!(cargoInfo?.passengers);
+  const from = a.from_industry !== undefined ? { industry: a.from_industry } : { town: a.from_town };
+  const to = a.to_industry !== undefined ? { industry: a.to_industry } : { town: a.to_town };
+  const [economy] = await Promise.all([s.economy(), s.ensureTiles()]);
+  const A = lineEnd(s, economy, from), B = lineEnd(s, economy, to);
+  const box = [Math.min(A.point[0], B.point[0]) - a.margin, Math.min(A.point[1], B.point[1]) - a.margin, Math.max(A.point[0], B.point[0]) + a.margin, Math.max(A.point[1], B.point[1]) + a.margin];
+  await s.refreshArea(...box);
+  const stopSteps = (c) => [['road_station', c.x, c.y, c.front_x, c.front_y, !bus, c.drive_through, -1], ...(c.drive_through ? [] : [['road', c.front_x, c.front_y, c.x, c.y]])];
+  const pickStop = async (end, other, needAccept) => {
+    const cands = end.kind === 'town'
+      ? [...townStopCandidates(s.map, { cx: end.point[0], cy: end.point[1], radius: a.radius }), ...truckStopCandidates(s.map, { targets: [end.point], catchment: Math.min(a.radius, 4), toward: other.point })]
+      : truckStopCandidates(s.map, { targets: end.targets, catchment: 3, toward: other.point });
+    let tried = 0;
+    for (const c of cands) {
+      if (tried >= 16) break;
+      tried++;
+      const dry = await s.exec(company, stopSteps(c), { dryRun: true });
+      if (!dry.ok) continue;
+      if (needAccept) {
+        const lists = await acceptanceAt(s, [[c.x, c.y]], { radius: 3, cargos: [cargo] });
+        const acc = lists ? (lists[0][0]?.acceptance ?? 0) : null;
+        if (acc !== null && acc < ACCEPTED) continue;
+        return { ...c, cost: dry.cost, acceptance: acc };
+      }
+      return { ...c, cost: dry.cost };
+    }
+    return { none: true, candidates: cands.length, tried };
+  };
+  const src = await pickStop(A, B, false);
+  if (src.none) return fail('source_stop', `no ${bus ? 'bus' : 'truck'} stop site passed near ${A.what} (${src.candidates} candidates, ${src.tried} dry runs)`);
+  const dst = await pickStop(B, A, true);
+  if (dst.none) return fail('dest_stop', `no ${bus ? 'bus' : 'truck'} stop site near ${B.what} passed and accepts ${cargoInfo?.name ?? a.cargo} (${dst.candidates} candidates, ${dst.tried} dry runs)`);
+  plan.source_stop = { target: A.what, ...src };
+  plan.dest_stop = { target: B.what, ...dst };
+  const cells = new Map();
+  for (const c of [src, dst]) if (!c.drive_through) cells.set(`${c.x},${c.y}`, 's');
+  const view = overlayMap(s.map, cells);
+  const road = planPath(view, stopConnect(src), stopConnect(dst), { mode: 'road', margin: a.margin, maxBridge: a.max_bridge });
+  if (!road.reachable) return fail('road', road.reason ?? 'no road path between the two stops');
+  const roadPlan = roadSteps(road, { bridgeType: -1 });
+  const roadCheck = await s.exec(company, roadPlan, { dryRun: true });
+  plan.road = { ...road.stats, cost: roadCheck.cost };
+  if (!roadCheck.ok) return fail('road', `road dry run failed: ${roadCheck.error}`);
+  const pathCellsMap = new Map(cells);
+  for (const [x, y] of road.tiles) pathCellsMap.set(`${x},${y}`, 'd');
+  const depotView = overlayMap(s.map, pathCellsMap);
+  let depot = null;
+  for (const d of roadDepotCandidates(depotView, road.tiles, stopConnect(src), { skip: new Set([`${src.x},${src.y}`, `${dst.x},${dst.y}`]) })) {
+    const dry = await s.exec(company, [['road_depot', d.x, d.y, d.front_x, d.front_y], ['road', d.front_x, d.front_y, d.x, d.y]], { dryRun: true });
+    if (dry.ok) { depot = { ...d, cost: dry.cost }; break; }
+  }
+  if (!depot) return fail('depot', 'no depot spot beside the planned road passed its dry run');
+  plan.depot = depot;
+  const engines = enginesFromRows(await s.gs.call('engines', { company, type: 1, cargo }), s.cargos);
+  let truck;
+  try { truck = pickTruck(engines, { cargoId: cargo, engine: a.engine }); } catch (e) { return fail('engine', e.message); }
+  plan.vehicle = { id: truck.id, name: truck.name, price: truck.price, capacity: truck.capacity, running_cost: truck.running_cost, count: a.vehicles };
+  const orders = routeOrderFlags({ passengerOrMail: !!(cargoInfo?.passengers || cargoInfo?.mail), fromTown: from.town !== undefined, toTown: to.town !== undefined });
+  plan.orders = { source: orders.source_flags || 'plain', dest: orders.dest_flags || 'plain' };
+  const estimate = src.cost + dst.cost + roadCheck.cost + depot.cost + truck.price * a.vehicles;
+  plan.estimated_cost = estimate;
+  plan.money = roadCheck.money;
+  plan.affordable = roadCheck.money === null || roadCheck.money >= estimate;
+  if (a.dry_run) return { ok: true, ...plan, cost: estimate, vehicles: [], built: [], note: 'dry run: nothing was built' };
+  if (!plan.affordable) return fail('money', `estimated cost ${estimate} is more than the company has (${roadCheck.money})`);
+
+  const exec = async (steps) => { s.throttleBuild(); return s.exec(company, steps); };
+  let spent = 0;
+  try {
+    const before = new Set(stationsFromRows(await s.gs.call('stations', { company }), s.cargos).map((st) => st.id));
+    const stopIds = [];
+    for (const [name, c] of [['source_stop', src], ['dest_stop', dst]]) {
+      const res = await exec(stopSteps(c));
+      spent += res.cost;
+      if (!res.ok) return fail(name, res.error, { spent });
+      const now = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const st = now.find((q) => !before.has(q.id) && !stopIds.includes(q.id)) ?? now.find((q) => tileDistance(q, c) <= 1);
+      stopIds.push(st?.id ?? null);
+      built.push({ step: name, station: st?.id ?? null, x: c.x, y: c.y, drive_through: c.drive_through, complete: true, cost: res.cost });
+    }
+    const roadRes = await exec(roadPlan);
+    spent += roadRes.cost;
+    built.push({ step: 'road', tiles: road.stats.tiles, complete: roadRes.ok, cost: roadRes.cost });
+    if (!roadRes.ok) return fail('road', roadRes.error, { spent });
+    const depRes = await exec([['road_depot', depot.x, depot.y, depot.front_x, depot.front_y], ['road', depot.front_x, depot.front_y, depot.x, depot.y]]);
+    spent += depRes.cost;
+    built.push({ step: 'depot', x: depot.x, y: depot.y, front: { x: depot.front_x, y: depot.front_y }, complete: depRes.ok, cost: depRes.cost });
+    if (!depRes.ok) return fail('depot', depRes.error, { spent });
+    const refit = truck.cargo === cargo ? -1 : cargo;
+    const buy = await exec(Array.from({ length: a.vehicles }, () => ['veh_buy', depot.x, depot.y, truck.id, refit, -1]));
+    spent += buy.cost;
+    const ids = buy.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
+    built.push({ step: 'buy_vehicles', vehicles: ids, of: a.vehicles, complete: buy.ok, cost: buy.cost });
+    if (!ids.length) return fail('buy_vehicles', buy.error, { spent });
+    const [first, ...rest] = ids;
+    const ord = await exec([['order_add', first, src.x, src.y, orders.source, -1], ['order_add', first, dst.x, dst.y, orders.dest, -1],
+      ...rest.map((v) => ['orders_copy', v, first, true]), ...ids.map((v) => ['veh_start_stop', v, 1])]);
+    built.push({ step: 'orders_and_start', vehicles: ids, complete: ord.ok });
+    if (!ord.ok) return fail('orders', ord.error, { spent, vehicles: ids });
+    let verify = null;
+    const tracer = makeRoadTracer(s, company, await s.gs.call('info'));
+    if (tracer && stopIds.every((id) => id !== null)) {
+      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const [sa, sb] = stopIds.map((id) => stations.find((q) => q.id === id));
+      const there = await tracer.trace(await tracer.stationStarts(sa), sb);
+      const back = await tracer.trace(await tracer.stationStarts(sb), sa);
+      verify = { connected: there.connected && back.connected, there: there.connected, back: back.connected, ...(there.connected ? {} : { first_gap: there.first_gap ?? null }) };
+    }
+    const ok = !verify || verify.connected;
+    return { ok, ...(ok ? {} : { error: `route_broken: the road does not join both stops (see verify)`, first_error: 'route_broken' }), ...plan, dry_run: false,
+      source_station: stopIds[0], dest_station: stopIds[1], depot: { x: depot.x, y: depot.y }, vehicles: ids, cost: spent, built, verify: verify ?? 'not checked (needs AgentBridge v11)',
+      next: `vehicle-clone --vehicle ${first} --depot_x ${depot.x} --depot_y ${depot.y} --start true adds vehicles with the same orders` };
+  } catch (e) {
+    const last = built.at(-1)?.step ?? null;
+    return fail(last ? `after ${last}` : 'source_stop', e.message, { spent });
   }
 }
 
@@ -2396,6 +2529,23 @@ export const COMMANDS = [
       if ((a.from_industry !== undefined) === (a.from_town !== undefined)) throw new Error('give exactly one of --from_industry, --from_town');
       if ((a.to_industry !== undefined) === (a.to_town !== undefined)) throw new Error('give exactly one of --to_industry, --to_town');
       return buildCargoRoute(s, company, a);
+    },
+  },
+  {
+    name: 'build-truck-route', group: 'build', session: true,
+    description: 'Composite: a whole road route in one call, the road twin of build-cargo-route. A truck stop (bus stop for passengers) at each end: a bay stop within 3 tiles of an industry, or a drive-through stop on a straight town road near the centre (else a bay stop); the destination stop must accept the cargo. A road between them (reusing existing roads, bridging where it must), a depot beside it near the source, --vehicles road vehicles (cheapest to run per capacity unless --engine; refitted to the cargo), orders (full_load_any at the source, unload,no_load at the destination; passengers between towns plain), started, and a road trace both ways (verify, AgentBridge v11). dry_run=true checks every placement and returns estimated_cost. Example: --from_industry 6 --to_industry 9 --cargo coal --dry_run true',
+    args: z.object({
+      ...act,
+      from_industry: int().optional(), from_town: z.string().optional(), to_industry: int().optional(), to_town: z.string().optional(),
+      cargo: z.string().describe('cargo name or label (see cargos)'), engine: int().optional().describe('road vehicle engine id (engines --type road --cargo <c>)'),
+      vehicles: int().min(1).max(20).default(2), radius: int().min(2).max(12).default(4).describe('town ends: how far from the centre to look for a stop'),
+      margin: int().min(2).max(80).default(20), max_bridge: int().min(3).max(40).default(12),
+    }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      if ((a.from_industry !== undefined) === (a.from_town !== undefined)) throw new Error('give exactly one of --from_industry, --from_town');
+      if ((a.to_industry !== undefined) === (a.to_town !== undefined)) throw new Error('give exactly one of --to_industry, --to_town');
+      return buildTruckRoute(s, company, a);
     },
   },
   {

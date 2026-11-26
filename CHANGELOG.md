@@ -195,6 +195,13 @@ Behaviour changes agents must know:
   passing loops on its track, refuses with `needs_loop` when the trains would outnumber loops + 1,
   else clones T on its own route, starts it and traces the new train's route (`verify`).
   Live-tested: refused on a 3-train/1-loop line, added on a 2-train/2-loop line (connected).
+- New `build-truck-route` (the road twin of build-cargo-route): truck (or bus) stop at each end
+  (bay stop by an industry; drive-through on a straight town road near the centre, else a bay
+  stop; the destination must accept the cargo), a road between them reusing existing roads, a
+  depot beside it, `--vehicles N` road vehicles with shared orders, started, then a road trace both
+  ways (`verify`). Every placement is dry-run first; `--dry_run true` returns `estimated_cost`.
+  Live-tested: coal mine to power station, 25 road tiles, 2 trucks, verify connected both ways,
+  the first truck loaded coal and left.
 
 ## 0.6.0 (2026-11-25)
 

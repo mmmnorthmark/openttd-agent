@@ -267,7 +267,8 @@ const GS = {
     [5, 'Kirby Paul Tank', 0xFF, 0, 64, 8000, 800, 75, 7300, 1925, 300, 47, false, 0],
     [27, 'Wood Truck', 7, 30, 0, 1500, 0, 0, 0, 1925, 0, 18, true, 0],
     [6, 'SH 8P', 0xFF, 0, 128, 21000, 1800, 80, 7300, 1954, 1000, 85, false, 0],
-  ].filter((r) => a.type === 0 && (a.cargo === undefined || a.cargo === 7)),
+  ].filter((r) => a.type === 0 && (a.cargo === undefined || a.cargo === 7))
+    .concat(a.type === 1 && (a.cargo === undefined || a.cargo === 7) ? [[40, 'Wood Truck R', 7, 20, 48, 4000, 400, 80, 5475, 1935, 0, 0, false, 0]] : []),
   groups: () => [[2, 'Wood line', 0, -1, 1, -1200, -3000, 40]],
   depots: (a, state) => (a.type === 0 ? [[13, 22, 0, 13, 21], [12, 22, 0, 12, 23], [31, 41, 0, 31, 40]] : a.type === 1 ? [[36, 8, 0, 36, 9]] : []).map((r) => (state.gsVersion >= 12 ? r : r.slice(0, 3))),
   autorenew: () => ({ enabled: false, months: 6, money: 100000 }),

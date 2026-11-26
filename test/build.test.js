@@ -382,3 +382,17 @@ test('road-types; --road_type reaches exec for road builds; engines --road_type'
   await run('build-road-depot', { x: 5, y: 5, front_x: 5, front_y: 6, road_type: 1, dry_run: true });
   assert.equal(fake.received.filter((q) => q.cmd === 'exec').at(-1).args.road_type, 1);
 });
+
+test('build-truck-route: dry run picks stops, road, depot and trucks; a real build starts and verifies', async () => {
+  const dry = await run('build-truck-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true });
+  assert.equal(dry.ok, true, JSON.stringify(dry).slice(0, 500));
+  assert.equal(dry.vehicle.id, 40);
+  assert.ok(dry.road.tiles > 10);
+  assert.ok(dry.estimated_cost > 0);
+  assert.equal(dry.dest_stop.acceptance >= 8, true);
+  const res = await run('build-truck-route', { from_industry: 1, to_industry: 2, cargo: 'wood', vehicles: 2 });
+  assert.deepEqual(res.built.map((b) => b.step), ['source_stop', 'dest_stop', 'road', 'depot', 'buy_vehicles', 'orders_and_start'], JSON.stringify(res).slice(0, 500));
+  const last = fake.received.filter((q) => q.cmd === 'exec').map((q) => q.args.steps).findLast((st) => st.some((x) => x[0] === 'order_add'));
+  assert.ok(last.some((x) => x[0] === 'orders_copy'));
+  assert.equal(last.filter((x) => x[0] === 'veh_start_stop').length, 2);
+});
