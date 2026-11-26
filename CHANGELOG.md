@@ -164,6 +164,10 @@ Behaviour changes agents must know:
   a shorter platform and one platform; `source_fallback` / `dest_fallback` say what was asked and
   what worked (it failed with `no terminus site passed`). `warnings[]` lists your stations within
   8 tiles of a new terminus (`near_own_station`, `end`, `tiles`). Live-tested (dry runs).
+- `depots` rows have `front` and `exit_dir` (GS v12). `build-rail-depot` returns `exit_dir`,
+  `front_joined` and `front_leads` (where a train leaving it can go) with a warning when nothing
+  joins the entrance or trains can leave one way only (a new train then ran to the far end of the
+  line to turn round, which looked lost).
 
 ## 0.6.0 (2026-11-25)
 

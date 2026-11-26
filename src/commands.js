@@ -18,7 +18,7 @@ import { ratingTable, vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMat
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
-import { traceRail, traceRoad, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
+import { traceRail, traceRoad, trackExits, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
@@ -228,6 +228,21 @@ async function stationSites(s, company, end, toward, { platforms = 2, length = 4
   }
   return { target: here.what, candidates_on_map: cands.length, dry_runs: checked, sites,
     ...(sites.length ? {} : { hint: `no site passed: try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform` }) };
+}
+
+/**
+ * Does track on a depot's front tile reach the depot entrance? `front`: rail_tiles tile or null;
+ * `dir`: direction from the depot to its front. Returns { front_joined, front_leads: [dir names], warning? }.
+ */
+export function depotFrontCheck(front, dir, company) {
+  const back = (dir + 2) % 4; // the front tile's edge that faces the depot
+  if (!front || front.kind !== 't' || (company !== undefined && front.owner !== company)) {
+    return { front_joined: false, front_leads: [], warning: `nothing joins the depot yet: lay track on the front tile and connect it (build-track / build-rail from the front)` };
+  }
+  const exits = trackExits(front.tracks, back);
+  const leads = exits.map((e) => DIR_NAMES[e]);
+  if (!exits.length) return { front_joined: false, front_leads: [], warning: 'the track on the front tile does not reach the depot entrance (it runs past it): add a piece from the entrance with build-track' };
+  return { front_joined: true, front_leads: leads, ...(leads.length === 1 ? { warning: `trains leaving the depot can only head ${leads[0]}: a new train runs that way first (to the next station or line end to turn round). Add a piece the other way for both directions` } : {}) };
 }
 
 /** Terminus search options to try in order for a town end: as asked, wider, shorter, one platform, all three. */
@@ -1797,11 +1812,14 @@ export const COMMANDS = [
   },
   {
     name: 'depots', group: 'operate', session: true,
-    description: 'Your depots (or hangars) of one type with the number of vehicles inside. Vehicles are bought and cloned at a depot tile.',
+    description: 'Your depots (or hangars) of one type with the number of vehicles inside and, for rail and road depots (AgentBridge v12), front (the tile vehicles leave onto) and exit_dir (sw/se/ne/nw). Vehicles are bought and cloned at a depot tile.',
     args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).default('rail') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const rows = (await s.gs.call('depots', { company, type: vehicleTypeId(a.type) })).map(([x, y, vehicles]) => ({ x, y, vehicles }));
+      const rows = (await s.gs.call('depots', { company, type: vehicleTypeId(a.type) })).map(([x, y, vehicles, fx, fy]) => {
+        const d = fx === undefined || fx < 0 ? -1 : TRACE_DIRS.findIndex(([dx, dy]) => x + dx === fx && y + dy === fy);
+        return { x, y, vehicles, ...(d >= 0 ? { front: { x: fx, y: fy }, exit_dir: DIR_NAMES[d] } : {}) };
+      });
       return { type: a.type, ...listResult('depots', rows, rows) };
     },
   },
@@ -2111,9 +2129,21 @@ export const COMMANDS = [
   },
   {
     name: 'build-rail-depot', group: 'build', session: true,
-    description: 'Build a rail depot at x,y with its entrance facing front (a tile next to it that has or will get track). Connect it with build-rail using the front tile as an anchor.',
+    description: 'Build a rail depot at x,y with its entrance facing front (a tile next to it that has or will get track). Connect it with build-rail using the front tile as an anchor. The result has exit_dir and (AgentBridge v9) front_joined: whether track on the front tile reaches the entrance, and front_leads (the ways a train leaving the depot can go from there); a warning when nothing joins it yet or when trains can leave in one direction only (every new train then runs that way first, e.g. to the far end of the line to turn).',
     args: z.object({ ...act, ...point, ...front, rail_type: int().optional() }),
-    run: (ctx, a) => run(ctx, a, [['rail_depot', a.x, a.y, a.front_x, a.front_y]], { railType: a.rail_type }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const res = await run(ctx, a, [['rail_depot', a.x, a.y, a.front_x, a.front_y]], { railType: a.rail_type });
+      const dir = TRACE_DIRS.findIndex(([dx, dy]) => a.x + dx === a.front_x && a.y + dy === a.front_y);
+      const out = { ...res, exit_dir: DIR_NAMES[dir] ?? null };
+      if (dir < 0 || !res.ok) return out;
+      let t = null;
+      try { t = (await s.gs.call('rail_tiles', { x0: a.front_x, y0: a.front_y, x1: a.front_x, y1: a.front_y }))[0]; } catch { return out; }
+      const front = t ? railTileFromRow(t) : null;
+      const { warning, ...joined } = depotFrontCheck(front, dir, company);
+      Object.assign(out, joined, warning ? { warnings: [warning] } : {});
+      return out;
+    },
   },
   {
     name: 'build-line-depot', group: 'build', session: true,

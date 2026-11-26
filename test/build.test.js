@@ -347,3 +347,19 @@ test('build-cargo-route: town fallbacks; warnings for own stations near a new te
   assert.equal(res.ok, true, JSON.stringify(res).slice(0, 400));
   assert.ok(res.warnings.some((w) => w.near_own_station.id === 3 && w.end === 'source'), JSON.stringify(res.warnings));
 });
+
+test('depots: front and exit_dir (v12); build-rail-depot checks its front', async () => {
+  const { depotFrontCheck } = await import('../src/commands.js');
+  const res = await run('depots', {});
+  assert.deepEqual(res.depots[0], { x: 13, y: 22, vehicles: 0, front: { x: 13, y: 21 }, exit_dir: 'nw' });
+  // Depot (13,22) faces nw onto (13,21), straight track along y: trains can only leave towards nw (-y).
+  assert.deepEqual(depotFrontCheck({ kind: 't', tracks: 2, owner: 0 }, 3, 0).front_leads, ['nw']);
+  assert.match(depotFrontCheck({ kind: 't', tracks: 2, owner: 0 }, 3, 0).warning, /only head nw/);
+  assert.equal(depotFrontCheck({ kind: 't', tracks: 1, owner: 0 }, 3, 0).front_joined, false);
+  assert.equal(depotFrontCheck(null, 3, 0).front_joined, false);
+  // Front with a junction: straight along y plus the curve from its se edge to sw (8): leaves nw or sw.
+  assert.deepEqual(depotFrontCheck({ kind: 't', tracks: 2 | 8, owner: 0 }, 3, 0).front_leads.sort(), ['nw', 'sw']);
+  const b = await run('build-rail-depot', { x: 13, y: 22, front_x: 13, front_y: 21 });
+  assert.equal(b.exit_dir, 'nw');
+  assert.equal(b.front_joined, true);
+});

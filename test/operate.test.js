@@ -64,7 +64,7 @@ test('engines: cargo name resolved, newest first, wagons filter; groups; depots'
   assert.deepEqual((await run('engines', { type: 'rail', wagons: true })).engines.map((e) => e.name), ['Wood Truck']);
   await assert.rejects(run('engines', { type: 'rail', cargo: 'unobtainium' }), /no cargo matching/);
   assert.equal((await run('groups', {})).groups[0].profit_last_year, -3000);
-  assert.deepEqual((await run('depots', { type: 'rail' })).depots[0], { x: 13, y: 22, vehicles: 0 });
+  assert.deepEqual((await run('depots', { type: 'rail' })).depots[0], { x: 13, y: 22, vehicles: 0, front: { x: 13, y: 21 }, exit_dir: 'nw' });
 });
 
 test('events: since filter and latest_seq', async () => {
