@@ -13,7 +13,7 @@ token bound to one company. Players who are not hosting use the `openttd-join-ga
 ## Commands in this skill
 
 Every example writes `openttd-agent ...`. Unless it is installed globally, run it as
-`npx -y github:mmmnorthmark/openttd-agent#<tag> ...` with one release tag (for example `v0.6.0`) and
+`npx -y github:mmmnorthmark/openttd-agent#<tag> ...` with one release tag (for example `v0.7.0`) and
 tell every player to use the **same tag**. All commands print JSON; `openttd-agent help` and
 `openttd-agent <command> --help` show what exists. Unknown flags are refused.
 

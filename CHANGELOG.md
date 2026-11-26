@@ -3,7 +3,9 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
-## Unreleased (next: 0.7.0)
+## 0.7.0 (2026-11-26)
+
+AgentBridge GameScript v12: hosts must run `install-gamescript` and reload the game. Older GameScripts get clear refusals or fallbacks. List outputs and `first_error` changed shape (below), so scripts that parse them need updating.
 
 Behaviour changes agents must know:
 
