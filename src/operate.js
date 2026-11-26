@@ -152,3 +152,23 @@ export function goalFromRow(g) {
   return { company: g.company, status: g.status, deadline_year: g.deadline_year, days_left: g.days_left, set_date: g.set_date,
     targets: g.targets.map(([cargo, amount, progress, done]) => ({ cargo, amount, progress, pct: Math.min(100, Math.floor((progress * 100) / amount)), done })) };
 }
+
+/**
+ * A route you already run between two ends: one of your rail stations near each end (within
+ * `radius` tiles of any target tile), the source one already handling `cargo` (it has a rating).
+ * Passengers and mail (`bothWays`) also match the reverse direction and need no rating: a rating
+ * lapses once no train has loaded for a while, and a stalled passenger line is still that line.
+ * `ends`: lineEnd() results.
+ * Returns { from_station, to_station } or null.
+ */
+export function findExistingRoute(stations, srcEnd, dstEnd, cargo, { radius = 8, bothWays = false } = {}) {
+  const near = (st, end) => end.targets.some(([x, y]) => Math.max(Math.abs(st.x - x), Math.abs(st.y - y)) <= radius);
+  const rail = stations.filter((st) => st.facilities.includes('rail'));
+  const handles = (st) => bothWays || st.cargo.some((c) => c.cargo === cargo);
+  const match = (a, b) => {
+    const from = rail.find((st) => near(st, a) && handles(st));
+    const to = from && rail.find((st) => st.id !== from.id && near(st, b));
+    return from && to ? { from_station: { id: from.id, name: from.name }, to_station: { id: to.id, name: to.name } } : null;
+  };
+  return match(srcEnd, dstEnd) ?? (bothWays ? match(dstEnd, srcEnd) : null);
+}

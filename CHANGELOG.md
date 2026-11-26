@@ -10,6 +10,10 @@ re-run `install-gamescript` when it changes.
   `--severity action|info` filters; the reply adds `vehicles_needing_action`. The fixes for
   breakdowns and low reliability no longer suggest a plain `vehicle-depot`, which stopped working
   trains in the depot (an agent then restarted them, over and over, in a live game).
+- `build-cargo-route` refuses (`failed_step: existing_route`) when your rail stations already
+  serve both ends: near the source and handling the cargo, near the destination; passengers and
+  mail in either direction. Clone a train instead, or pass `--allow_existing true`. (A live agent
+  built the same town pair twice, once each way.)
 - Fix: `--help` on the built-ins (`daemon-stop`, `daemon`, `mcp`, `relay`, `batch`, `commands`,
   `version`) said "unknown command".
 

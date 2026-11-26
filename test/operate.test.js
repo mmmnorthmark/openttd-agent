@@ -277,3 +277,16 @@ test('vehicle-clone: refuses a depot off the route, auto picks a joined one, ski
   const road = await run('vehicle-clone', { vehicle: 12, depot_x: 41, depot_y: 8, dry_run: true });
   assert.match(road.route_check, /road vehicle/);
 });
+
+test('findExistingRoute: own rail stations at both ends, source handling the cargo; passengers both ways', async () => {
+  const { findExistingRoute } = await import('../src/operate.js');
+  const st = (id, x, y, cargo = [], facilities = ['rail']) => ({ id, name: `S${id}`, x, y, facilities, cargo: cargo.map((c) => ({ cargo: c })) });
+  const a = { targets: [[10, 10]] }, b = { targets: [[40, 40]] };
+  assert.deepEqual(findExistingRoute([st(1, 12, 11, [0]), st(2, 41, 38)], a, b, 0), { from_station: { id: 1, name: 'S1' }, to_station: { id: 2, name: 'S2' } });
+  assert.equal(findExistingRoute([st(1, 12, 11, [5]), st(2, 41, 38)], a, b, 0), null, 'source station does not handle this cargo');
+  assert.equal(findExistingRoute([st(1, 12, 11, [0], ['truck']), st(2, 41, 38)], a, b, 0), null, 'not a rail station');
+  assert.equal(findExistingRoute([st(1, 30, 30, [0]), st(2, 41, 38)], a, b, 0), null, 'too far from the source');
+  const rev = [st(1, 41, 38, [0]), st(2, 12, 11)];
+  assert.equal(findExistingRoute(rev, a, b, 0), null, 'one-way cargo: a route the other way is a different route');
+  assert.equal(findExistingRoute(rev, a, b, 0, { bothWays: true })?.from_station.id, 2, 'passengers: any rail stations at both towns, rating or not');
+});

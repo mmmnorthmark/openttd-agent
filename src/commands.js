@@ -13,7 +13,7 @@ import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
-  encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow } from './operate.js';
+  encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
 import { traceRail, adjacencyTrace, mirrorStationTiles, railTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
@@ -241,6 +241,19 @@ async function buildCargoRoute(s, company, a) {
   const railType = a.rail_type ?? [...railTypes].sort((p, q) => p[3] - q[3])[0]?.[0];
   if (railType === undefined) throw new Error('your company cannot build any rail type yet (see rail-types)');
   plan.rail_type = railType;
+
+  // 0. Already running this route? A second line beside the first doubles the cost for little
+  // more cargo; more trains on the first line is the usual answer (a live agent built one twice).
+  if (!a.allow_existing) {
+    const economy = await s.economy();
+    const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+    const bothWays = !!(cargoInfo?.passengers || cargoInfo?.mail);
+    const existing = findExistingRoute(stations, lineEnd(s, economy, from), lineEnd(s, economy, to), cargo, { radius: a.radius + 2, bothWays });
+    if (existing) {
+      return fail('existing_route', `you already have rail stations serving this route: ${existing.from_station.name} (${existing.from_station.id}) and ${existing.to_station.name} (${existing.to_station.id})`,
+        { existing, hint: 'add capacity instead: vehicle-clone --vehicle <a train of that route> --depot auto --start true (vehicles shows them); --allow_existing true builds a second line anyway' });
+    }
+  }
 
   // 1. Stations: best dry-run-checked site at each end, facing the other end, not overlapping.
   const opts = { platforms: a.platforms, length: a.length, radius: a.radius, limit: 3, railType };
@@ -1370,7 +1383,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-cargo-route', group: 'build', session: true,
-    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
+    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. Refused (failed_step existing_route) when your rail stations already serve both ends: clone a train instead, or --allow_existing true. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
     args: z.object({
       ...act,
       from_industry: int().optional().describe('source industry id (see industries / find-cargo-pairs)'), from_town: z.string().optional().describe('source town id or name'),
@@ -1382,6 +1395,7 @@ export const COMMANDS = [
       radius: int().min(2).max(20).default(8).describe('station search box around each end'),
       margin: int().min(2).max(80).default(20).describe('how far the line may wander outside the two stations'),
       max_bridge: int().min(3).max(40).default(12), rail_type: int().optional().describe('see rail-types; default: the one with the cheapest track'),
+      allow_existing: bool().default(false).describe('build even when your rail stations already serve both ends (refused by default: clone trains instead)'),
     }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
