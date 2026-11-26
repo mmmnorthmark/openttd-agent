@@ -106,6 +106,20 @@ Behaviour changes agents must know:
   `--min_gap_from_bend`, default 8), `distance_from_station`, `position_pct`, `cost` and `build`.
 - `build-passing-loop` also refuses a loop lane on houses, water or other non-free land
   (`loop_side_occupied_at` with the map class) before building.
+- New `vehicle-replace --vehicles A,B [--engine N --wagon W --wagons K]`: buys the replacement at
+  a depot on the vehicle's own route, shares the old vehicle's orders and starts it; the old one
+  gets its own copy of the orders, loads nothing at its next unloading stop and stops in the depot
+  after it, and the daemon (or relay) sells it there (checked every 20 s; `--finish true` sells
+  arrivals now and lists `pending_sales`). `--when now` sends the old one to a depot at once.
+  Without `--engine` the replacement is a clone. Live-tested: two replacements, old trains sold
+  on arrival.
+- New `vehicle-reverse --vehicles A,B` (GS v12, `GSVehicle.ReverseVehicle`): turn a train or road
+  vehicle round, e.g. to free a deadlock.
+- `vehicle-problems` finds trains that stand still: `stalled_on_line` (speed 0 on the same tile for
+  `--stall_days`, default 10, not at a station or broken down) and `deadlock` (two such trains
+  within 16 tiles; fix: reverse one). Once vehicle-problems has run, the daemon samples the
+  company's vehicles every 15 s, so one later call sees a stall. `stuck_or_lost` is not reported
+  on top of a stall.
 
 ## 0.6.0 (2026-11-25)
 

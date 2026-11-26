@@ -353,7 +353,7 @@ test('status: versions, and a warning when the running AgentBridge is older than
   try {
     const old = await run('status', {});
     assert.match(old.warnings[0], /runs AgentBridge v\d+; this openttd-agent .* ships v\d+/);
-  } finally { fake.state.gsVersion = 11; }
+  } finally { fake.state.gsVersion = 12; }
 });
 
 test('verify-route traces road vehicles and road stops (AgentBridge v11), refuses on older GameScripts', async () => {
@@ -382,7 +382,7 @@ test('verify-route traces road vehicles and road stops (AgentBridge v11), refuse
   try {
     await assert.rejects(run('verify-route', { vehicle: 12 }), /refused: road vehicles .* AgentBridge v11/);
     assert.match((await run('vehicle-problems', {})).road_trace, /^off: /);
-  } finally { fake.state.gsVersion = 11; }
+  } finally { fake.state.gsVersion = 12; }
 });
 
 test('vehicle-depot: idempotent (already heading / in depot) and decoded failures', async () => {
@@ -400,7 +400,7 @@ test('vehicle-depot: idempotent (already heading / in depot) and decoded failure
     assert.deepEqual([old.already_in_depot, old.sent], [[11], [13]]);
     assert.deepEqual(lastExec().steps, [['veh_depot', 13, false]]);
     assert.match(old.note, /older than v11/);
-  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 11; }
+  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 12; }
 });
 
 test('loop-sites: traces the line and explains when no stretch is long enough', async () => {
@@ -411,4 +411,50 @@ test('loop-sites: traces the line and explains when no stretch is long enough', 
   assert.deepEqual(res.sites, []);
   assert.match(res.note, /no straight stretch of 8 tiles/);
   await assert.rejects(run('loop-sites', {}), /give --vehicle ID/);
+});
+
+test('vehicle-replace: clone, start, old gets a stop-in-depot order and is sold on arrival', async () => {
+  const { depotOrderPosition } = await import('../src/commands.js');
+  const st = (flags) => ({ kind: 'station', flags });
+  assert.equal(depotOrderPosition([st(['full_load_any']), st(['unload', 'no_load'])], 0), 2);
+  assert.equal(depotOrderPosition([st(['full_load_any']), st(['unload', 'no_load'])], 1), 2);
+  assert.equal(depotOrderPosition([st([]), st([])], 1), 2);
+  const dry = await run('vehicle-replace', { vehicles: '11', dry_run: true });
+  assert.equal(dry.ok, true, JSON.stringify(dry));
+  assert.equal(dry.replaced[0].would.buy, 'clone');
+  const res = await run('vehicle-replace', { vehicles: '11' });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const r = res.replaced[0];
+  assert.deepEqual([r.vehicle, r.depot, r.started], [11, { x: 13, y: 22 }, true]);
+  const execs = fake.received.filter((q) => q.cmd === 'exec').slice(-3).map((q) => q.args.steps);
+  assert.deepEqual(execs[0], [['veh_clone', 13, 22, 11, true]]);
+  assert.deepEqual(execs[1].at(-1)[0], 'veh_start_stop');
+  // Train 11 heads for order 1 (a depot); its next station is order 0 (full_load_any): no_load there, depot after it.
+  assert.deepEqual(execs[2][0], ['orders_unshare', 11]);
+  assert.deepEqual(execs[2][1], ['orders_copy', 11, r.new_vehicle, false]);
+  assert.deepEqual(execs[2][2], ['order_flags', 11, 0, 1 | 128]);
+  assert.deepEqual(execs[2][3], ['order_add', 11, 13, 22, 8, 1]);
+  assert.deepEqual(res.pending_sales.map((p) => p.vehicle), [11]);
+  fake.state.trainInDepot = true;
+  const fin = await run('vehicle-replace', { finish: true });
+  fake.state.trainInDepot = false;
+  assert.deepEqual(fin.sold.map((x) => x.vehicle), [11]);
+  assert.deepEqual(fin.pending_sales, []);
+  // --engine: buys the engine, the old train's wagons (v12 vehicle_wagons) refitted, shares orders.
+  const eng = await run('vehicle-replace', { vehicles: '11', engine: 6 });
+  assert.equal(eng.ok, true, JSON.stringify(eng));
+  const steps = fake.received.filter((q) => q.cmd === 'exec').slice(-3).map((q) => q.args.steps);
+  assert.deepEqual(steps[0], [['veh_buy', 13, 22, 6, -1, -1]]);
+  assert.equal(steps[1].filter((x) => x[0] === 'veh_buy' && x[3] === 27 && x[4] === 7).length, 4);
+  assert.ok(steps[1].some((x) => x[0] === 'orders_copy' && x[2] === 11 && x[3] === true));
+  await run('vehicle-replace', { finish: true });
+});
+
+test('vehicle-reverse: one veh_reverse step per vehicle; refused on an older GameScript', async () => {
+  const res = await run('vehicle-reverse', { vehicles: '11,12' });
+  assert.equal(res.ok, true);
+  assert.deepEqual(lastExec().steps, [['veh_reverse', 11], ['veh_reverse', 12]]);
+  assert.deepEqual(res.reversed, [11, 12]);
+  fake.state.gsVersion = 11;
+  try { await assert.rejects(run('vehicle-reverse', { vehicles: '11' }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
 });

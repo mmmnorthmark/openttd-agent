@@ -4,7 +4,8 @@
 import { AdminClient, UPDATE, FREQ } from './admin-client.js';
 import { GSRpc } from './gs-rpc.js';
 import { TileMap, townsFromRows, industriesFromRows } from './world.js';
-import { execSummary } from './operate.js';
+import { execSummary, VEHICLE_STATES } from './operate.js';
+import { recordStall } from './problems.js';
 import { log } from './log.js';
 
 const ECONOMY_TTL_MS = 60_000; // towns/industries refresh at most once a minute (~1 game month)
@@ -23,6 +24,11 @@ export class Session {
     this._tileLoad = null;   // promise of the initial full dump
     this._refreshTimer = null;
     this._refreshRow = 0;
+    this.pendingSales = new Map(); // "company:vehicle" -> { company, vehicle, replaced_by, since } (vehicle-replace)
+    this._salesTimer = null;
+    this.vehicleHistory = new Map(); // vehicle-problems progress samples
+    this.stallHistory = new Map();   // vehicle-problems standstill samples
+    this._watchTimers = new Map();   // company -> interval sampling vehicles for stall detection
   }
 
   async connect() {
@@ -53,6 +59,8 @@ export class Session {
 
   close() {
     clearInterval(this._refreshTimer);
+    clearInterval(this._salesTimer);
+    for (const t of this._watchTimers.values()) clearInterval(t);
     this.admin?.close();
   }
 
@@ -149,6 +157,64 @@ export class Session {
     return execSummary(steps, replies, dryRun);
   }
 
+  // ---- vehicle-replace: sell old vehicles once they stop in a depot ------------------
+
+  /** Sell every pending vehicle that is stopped in a depot. Returns { sold: [...], waiting: [...], gone: [...] }. */
+  async finishSales() {
+    const out = { sold: [], waiting: [], gone: [] };
+    const companies = new Set([...this.pendingSales.values()].map((p) => p.company));
+    for (const company of companies) {
+      const rows = await this.gs.call('vehicles', { company });
+      const state = new Map(rows.map((r) => [r[0], r[11]])); // id -> GS state (2 = in depot)
+      for (const [k, p] of this.pendingSales) {
+        if (p.company !== company) continue;
+        if (!state.has(p.vehicle)) { this.pendingSales.delete(k); out.gone.push(p.vehicle); continue; }
+        if (state.get(p.vehicle) !== 2) { out.waiting.push(p.vehicle); continue; }
+        const res = await this.exec(company, [['veh_sell', p.vehicle]]);
+        if (res.ok) { this.pendingSales.delete(k); out.sold.push({ vehicle: p.vehicle, income: -res.cost, replaced_by: p.replaced_by }); log.info('session', 'sold replaced vehicle', { company, vehicle: p.vehicle, income: -res.cost }); } else out.waiting.push(p.vehicle);
+      }
+    }
+    return out;
+  }
+
+  /** Check pending sales every 20 s while there are any (the daemon or relay keeps running). */
+  watchSales() {
+    if (this._salesTimer || !this.pendingSales.size) return;
+    let busy = false;
+    this._salesTimer = setInterval(async () => {
+      if (busy) return;
+      busy = true;
+      try { await this.finishSales(); } catch (e) { log.warn('session', 'pending sale check failed', { error: e.message }); }
+      if (!this.pendingSales.size) { clearInterval(this._salesTimer); this._salesTimer = null; }
+      busy = false;
+    }, 20_000);
+    this._salesTimer.unref?.();
+  }
+
+  /**
+   * Sample a company's vehicles every 15 s (about 7 game days) for stall detection, so a stall is
+   * seen without the agent calling twice. One `vehicles` call per sample; runs while the session lives.
+   */
+  watchVehicles(company) {
+    if (this._watchTimers.has(company) || this.cfg.vehicle_watch === false) return;
+    let busy = false;
+    const t = setInterval(async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        const info = await this.gs.call('info');
+        if (!info.paused) {
+          for (const r of await this.gs.call('vehicles', { company })) {
+            recordStall(this.stallHistory, `${company}:${r[0]}`, { date: info.date, x: r[12], y: r[13], speed: r[23], state: VEHICLE_STATES[r[11]] });
+          }
+        }
+      } catch (e) { log.warn('session', 'vehicle sample failed', { error: e.message }); }
+      busy = false;
+    }, 15_000);
+    t.unref?.();
+    this._watchTimers.set(company, t);
+  }
+
   /** Client-side throttle (max_builds_per_minute, 0 = off). Throws when over the limit. */
   throttleBuild() {
     const cap = this.cfg.max_builds_per_minute;
@@ -178,5 +244,8 @@ export function playerView(base, cfg, throttle) {
   view.refreshArea = (...a) => base.refreshArea(...a);
   view.economy = (o) => base.economy(o);
   view.exec = (...a) => base.exec(...a);
+  view.finishSales = () => base.finishSales();
+  view.watchSales = () => base.watchSales();
+  view.watchVehicles = (c) => base.watchVehicles(c);
   return view;
 }

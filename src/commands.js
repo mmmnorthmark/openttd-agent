@@ -19,7 +19,7 @@ import { vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRow
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
 import { traceRail, traceRoad, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
-import { recordProgress, vehicleProblems, manhattan as tileDistance } from './problems.js';
+import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
@@ -702,6 +702,96 @@ async function depotForRoute(s, company, a, id, { cmd }) {
 }
 
 /**
+ * Position for the "stop in depot" order of a vehicle being replaced: right after the next order
+ * (from its current one) at which it unloads (unload, transfer or no_load flags), else after the
+ * next station order. Pure; orders as vehicleDetail decodes them.
+ */
+export function depotOrderPosition(orders, current) {
+  const n = orders.length;
+  if (!n) return 0;
+  const start = Math.max(0, current);
+  const at = (i) => orders[(start + i) % n];
+  for (let i = 0; i < n; i++) {
+    const o = at(i);
+    if (o.kind === 'station' && o.flags.some((f) => f === 'unload' || f === 'transfer' || f === 'no_load')) return ((start + i) % n) + 1;
+  }
+  for (let i = 0; i < n; i++) if (at(i).kind === 'station') return ((start + i) % n) + 1;
+  return start + 1;
+}
+
+/** One vehicle of vehicle-replace. Returns { ok, vehicle, new_vehicle, depot, cost, old: {...}, error? }. */
+async function replaceOne(s, company, a, id, v12) {
+  const fail = (error, extra = {}) => ({ ok: false, vehicle: id, error, first_error: errorCode(error), ...extra });
+  let place;
+  try {
+    place = await depotForRoute(s, company, { depot: a.depot_x === undefined ? 'auto' : a.depot, depot_x: a.depot_x, depot_y: a.depot_y, check_route: true }, id, { cmd: 'vehicle-clone' });
+  } catch (e) { return fail(e.message); }
+  const { depot } = place;
+  const d = vehicleDetail(await s.gs.call('vehicle', { company, vehicle: id }), s.cargos);
+  const cargo = d.capacity.find((c) => c.capacity > 0)?.cargo ?? -1;
+  // Steps that make the new vehicle; its id is the value of the first step.
+  let buy;
+  let wagonPlan = null;
+  if (a.engine === undefined) {
+    buy = [['veh_clone', depot.x, depot.y, id, true]];
+  } else {
+    buy = [['veh_buy', depot.x, depot.y, a.engine, d.type === 'rail' ? -1 : cargo, -1]];
+    if (d.type === 'rail') {
+      let wagon = a.wagon, count = a.wagons;
+      if ((wagon === undefined || count === undefined) && v12) {
+        const parts = (await s.gs.call('vehicle_wagons', { company, vehicle: id })).filter((r) => r[0] > 0);
+        const freq = new Map();
+        for (const r of parts) freq.set(r[1], (freq.get(r[1]) ?? 0) + 1);
+        wagon ??= [...freq.entries()].sort((p, q) => q[1] - p[1])[0]?.[0];
+        count ??= parts.length;
+      }
+      if (count === undefined) count = Math.max(0, (d.wagons ?? 1) - 1);
+      if (count > 0 && wagon === undefined) return fail('refused: give --wagon ENGINE_ID (the running AgentBridge is older than v12 and cannot read the old train\'s wagon type)');
+      wagonPlan = { wagon: wagon ?? null, count };
+    }
+  }
+  if (a.dry_run) {
+    const res = await s.exec(company, buy, { dryRun: true });
+    return { ok: res.ok, vehicle: id, dry_run: true, depot, ...(place.route_check ? { route_check: place.route_check } : {}), cost: res.cost, would: { buy: a.engine === undefined ? 'clone' : `engine ${a.engine}`, ...(wagonPlan ? { wagons: wagonPlan } : {}), old_vehicle: a.when === 'now' ? 'to depot now, sold there' : 'stop in depot after its next unloading stop, sold there' }, ...(res.ok ? {} : { error: res.error, first_error: res.first_error }) };
+  }
+  s.throttleBuild();
+  const bought = await s.exec(company, buy);
+  if (!bought.ok) return fail(bought.error, { depot, cost: bought.cost });
+  const nv = bought.results[0].value;
+  let cost = bought.cost;
+  const follow = [];
+  if (wagonPlan && wagonPlan.count > 0) for (let i = 0; i < wagonPlan.count; i++) follow.push(['veh_buy', depot.x, depot.y, wagonPlan.wagon, cargo, nv]);
+  if (a.engine !== undefined) follow.push(['orders_copy', nv, id, true]);
+  follow.push(['veh_start_stop', nv, 1]);
+  const setup = await s.exec(company, follow);
+  cost += setup.cost;
+  if (!setup.ok) return fail(`bought vehicle ${nv} at (${depot.x},${depot.y}) but setting it up failed: ${setup.error}; it is stopped in the depot (finish by hand or vehicle-sell it)`, { new_vehicle: nv, depot, cost });
+  // The old vehicle: own copy of the orders, then a stop-in-depot order after its next unloading stop.
+  const oldSteps = [];
+  // The new vehicle shares the old one's orders now (clone or orders_copy with share). Unsharing leaves
+  // the old vehicle with no orders (OpenTTD CO_UNSHARE), so copy them back from the new one, unshared.
+  oldSteps.push(['orders_unshare', id], ['orders_copy', id, nv, false]);
+  if (a.when === 'now') oldSteps.push(['veh_depot', id, false]);
+  else {
+    // Unload there but load nothing (its own copy of the orders), then stop in the depot.
+    const pos = depotOrderPosition(d.orders, d.current_order);
+    const stop = d.orders[pos - 1];
+    if (stop?.kind === 'station' && !stop.flags.includes('no_load') && !stop.flags.includes('no_unload')) {
+      const keep = stop.flags.filter((f) => !f.startsWith('full_load'));
+      oldSteps.push(['order_flags', id, pos - 1, encodeOrderFlags([...keep, 'no_load'].join(','))]);
+    }
+    oldSteps.push(['order_add', id, depot.x, depot.y, 8, pos]);
+  }
+  let oldRes = { ok: true };
+  if (d.state !== 'in_depot') oldRes = await s.exec(company, oldSteps);
+  s.pendingSales.set(`${company}:${id}`, { company, vehicle: id, replaced_by: nv, since: new Date().toISOString() });
+  const sold = d.state === 'in_depot' ? await s.finishSales() : null;
+  return { ok: oldRes.ok, vehicle: id, new_vehicle: nv, depot, cost, started: true,
+    old: d.state === 'in_depot' ? { state: 'in_depot', sold: sold.sold.some((x) => x.vehicle === id) } : { heading: a.when === 'now' ? 'depot now' : `depot (${depot.x},${depot.y}) after unloading at order ${depotOrderPosition(d.orders, d.current_order) - 1} (no_load there)`, sold_on_arrival: true },
+    ...(oldRes.ok ? {} : { error: `new vehicle ${nv} runs, but sending old vehicle ${id} to the depot failed: ${oldRes.error}; send it with vehicle-depot and sell it`, first_error: oldRes.first_error }) };
+}
+
+/**
  * Why `build-signal --remove` would fail, from GS `rail_tiles` (v9+): no rail, or no signal facing
  * trains from front. null = go ahead (also when the running GameScript is too old to tell).
  */
@@ -1317,9 +1407,10 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-problems', group: 'operate', session: true,
-    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot, stopped, old, broken_down, low_reliability, crashed. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
+    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), stalled_on_line (speed 0 on the same tile for stall_days, not at a station or broken down; the daemon samples every 15 s once vehicle-problems has run), deadlock (two such trains within 16 tiles: reverse one with vehicle-reverse), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot, stopped, old, broken_down, low_reliability, crashed. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
     args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'),
       stuck_days: int().min(1).default(30).describe('game days without progress before a vehicle counts as stuck or lost'),
+      stall_days: int().min(1).default(10).describe('game days standing still on one tile (speed 0, not at a station) before stalled_on_line / deadlock'),
       trace: bool().default(true).describe('check rail (and, AgentBridge v11, road) connectivity to each vehicle\'s destination'),
       severity: z.enum(['all', 'action', 'info']).default('all').describe('action = only problems that need a command') }),
     run: async (ctx, a) => {
@@ -1333,6 +1424,11 @@ export const COMMANDS = [
       const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
       const stationById = new Map(stations.map((st) => [st.id, st]));
       s.vehicleHistory ??= new Map();
+      s.stallHistory ??= new Map();
+      const stalls = new Map(vehicles.map((v) => [v.id, recordStall(s.stallHistory, `${company}:${v.id}`, { date: info.date, x: v.x, y: v.y, speed: v.speed, state: v.state })]));
+      const longStalled = vehicles.filter((v) => { const e = stalls.get(v.id); return e && info.date - e.since >= a.stall_days && e.samples >= 2; });
+      const partners = deadlockPartners(longStalled);
+      s.watchVehicles?.(company);
       const railTracer = a.trace ? await makeTracer(s, company, info) : null;
       const roadTracer = a.trace && vehicles.some((v) => v.type === 'road') ? makeRoadTracer(s, company, info) : null;
       const tracer = railTracer;
@@ -1374,7 +1470,7 @@ export const COMMANDS = [
             }
           }
         }
-        for (const p of vehicleProblems(v, { today: info.date, stuckDays: a.stuck_days, progress, reach, line })) {
+        for (const p of vehicleProblems(v, { today: info.date, stuckDays: a.stuck_days, progress, reach, line, stall: stalls.get(v.id), stallDays: a.stall_days, partners: partners.get(v.id) })) {
           if (a.severity === 'all' || a.severity === p.severity) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p });
         }
       }
@@ -1618,6 +1714,38 @@ export const COMMANDS = [
       if (!a.start || a.dry_run || !vehicles.length) return out;
       const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
       return { ...out, started: started.ok };
+    },
+  },
+  {
+    name: 'vehicle-replace', group: 'operate', session: true,
+    description: 'Replace vehicles (comma-separated ids) in one call: buy the replacement at a depot on the vehicle\'s own route (--depot auto, the default, or --depot_x/--depot_y), share the old vehicle\'s orders, start it; the old vehicle gets its own copy of the orders, loads nothing more at its next unloading stop (no_load) and gets a "stop in depot" order right after it (--when unloaded, the default; --when now sends it to a depot at once), and is sold when it stops there. The daemon (or relay) checks every 20 s and sells it; --finish true sells any that have arrived now and lists the rest (pending_sales). Without --engine the replacement is a clone (same engine and wagons). --engine N buys that engine instead; for trains also --wagons N (default: as many as the old train) of --wagon ID (default: the old train\'s wagon type; AgentBridge v12) refitted to the old cargo. For age-based replacement of whole fleets, group-autoreplace or autorenew is cheaper in calls.',
+    args: z.object({ ...act, vehicles: ids().optional(), engine: int().optional(), wagon: int().optional(), wagons: int().min(0).max(60).optional(),
+      depot: z.enum(['auto']).optional(), depot_x: int().optional(), depot_y: int().optional(),
+      when: z.enum(['unloaded', 'now']).default('unloaded').describe('when the old vehicle heads for the depot'),
+      finish: bool().default(false).describe('only sell replaced vehicles that have stopped in a depot; no new replacements') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      if (a.finish) return { ...(await s.finishSales()), pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
+      if (!a.vehicles) throw new Error('give --vehicles A,B (or --finish true)');
+      const v12 = ((await s.gs.call('info')).bridge_version ?? 0) >= 12;
+      const replaced = [];
+      for (const id of a.vehicles) replaced.push(await replaceOne(s, company, a, id, v12));
+      if (!a.dry_run) s.watchSales();
+      const bad = replaced.filter((r) => !r.ok);
+      return { ok: !bad.length, dry_run: a.dry_run, error: bad.length ? bad.map((r) => `vehicle ${r.vehicle}: ${r.error}`).join('; ') : null,
+        ...(bad.length ? { first_error: bad[0].first_error ?? errorCode(bad[0].error) } : {}),
+        cost: replaced.reduce((n, r) => n + (r.cost ?? 0), 0), replaced, pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
+    },
+  },
+  {
+    name: 'vehicle-reverse', group: 'operate', session: true,
+    description: 'Turn trains or road vehicles (comma-separated ids) round so they drive the other way (the game\'s "reverse" button). Frees a deadlock: when vehicle-problems reports deadlock, reverse one of the two trains. Road vehicles must be moving and outside a depot. AgentBridge v12.',
+    args: z.object({ ...act, vehicles: ids() }),
+    run: async (ctx, a) => {
+      const { s } = await mine(ctx, a);
+      if (((await s.gs.call('info')).bridge_version ?? 0) < 12) throw new Error('refused: vehicle-reverse needs AgentBridge v12 (the running GameScript is older); the host re-runs install-gamescript and loads the game again. Meanwhile vehicle-depot also turns a train round');
+      const res = await run(ctx, a, a.vehicles.map((v) => ['veh_reverse', v]), { keepGoing: true });
+      return { ...res, reversed: res.results.filter((r) => r.ok).map((r) => a.vehicles[r.step]), failed: res.results.filter((r) => !r.ok).map((r) => ({ vehicle: a.vehicles[r.step], error: r.error ?? 'failed' })) };
     },
   },
   {

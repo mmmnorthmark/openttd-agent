@@ -28,6 +28,41 @@ export function recordProgress(history, k, { date, order, dist, atStation }) {
   return e;
 }
 
+/**
+ * Record one standstill sample. `history`: Map key -> { x, y, since, last, samples } while the vehicle
+ * stands on one tile at speed 0 outside stations and depots, not broken down; any movement deletes
+ * it. Returns the entry or null.
+ */
+export function recordStall(history, k, { date, x, y, speed, state }) {
+  const standing = speed === 0 && (state === 'running');
+  const prev = history.get(k);
+  if (!standing) { history.delete(k); return null; }
+  if (prev && prev.x === x && prev.y === y) {
+    const e = { ...prev, last: date, samples: prev.samples + 1 };
+    history.set(k, e);
+    return e;
+  }
+  const e = { x, y, since: date, last: date, samples: 1 };
+  history.set(k, e);
+  return e;
+}
+
+/**
+ * Pairs of stalled trains that block each other: both stalled >= stallDays and within `radius`
+ * tiles. stalled: [{ id, x, y, type }]. Returns Map id -> [partner ids].
+ */
+export function deadlockPartners(stalled, { radius = 16 } = {}) {
+  const out = new Map();
+  const rail = stalled.filter((v) => v.type === 'rail');
+  for (const a of rail) {
+    for (const b of rail) {
+      if (a.id === b.id || manhattan(a, b) > radius) continue;
+      out.set(a.id, [...(out.get(a.id) ?? []), b.id]);
+    }
+  }
+  return out;
+}
+
 const fmtTile = (p) => `(${p.x},${p.y})`;
 
 /**
@@ -40,7 +75,7 @@ const fmtTile = (p) => `(${p.x},${p.y})`;
  */
 export const INFO_PROBLEMS = new Set(['crashed', 'old', 'broken_down', 'low_reliability']);
 
-export function vehicleProblems(v, { today, stuckDays = 30, progress = null, reach = null, line = null } = {}) {
+export function vehicleProblems(v, { today, stuckDays = 30, progress = null, reach = null, line = null, stall = null, stallDays = 10, partners = null } = {}) {
   const out = [];
   const add = (problem, evidence, suggested_fix) => out.push({ problem, severity: INFO_PROBLEMS.has(problem) ? 'info' : 'action', evidence, suggested_fix });
   const dest = v.dest_name ? `${v.dest_name} ${v.dest ? fmtTile(v.dest) : ''}`.trim() : v.dest ? fmtTile(v.dest) : 'its destination';
@@ -65,9 +100,20 @@ export function vehicleProblems(v, { today, stuckDays = 30, progress = null, rea
     }
   }
 
+  const stalledFor = stall ? today - stall.since : 0;
+  if (stall && stalledFor >= stallDays && stall.samples >= 2) {
+    if (partners && partners.length) {
+      add('deadlock', `standing at ${fmtTile(v)} at speed 0 for ${stalledFor} days, as are train${partners.length > 1 ? 's' : ''} ${partners.join(', ')} nearby: they block each other (often two trains meeting in a loop or single track too short for them)`,
+        `vehicle-reverse --vehicles ${v.id} (one of them is enough; the other then gets its path), then check the loop: loop-sites / build-passing-loop --train_tiles N for longer trains, or remove the short loop (build-passing-loop ... --remove true) with the trains in depots`);
+    } else {
+      add('stalled_on_line', `standing at ${fmtTile(v)} at speed 0 for ${stalledFor} days (not at a station, not broken down)`,
+        `probably waiting at a red signal for a path that never frees: run verify-route --vehicle ${v.id}; look for a train or a wagon in the way ahead; vehicle-reverse --vehicles ${v.id} turns it round`);
+    }
+  }
+
   if (progress && v.order_count > 0 && v.state !== 'in_depot' && v.state !== 'stopped' && v.state !== 'crashed') {
     const stalled = today - progress.since;
-    if (stalled >= stuckDays) {
+    if (stalled >= stuckDays && !(stall && stalledFor >= stallDays && stall.samples >= 2)) {
       add('stuck_or_lost', `order ${v.current_order} (to ${dest}) for ${stalled} days without getting closer than ${progress.best} tiles; now ${v.dist ?? '?'} tiles away, speed ${v.speed ?? '?'}`,
         v.speed === 0
           ? 'standing still: probably waiting at a red signal or behind another train; check the track ahead and the number of trains on the line'
