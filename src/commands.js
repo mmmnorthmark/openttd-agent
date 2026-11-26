@@ -946,7 +946,7 @@ export const COMMANDS = [
   },
   {
     name: 'airport-sites', group: 'world', session: true,
-    description: 'Find places to build an airport near a town: flat buildable rectangles of the airport size within radius, each checked for town noise limit and (with your company) a dry-run build with cost.',
+    description: 'Find places to build an airport near a town: flat buildable rectangles of the airport size within radius, each checked for town noise limit and (with your company) a dry-run build with cost. With your company (AgentBridge v10), your owned land counts as buildable and each site has owned: true when its whole footprint is your owned land; those sites come first.',
     args: z.object({
       town: z.string().describe('town name (substring)'), airport: z.string().default('small').describe('airport type name, see airport-types'),
       radius: int().default(20), max_height_spread: int().default(0), limit: int().default(5),
@@ -958,11 +958,16 @@ export const COMMANDS = [
       if (!town) throw new Error(`no town matching '${a.town}'`);
       const at = types.find((t) => t.name === a.airport.toLowerCase());
       if (!at) throw new Error(`unknown airport '${a.airport}'. Available: ${types.map((t) => t.name).join(', ')}`);
-      const sites = findFlatSites(s.map, { cx: town.x, cy: town.y, width: at.width, height: at.height, radius: a.radius, maxHeightSpread: a.max_height_spread, limit: a.limit * 3 });
       const company = s.cfg.company;
+      const hasCompany = company !== null && company !== undefined;
+      // Own owned land counts as buildable (airports clear it); company from the config, so the relay binds it.
+      const pad = Math.max(at.width, at.height);
+      const box = { x0: town.x - a.radius, y0: town.y - a.radius, x1: town.x + a.radius + pad, y1: town.y + a.radius + pad };
+      const owned = hasCompany ? await ownedLandAt(s, company, ownedLandCandidates(s.map, box)) : null;
+      const sites = findFlatSites(s.map, { cx: town.x, cy: town.y, width: at.width, height: at.height, radius: a.radius, maxHeightSpread: a.max_height_spread, limit: a.limit * 3, owned });
       const checked = [];
       for (const site of sites) {
-        const chk = await s.gs.call('check_airport', { x: site.x, y: site.y, type: at.type, ...(company !== null && company !== undefined ? { company } : {}) });
+        const chk = await s.gs.call('check_airport', { x: site.x, y: site.y, type: at.type, ...(hasCompany ? { company } : {}) });
         checked.push({ ...site, ...chk, noise_ok: chk.noise_increase <= chk.town_allowed_noise });
         if (checked.filter((c) => c.noise_ok && c.buildable !== false).length >= a.limit) break;
       }

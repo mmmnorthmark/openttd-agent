@@ -345,26 +345,31 @@ export function townGaps(towns, { minPopulation = 0, maxTransportedPct = 100, li
  * "Flat" = every tile slope 0 and the same height; allow `maxHeightSpread` to
  * accept sites that need a little terraforming.
  */
-export function findFlatSites(map, { cx, cy, width, height, radius = 20, maxHeightSpread = 0, limit = 5, buildable = ['b', 't', 'f', 'h', 'k'] }) {
+// owned: optional Set of "x,y" (the company's owned land): those tiles count as buildable, each site
+// gets owned (whole footprint owned), and owned sites sort first.
+export function findFlatSites(map, { cx, cy, width, height, radius = 20, maxHeightSpread = 0, limit = 5, buildable = ['b', 't', 'f', 'h', 'k'], owned = null }) {
   const ok = new Set(buildable);
   const sites = [];
   for (let y = Math.max(0, cy - radius); y <= Math.min(map.sizeY - height, cy + radius); y++) {
     for (let x = Math.max(0, cx - radius); x <= Math.min(map.sizeX - width, cx + radius); x++) {
-      let lo = 255, hi = 0, good = true, slopes = 0;
+      let lo = 255, hi = 0, good = true, slopes = 0, ownedTiles = 0;
       for (let dy = 0; dy < height && good; dy++) {
         for (let dx = 0; dx < width; dx++) {
           const tx = x + dx, ty = y + dy;
-          if (!ok.has(map.classAt(tx, ty))) { good = false; break; }
+          const mine = owned?.has(`${tx},${ty}`) ?? false;
+          if (mine) ownedTiles++;
+          if (!mine && !ok.has(map.classAt(tx, ty))) { good = false; break; }
           const ht = map.heightAt(tx, ty);
           lo = Math.min(lo, ht); hi = Math.max(hi, ht);
           if (map.slopeAt(tx, ty) !== 0) slopes++;
         }
       }
       if (!good || hi - lo > maxHeightSpread || (maxHeightSpread === 0 && slopes > 0)) continue;
-      sites.push({ x, y, width, height, distance: Math.abs(x + width / 2 - cx) + Math.abs(y + height / 2 - cy), height_spread: hi - lo, sloped_tiles: slopes });
+      sites.push({ x, y, width, height, distance: Math.abs(x + width / 2 - cx) + Math.abs(y + height / 2 - cy), height_spread: hi - lo, sloped_tiles: slopes,
+        ...(owned ? { owned: ownedTiles === width * height } : {}) });
     }
   }
-  sites.sort((a, b) => a.distance - b.distance);
+  sites.sort((a, b) => (b.owned === true) - (a.owned === true) || a.distance - b.distance);
   // Drop heavily overlapping candidates so results are distinct places.
   const picked = [];
   for (const s of sites) {

@@ -244,10 +244,25 @@ test('purchase-land reports a failure while buying: what was bought and the fail
   } finally { fake.state.landFailAt = null; fake.state.land.clear(); }
 });
 
-test('owned land commands explain an older AgentBridge', async () => {
+test('airport-sites marks sites on your owned land and lists them first', async () => {
+  const plain = await run('airport-sites', { town: 'Smallham', limit: 2 });
+  assert.ok(plain.sites.length > 0 && plain.sites.every((st) => st.owned === false));
+  fake.state.land.set('9,48', 1); // another company's land is not ours
+  try {
+    await run('purchase-land', { x0: 4, y0: 58, x1: 7, y1: 60 }); // refreshes the mirror there
+    const res = await run('airport-sites', { town: 'Smallham', limit: 2 });
+    assert.deepEqual([res.sites[0].x, res.sites[0].y, res.sites[0].owned], [4, 58, true]);
+    assert.equal(res.sites[0].buildable, true);
+    assert.equal(res.sites.filter((st) => st.owned).length, 1);
+  } finally { fake.state.land.clear(); }
+});
+
+test('owned land commands explain an older AgentBridge; airport-sites still works', async () => {
   fake.state.gsVersion = 9;
   try {
     await assert.rejects(run('purchase-land', { x0: 1, y0: 1, x1: 2, y1: 2, dry_run: true }), /older than v10/);
     await assert.rejects(run('owned-land', {}), /older than v10/);
+    const res = await run('airport-sites', { town: 'Smallham', limit: 1 });
+    assert.ok(res.sites.length && res.sites.every((st) => !('owned' in st)));
   } finally { fake.state.gsVersion = 10; }
 });
