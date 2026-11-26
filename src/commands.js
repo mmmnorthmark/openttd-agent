@@ -7,7 +7,8 @@
 import os from 'node:os';
 import { randomBytes } from 'node:crypto';
 import * as z from 'zod/v4';
-import { doctor, installGamescript, launch, checkSaveName, TERRAIN_TYPES } from './setup.js';
+import { doctor, installGamescript, launch, checkSaveName, bundledGsVersion, TERRAIN_TYPES } from './setup.js';
+import { VERSION } from './version.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
@@ -790,14 +791,21 @@ export const COMMANDS = [
   // ---- game -------------------------------------------------------------------
   {
     name: 'status', group: 'game', session: true,
-    description: 'Game date, map size, pause state, your company, rate limits, tile-mirror progress.',
+    description: 'Game date, map size, pause state, your company, rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
     args: z.object({}),
     run: async (ctx) => {
       const s = await ctx.session();
       const [info, companies, rate] = await Promise.all([s.gs.call('info'), s.gs.call('companies'), s.gs.call('get_rate')]);
       const loaded = s.map.rowsLoaded.reduce((n, v) => n + v, 0);
+      const bundled = bundledGsVersion();
+      const running = info.bridge_version ?? null;
+      const warnings = [];
+      if (bundled !== null && running !== null && running < bundled) {
+        warnings.push(`the game runs AgentBridge v${running}; this openttd-agent ${VERSION} ships v${bundled}. Host: openttd-agent install-gamescript, then load or launch the game again (a running game keeps its GameScript); until then newer features say so or fall back`);
+      }
       return { info, my_company: s.cfg.company, companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
-        tile_mirror: { rows_loaded: loaded, rows_total: s.map.sizeY, load_ms: s.tileLoadMs ?? null } };
+        tile_mirror: { rows_loaded: loaded, rows_total: s.map.sizeY, load_ms: s.tileLoadMs ?? null },
+        versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, warnings };
     },
   },
   {
@@ -1813,7 +1821,14 @@ export async function runCommand(ctx, name, rawArgs = {}) {
   const parsed = cmd.args.safeParse(args);
   if (!parsed.success) throw new Error(`bad arguments for ${name}: ${argErrors(parsed.error, args)}`);
   // Player with a relay configured: the host's relay runs every game command (it holds the admin connection and the map mirror).
-  if (cmd.session && ctx.cfg.relay) return envelope(await callRelay(ctx.cfg, name, args));
+  if (cmd.session && ctx.cfg.relay) {
+    const res = envelope(await callRelay(ctx.cfg, name, args));
+    const host = res.versions?.openttd_agent;
+    if (name === 'status' && host && host !== VERSION) {
+      res.warnings = [...(res.warnings ?? []), `the host's relay runs openttd-agent ${host}, you run ${VERSION}: use the same version (npx -y github:mmmnorthmark/openttd-agent#v${host} ...)`];
+    }
+    return res;
+  }
   return envelope(await cmd.run(ctx, parsed.data));
 }
 

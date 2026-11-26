@@ -51,6 +51,11 @@ Behaviour changes agents must know:
 - `launch` writes `server_name` (and, for a dedicated server, `client_name = openttd-agent
   server`) to the profile's private.cfg; OpenTTD 15 ignores them in openttd.cfg, so the server's
   own client showed as "Unnamed Client".
+- Version drift is visible: `status` returns `versions` (openttd-agent, running and bundled
+  AgentBridge) and `warnings` when the running GameScript is older than the bundled one or, for a
+  player, when the host's relay runs another openttd-agent version. `doctor` adds
+  `gamescript_warning`; `guide` (host) has a `gamescript-running` step. The CLI restarts a
+  background daemon that runs another version (it kept serving old code after an update).
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

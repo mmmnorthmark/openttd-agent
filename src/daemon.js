@@ -10,6 +10,7 @@ import { makeContext } from './context.js';
 import { runCommand } from './commands.js';
 import { loadConfig } from './config.js';
 import { log } from './log.js';
+import { VERSION } from './version.js';
 
 const VERSION_CHECK = 'openttd-agent-daemon';
 
@@ -17,7 +18,7 @@ export function startDaemon({ port = loadConfig().daemon_port } = {}) {
   const ctx = makeContext();
   const server = http.createServer(async (req, res) => {
     const reply = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
-    if (req.method === 'GET' && req.url === '/health') return reply(200, { ok: true, service: VERSION_CHECK, pid: process.pid });
+    if (req.method === 'GET' && req.url === '/health') return reply(200, { ok: true, service: VERSION_CHECK, pid: process.pid, version: VERSION });
     if (req.method === 'POST' && req.url === '/shutdown') { reply(200, { ok: true }); ctx.close(); server.close(); setTimeout(() => process.exit(0), 50); return; }
     if (req.method !== 'POST' || req.url !== '/call') return reply(404, { ok: false, error: 'not found' });
     let body = '';
@@ -42,16 +43,26 @@ export function startDaemon({ port = loadConfig().daemon_port } = {}) {
 
 const base = (port) => `http://127.0.0.1:${port}`;
 
-export async function daemonHealthy(port) {
+/** Health of the daemon on `port`: { version } (null for a daemon older than 0.7.0) when one answers, else null. */
+export async function daemonHealth(port) {
   try {
     const r = await fetch(`${base(port)}/health`, { signal: AbortSignal.timeout(1000) });
     const j = await r.json();
-    return j.service === VERSION_CHECK;
-  } catch { return false; }
+    return j.service === VERSION_CHECK ? { version: j.version ?? null, pid: j.pid } : null;
+  } catch { return null; }
 }
 
+export async function daemonHealthy(port) { return (await daemonHealth(port)) !== null; }
+
 export async function ensureDaemon(port) {
-  if (await daemonHealthy(port)) return;
+  const h = await daemonHealth(port);
+  if (h && h.version === VERSION) return;
+  if (h) {
+    // A daemon keeps the code it started with: after an update it would answer with old behaviour.
+    log.info('daemon', 'restarting a daemon of another version', { running: h.version, now: VERSION });
+    await stopDaemon(port);
+    for (let i = 0; i < 25 && (await daemonHealthy(port)); i++) await new Promise((r) => setTimeout(r, 100));
+  }
   const bin = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'openttd-agent.js');
   const child = spawn(process.execPath, [bin, 'daemon'], { detached: true, stdio: 'ignore', env: process.env });
   child.unref();

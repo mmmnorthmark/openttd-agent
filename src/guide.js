@@ -64,7 +64,8 @@ async function probeGame(ctx) {
       if (!g) { goals = null; break; }
       goals[id] = g.status;
     }
-    return { ok: true, companies, goals };
+    const st = await call('status').catch(() => null);
+    return { ok: true, companies, goals, gamescript_running: st?.info?.bridge_version ?? null };
   } catch (e) { return { ok: false, error: short(e.message) }; }
 }
 
@@ -137,6 +138,13 @@ export function hostSteps(p, version = VERSION) {
       command: 'openttd-agent launch --mode dedicated --map_bits 9',
       why: 'Headless server on 0.0.0.0:3979 with AgentBridge; generates the admin password and keeps it in your config.',
       ...(game && !game.ok ? { detail: game.error } : {}),
+    },
+    {
+      id: 'gamescript-running', step: 'The game runs the AgentBridge version this openttd-agent ships',
+      done: game?.ok && game.gamescript_running && d?.ok && d.gamescript_bundled ? game.gamescript_running >= d.gamescript_bundled : null,
+      command: 'openttd-agent install-gamescript, then openttd-agent launch (or load the save again)',
+      why: 'A running game keeps the GameScript it started with; newer commands fall back or say so until it is reloaded.',
+      ...(game?.ok && game.gamescript_running ? { detail: `running v${game.gamescript_running}, bundled v${d?.gamescript_bundled ?? '?'}` } : {}),
     },
     {
       id: 'relay', step: 'Run the relay and leave it running',

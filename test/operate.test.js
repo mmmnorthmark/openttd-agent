@@ -344,3 +344,14 @@ test('existing route: only a vehicle with orders at both stations blocks build-c
   fake.state.lostTrain = true; // train 13 heads for station 3 with orders 3 -> 5
   try { assert.equal(await vehicleServing(s, 0, [st(3, 2), st(5, 1)], 3, 5), 13); } finally { fake.state.lostTrain = false; }
 });
+
+test('status: versions, and a warning when the running AgentBridge is older than the bundled one', async () => {
+  const { bundledGsVersion } = await import('../src/setup.js');
+  const now = await run('status', {});
+  assert.equal(now.versions.gamescript_bundled, bundledGsVersion());
+  fake.state.gsVersion = bundledGsVersion() - 1;
+  try {
+    const old = await run('status', {});
+    assert.match(old.warnings[0], /runs AgentBridge v\d+; this openttd-agent .* ships v\d+/);
+  } finally { fake.state.gsVersion = 10; }
+});

@@ -210,7 +210,8 @@ refusal: time, player, company, command, arguments, outcome).
   URL in `show-config` right?
 - **`missing or unknown token`:** the host re-issues one (`relay-remove-player`, then `relay-add-player`).
 - **`not bound to a company yet`:** the host runs `relay-set-company` (step 8).
-- **`unknown command` through the relay:** player and host run different openttd-agent versions.
+- **`unknown command` through the relay:** player and host run different openttd-agent versions
+  (`status` warns about it, and about a game running an older AgentBridge).
 - **AgentBridge did not answer:** the host runs `install-gamescript` and launches the game again with
   `openttd-agent launch` (`doctor` lists launch profiles whose `[game_scripts]` is wrong). A loaded
   save runs the GameScript stored in it.

@@ -56,6 +56,9 @@ function readGsVersion(dir) {
   } catch { return null; }
 }
 
+/** AgentBridge version shipped in this package (gamescript/AgentBridge/info.nut). */
+export function bundledGsVersion() { return readGsVersion(path.join(PACKAGE_ROOT, 'gamescript', GS_NAME)); }
+
 const ORIGINAL_BASESET = ['trg1r.grf', 'trgcr.grf', 'trghr.grf', 'trgir.grf', 'trgtr.grf', 'sample.cat'];
 
 export function doctor() {
