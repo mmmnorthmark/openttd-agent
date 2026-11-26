@@ -13,12 +13,12 @@ token bound to one company. Players who are not hosting use the `openttd-join-ga
 ## Commands in this skill
 
 Every example writes `openttd-agent ...`. Unless it is installed globally, run it as
-`npx -y github:mmmnorthmark/openttd-agent#<tag> ...` with one release tag (for example `v0.4.0`) and
+`npx -y github:mmmnorthmark/openttd-agent#<tag> ...` with one release tag (for example `v0.5.0`) and
 tell every player to use the **same tag**. All commands print JSON; `openttd-agent help` and
 `openttd-agent <command> --help` show what exists. Unknown flags are refused.
 
-**First step, if available:** run `openttd-agent guide --role host` and follow its `next` step. It is
-read-only, starts nothing and prints no secrets. Older releases do not have `guide`.
+**First step:** run `openttd-agent guide --role host` and follow its `next` step (v0.5.0 and later). It is
+read-only, starts nothing and prints no secrets.
 
 ## 0. Is a game already running? Ask before replacing it
 
@@ -104,8 +104,8 @@ cargo and value, e.g. `COAL:3000,PASS:3000,VALUE:500000`. Players see it with `g
 
 ## 9. End of the night
 
-- If `openttd-agent help` lists `save`: `openttd-agent save --name <name>`, then next time
-  `launch --mode dedicated --load <name>`. Otherwise save from the server console or a client.
+- `openttd-agent save --name <name>` (v0.5.0 and later), then next time
+  `launch --mode dedicated --load <name>`. On older releases, save from the server console or a client.
 - `openttd-agent relay-remove-player --name <player>` stops a token at once.
 
 ## Troubleshooting

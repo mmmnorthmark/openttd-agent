@@ -3,8 +3,10 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
-## (unreleased)
+## 0.5.0 (2026-11-25)
 
+- Agent skills in `skills/` (`openttd-host-game`, `openttd-join-game`, `openttd-play`), installable as a
+  Claude Code plugin (`.claude-plugin/`) or pasted into any agent as a prompt.
 - `guide [--role host|player]`: read-only setup checklist as JSON: `role`, ordered `steps`
   (`done` true, false, or null when it cannot tell; `command`; `why`) and `next`, the first step
   still to do. The role defaults to player when a relay is configured, host when an admin password

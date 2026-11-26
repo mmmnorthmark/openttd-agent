@@ -14,11 +14,11 @@ If the user is the one hosting, use the `openttd-host-game` skill instead.
 
 Every example writes `openttd-agent ...`. Unless the user installed it globally, run it as
 `npx -y github:mmmnorthmark/openttd-agent#<tag> ...`, where `<tag>` is **the release tag the host
-uses** (for example `v0.4.0`; ask the host). Every command prints JSON. `openttd-agent help` lists
+uses** (for example `v0.5.0`; ask the host). Every command prints JSON. `openttd-agent help` lists
 commands; `openttd-agent <command> --help` shows one command's flags. Unknown flags are refused.
 
-**First step, if available:** run `openttd-agent guide --role player` and follow its `next` step.
-It is read-only and prints no secrets. Older releases do not have `guide`; then follow the steps below.
+**First step:** run `openttd-agent guide --role player` and follow its `next` step (v0.5.0 and later).
+It is read-only and prints no secrets. On older releases, follow the steps below.
 
 ## 1. Ask the host for exactly two things
 
