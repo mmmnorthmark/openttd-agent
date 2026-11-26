@@ -247,7 +247,7 @@ export function acceptanceFromRows(rows, cargosById, nPoints) {
  * mail: see townToTownPairs. Optionally ranks each pair by routeEffort on `map`.
  */
 export function findCargoPairs({ industries, types, towns = [], cargos = new Map(), townAcceptance = null, townCargoFallback = new Set(), map, cargo, sourceType, destType, destKind = 'any',
-  minDist = 0, maxDist = 1e9, maxTransportedPct = 100, minProduction = 0, limit = 10, withEffort = true }) {
+  minDist = 0, maxDist = 1e9, maxTransportedPct = 100, minProduction = 0, limit = 10, withEffort = true, near = null }) {
   const pairs = [];
   for (const src of industries) {
     if (!matches(sourceType, src.type_name)) continue;
@@ -282,6 +282,10 @@ export function findCargoPairs({ industries, types, towns = [], cargos = new Map
     }
   }
   if (destKind !== 'industry') pairs.push(...townToTownPairs({ towns, cargos, townAcceptance, townCargoFallback, cargo, sourceType, destType, minDist, maxDist, maxTransportedPct, minProduction }));
+  // near = { x, y, radius }: keep pairs whose source is within radius of that tile.
+  if (near) {
+    for (let i = pairs.length - 1; i >= 0; i--) if (manhattan(pairs[i].source, near) > near.radius) pairs.splice(i, 1);
+  }
   // Pre-rank by unserved volume * distance (revenue proxy) before the costlier effort pass.
   pairs.sort((x, y) => y.source_last_month * (100 - y.source_transported_pct) * y.distance
     - x.source_last_month * (100 - x.source_transported_pct) * x.distance);

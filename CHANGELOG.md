@@ -155,6 +155,9 @@ Behaviour changes agents must know:
   fix, old samples no longer report it). `stopped_in_depot` says how long the vehicle has been
   parked; wagons without a locomotive in a depot are `loose_wagons` (they were reported as a
   parked train with unit number -1).
+- `find-cargo-pairs` defaults to 20..200 tiles when `--min_distance`/`--max_distance` are not
+  given (it was 0..1000 and offered 900-tile pairs); `distance_bounds` says which bounds applied.
+  `--near_x --near_y [--radius 60]` keeps sources near a tile.
 
 ## 0.6.0 (2026-11-25)
 

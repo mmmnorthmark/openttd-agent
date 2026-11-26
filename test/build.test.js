@@ -109,7 +109,7 @@ test('rail-types and bridge-types decode rows', async () => {
 });
 
 test('find-cargo-pairs pairs goods with towns that accept them; acceptance command', async () => {
-  const res = await run('find-cargo-pairs', { cargo: 'goods', with_effort: false });
+  const res = await run('find-cargo-pairs', { cargo: 'goods', with_effort: false, min_distance: 0 });
   assert.equal(res.total_candidates, 1, 'Smallham accepts goods only at 4');
   assert.equal(res.pairs[0].dest.kind, 'town');
   assert.equal(res.pairs[0].dest.name, 'Bigton');
@@ -316,4 +316,16 @@ test('build-passing-loop: site check, train length, dry run ok, remove', async (
   const rm = await run('build-passing-loop', { x: 5, y: 30, length: 4, remove: true });
   assert.equal(rm.removed, true);
   assert.deepEqual(lastExec().steps[0], ['signal_remove', 9, 30, 8, 30]);
+});
+
+test('find-cargo-pairs: default distance bounds and --near_x/--near_y/--radius', async () => {
+  const res = await run('find-cargo-pairs', { cargo: 'passengers', with_effort: false });
+  assert.deepEqual([res.distance_bounds.min, res.distance_bounds.max], [20, 200]);
+  assert.ok(res.distance_bounds.defaulted);
+  const near = await run('find-cargo-pairs', { cargo: 'passengers', with_effort: false, near_x: 10, near_y: 50, radius: 5 });
+  assert.ok(near.pairs.length > 0);
+  assert.ok(near.pairs.every((p) => p.source.name === 'Smallham'), JSON.stringify(near.pairs));
+  const far = await run('find-cargo-pairs', { cargo: 'passengers', with_effort: false, min_distance: 0, max_distance: 10 });
+  assert.equal(far.total_candidates, 0);
+  assert.equal(far.distance_bounds.defaulted, undefined);
 });
