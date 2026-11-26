@@ -174,6 +174,11 @@ Behaviour changes agents must know:
   every few seconds). Never served through the relay.
 - New `build-hq --x --y [--dry_run true]` (GS v12): build or move the company headquarters;
   returns its location (`hq`). Live-tested.
+- New `road-types` (GS v12): road and tram types with id, tram, max speed, cost, available.
+  `--road_type ID` on `build-road`, `build-road-path`, `build-road-station`, `build-road-depot`
+  builds that type (trams: a tram type, usually from a NewGRF; a plain game has road only);
+  `engines --type road --road_type ID` finds the vehicles for it. Road tracing (`connected`,
+  `verify-route`) follows plain road only and says so for other types.
 
 ## 0.6.0 (2026-11-25)
 

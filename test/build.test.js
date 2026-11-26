@@ -371,3 +371,14 @@ test('build-hq: one hq step; refused on an older GameScript', async () => {
   fake.state.gsVersion = 11;
   try { await assert.rejects(run('build-hq', { x: 20, y: 30 }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
 });
+
+test('road-types; --road_type reaches exec for road builds; engines --road_type', async () => {
+  const rt = await run('road-types', {});
+  assert.deepEqual(rt.road_types.map((r) => [r.id, r.tram]), [[0, false], [1, true]]);
+  const r = await run('build-road', { x1: 1, y1: 1, x2: 4, y2: 1, road_type: 1, dry_run: true });
+  assert.equal(r.ok, true);
+  const last = fake.received.filter((q) => q.cmd === 'exec').at(-1).args;
+  assert.deepEqual([last.steps, last.road_type], [[['road', 1, 1, 4, 1]], 1]);
+  await run('build-road-depot', { x: 5, y: 5, front_x: 5, front_y: 6, road_type: 1, dry_run: true });
+  assert.equal(fake.received.filter((q) => q.cmd === 'exec').at(-1).args.road_type, 1);
+});

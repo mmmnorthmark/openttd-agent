@@ -121,7 +121,7 @@ async function buildPath(ctx, a, mode) {
   const out = { reachable: true, ...plan.stats, ...(a.show_path ? { path: plan.tiles } : {}) };
   if (a.plan_only) return { ...out, steps_total: steps.length, steps };
   if (!a.dry_run) s.throttleBuild();
-  const res = await s.exec(company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}) });
+  const res = await s.exec(company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) });
   if (!a.dry_run) await s.refreshArea(...box);
   return { ...out, ...res };
 }
@@ -968,6 +968,7 @@ function nearestRoad(map, x, y, skip, radius = 30) {
 /** Add `connected` to a road stop/depot build result and, with connect=auto, join it to the nearest road. */
 async function withRoadJoin(s, company, a, res, shape) {
   if (!res.ok || a.dry_run) return res;
+  if (a.road_type !== undefined && a.road_type !== 0) return { ...res, connected: null, connected_note: 'not checked: the road trace (road_tiles) follows plain road only, not other road or tram types' };
   const join = await roadJoin(s, company, a, shape);
   if (!join) return { ...res, connected: null, connected_note: OLD_GS_ROAD };
   if (join.connected || a.connect !== 'auto') {
@@ -1594,9 +1595,10 @@ export const COMMANDS = [
   },
   {
     name: 'build-road', group: 'build', session: true,
-    description: 'Build a straight road from (x1,y1) to (x2,y2) as your company. dry_run=true = cost only (same as test-build-road). Subject to client and GameScript rate limits.',
-    args: z.object({ ...act, x1: int(), y1: int(), x2: int(), y2: int() }),
+    description: 'Build a straight road from (x1,y1) to (x2,y2) as your company. dry_run=true = cost only (same as test-build-road). road_type (see road-types) builds that road or tram type instead. Subject to client and GameScript rate limits.',
+    args: z.object({ ...act, x1: int(), y1: int(), x2: int(), y2: int(), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, { dry_run, ...a }) => {
+      if (a.road_type !== undefined) return run(ctx, { ...a, dry_run }, [['road', a.x1, a.y1, a.x2, a.y2]], { roadType: a.road_type });
       const s = await ctx.session();
       const args = { x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2, company: s.companyOrThrow(a.company) };
       if (dry_run) return { ...(await s.gs.call('test_build_road', args)), dry_run: true };
@@ -1820,13 +1822,14 @@ export const COMMANDS = [
   {
     name: 'engines', group: 'operate', session: true,
     description: 'Engines/wagons/vehicles your company can buy now: price, capacity, max speed, reliability, running cost per year, lifespan, design year, power. type defaults to rail; cargo (name) keeps wagons/vehicles refittable to it and locomotives that can pull it; rail_type keeps trains for that track (see rail-types). Newest design first: compare with your fleet to decide replacements.',
-    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).default('rail'), cargo: z.string().optional(), rail_type: int().optional(), wagons: bool().optional().describe('rail only: true = wagons only, false = locomotives only'), limit: int().default(60) }),
+    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).default('rail'), cargo: z.string().optional(), rail_type: int().optional(), wagons: bool().optional().describe('rail only: true = wagons only, false = locomotives only'), limit: int().default(60),
+      road_type: int().optional().describe('road only: vehicles for this road type (see road-types; trams have tram types)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargo = cargoId(s.cargos, a.cargo);
       const rows = await s.gs.call('engines', { company, type: vehicleTypeId(a.type), ...(cargo !== undefined ? { cargo } : {}), ...(a.rail_type !== undefined ? { rail_type: a.rail_type } : {}) });
       const all = enginesFromRows(rows, s.cargos);
-      const hits = all.filter((e) => a.wagons === undefined || e.is_wagon === a.wagons).sort((x, y) => y.design_year - x.design_year);
+      const hits = all.filter((e) => (a.wagons === undefined || e.is_wagon === a.wagons) && (a.road_type === undefined || e.track_type === a.road_type)).sort((x, y) => y.design_year - x.design_year);
       return listResult('engines', all, hits, a.limit);
     },
   },
@@ -2132,6 +2135,17 @@ export const COMMANDS = [
     },
   },
   {
+    name: 'road-types', group: 'build', session: true,
+    description: 'Road and tram types: id, name, tram (true = tram track), max speed (0 = unlimited), build cost per piece, available (your company can build it now). Pass the id as --road_type to build-road, build-road-path, build-road-station, build-road-depot, and to engines --type road to find trams. AgentBridge v12.',
+    args: z.object({ ...who }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      await needV12(s, 'road-types');
+      const rows = (await s.gs.call('road_types', { company })).map(([id, name, tram, max_speed, build_cost, available]) => ({ id, name, tram, max_speed, build_cost, available }));
+      return listResult('road_types', rows, rows);
+    },
+  },
+  {
     name: 'bridge-types', group: 'build', session: true,
     description: 'Bridge types that can span `length` tiles (both ends included): id, name, max speed, price.',
     args: z.object({ length: int().min(2), type: z.enum(['rail', 'road']).default('rail') }),
@@ -2385,21 +2399,21 @@ export const COMMANDS = [
   // ---- build: road ---------------------------------------------------------------------
   {
     name: 'build-road-path', group: 'build', session: true,
-    description: 'Plan and build a road between two tiles (both included), reusing existing roads where that is cheaper, going round houses and industries, bridging water and rail where it must. dry_run=true for the cost first.',
-    args: z.object({ ...pathArgs }),
+    description: 'Plan and build a road between two tiles (both included), reusing existing roads where that is cheaper, going round houses and industries, bridging water and rail where it must. dry_run=true for the cost first. road_type (see road-types) lays that road or tram type (tram track can go on existing roads).',
+    args: z.object({ ...pathArgs, road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: (ctx, a) => buildPath(ctx, a, 'road'),
   },
   {
     name: 'build-road-station', group: 'build', session: true,
     description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis; not on junctions). A normal (bay) stop also gets the road piece on front that joins its entrance. Returns connected (AgentBridge v11): true when the entrance (or one end of a drive-through stop) joins a road beyond it. connect=auto builds a road from the entrance to the nearest road when it does not. A refused drive-through stop says why where it can tell (junction, one_way_road, other_owner_road, slope).',
     args: z.object({ ...act, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join,
-      connect: z.enum(['none', 'auto']).default('none').describe('auto = when the entrance does not join a road, build a road path from it to the nearest road') }),
+      connect: z.enum(['none', 'auto']).default('none').describe('auto = when the entrance does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
       const res = await run(ctx, a, [
         ['road_station', a.x, a.y, a.front_x, a.front_y, a.kind === 'truck', a.drive_through, joinArg(a.join)],
         // A bay stop's entrance is useless until the front tile has a road piece pointing into it.
         ...(a.drive_through ? [] : [['road', a.front_x, a.front_y, a.x, a.y]]),
-      ]);
+      ], a.road_type !== undefined ? { roadType: a.road_type } : {});
       const { s, company } = await mine(ctx, a);
       if (!res.ok && a.drive_through && res.results[0] && !res.results[0].ok) {
         const why = await driveThroughRefusal(s, company, a);
@@ -2412,9 +2426,9 @@ export const COMMANDS = [
     name: 'build-road-depot', group: 'build', session: true,
     description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile), plus the road piece on front that joins the entrance. Returns connected (AgentBridge v11): true when the front tile joins a road beyond it. connect=auto builds a road from the front tile to the nearest road when it does not.',
     args: z.object({ ...act, ...point, ...front,
-      connect: z.enum(['none', 'auto']).default('none').describe('auto = when the front tile does not join a road, build a road path from it to the nearest road') }),
+      connect: z.enum(['none', 'auto']).default('none').describe('auto = when the front tile does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
-      const res = await run(ctx, a, [['road_depot', a.x, a.y, a.front_x, a.front_y], ['road', a.front_x, a.front_y, a.x, a.y]]);
+      const res = await run(ctx, a, [['road_depot', a.x, a.y, a.front_x, a.front_y], ['road', a.front_x, a.front_y, a.x, a.y]], a.road_type !== undefined ? { roadType: a.road_type } : {});
       const { s, company } = await mine(ctx, a);
       return withRoadJoin(s, company, a, res, 'depot');
     },
