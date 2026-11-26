@@ -119,7 +119,8 @@ Behaviour changes agents must know:
   `--stall_days`, default 10, not at a station or broken down) and `deadlock` (two such trains
   within 16 tiles; fix: reverse one). Once vehicle-problems has run, the daemon samples the
   company's vehicles every 15 s, so one later call sees a stall. `stuck_or_lost` is not reported
-  on top of a stall.
+  on top of a stall. Live-tested: a too-short loop jammed two trains, both were reported as
+  `deadlock`, and reversing one freed them.
 - New `rail-tiles --x0 --y0 --x1 --y1` (max 32x32): per rail tile the kind, track pieces
   (`x`, `y`, `n`, `s`, `e`, `w`), signals (`facing: from_sw|from_se|from_ne|from_nw`, `one_way`),
   depot front, bridge/tunnel other end, station, rail type, owner and `mine`; `--mine true|false`
