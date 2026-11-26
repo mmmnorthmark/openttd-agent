@@ -179,6 +179,12 @@ Behaviour changes agents must know:
   builds that type (trams: a tram type, usually from a NewGRF; a plain game has road only);
   `engines --type road --road_type ID` finds the vehicles for it. Road tracing (`connected`,
   `verify-route`) follows plain road only and says so for other types.
+- `build-cargo-route --passing_loops N`: lays N passing loops on straight stretches spread along
+  the new line (loop-sites logic on the planned line for the dry run and on the traced line when
+  built), each sized for the train (train tiles + 2); `passing_loops[]` in the dry run,
+  `passing_loop` entries in `built[]`; a loop that does not fit is a warning. `loop-sites` also
+  offers several positions on one long straight stretch. Live-tested: a 58-tile line with 2 loops,
+  traced connected.
 
 ## 0.6.0 (2026-11-25)
 

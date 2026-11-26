@@ -17,7 +17,7 @@ import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from
 import { readStats, statsView, RELAY_STATS_FILE } from './relay-stats.js';
 import { ratingTable, vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
-import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
+import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, spreadLoops, plannedRail, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
 import { traceRail, traceRoad, trackExits, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
@@ -246,6 +246,33 @@ export function depotFrontCheck(front, dir, company) {
   return { front_joined: true, front_leads: leads, ...(leads.length === 1 ? { warning: `trains leaving the depot can only head ${leads[0]}: a new train runs that way first (to the next station or line end to turn round). Add a piece the other way for both directions` } : {}) };
 }
 
+/**
+ * build-cargo-route --passing_loops: trace the built line between two stations and lay n loops
+ * spread along it (non-fatal: a loop that fails is reported). Returns { built: [...], cost, warning? }.
+ */
+async function buildLineLoops(s, company, from, to, n, length, railType) {
+  const out = { built: [], cost: 0 };
+  const info = await s.gs.call('info');
+  if ((info.bridge_version ?? 0) < 9) { out.warning = 'not built: needs AgentBridge v9 (rail_tiles) to find straight stretches'; return out; }
+  const tracer = await makeTracer(s, company, info);
+  const r = await tracer.trace(await tracer.stationStarts(from), to);
+  if (!r.connected) { out.warning = 'not built: the new line does not trace from one station to the other'; return out; }
+  const rail = new Map();
+  for (const p of r.path) for (const [dx, dy] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) { const t = await tracer.tileAt(p.x + dx, p.y + dy); if (t) rail.set(`${t.x},${t.y}`, t); }
+  const railAt = (x, y) => rail.get(`${x},${y}`) ?? null;
+  const picks = spreadLoops(loopSites(r.path, railAt, (x, y) => s.map.classAt(x, y), { length }), n, r.path.length, length);
+  for (const c of picks) {
+    const lp = passingLoopSteps({ x: c.x, y: c.y, dir: dirIndex(c.dir), length, side: c.side });
+    s.throttleBuild();
+    const res = await s.exec(company, lp.steps, { railType });
+    out.cost += res.cost;
+    out.built.push({ x: c.x, y: c.y, dir: c.dir, side: c.side, length, position_pct: Math.round((100 * c.path_index) / r.path.length), complete: res.ok, cost: res.cost, ...(res.ok ? {} : { error: res.error }) });
+  }
+  const ok = out.built.filter((l) => l.complete).length;
+  if (ok < n) out.warning = `${ok} of ${n} passing loops built (each needs ${length + 4} straight tiles of plain track with free land beside it)${out.built.some((l) => !l.complete) ? '; a failed loop may have left partial track: check it with rail-tiles' : ''}`;
+  return out;
+}
+
 /** Terminus search options to try in order for a town end: as asked, wider, shorter, one platform, all three. */
 export function siteFallbacks(o) {
   const out = [o, { ...o, radius: o.radius + 4 }, { ...o, radius: o.radius + 4, length: Math.max(2, o.length - 1) },
@@ -432,7 +459,23 @@ async function buildCargoRoute(s, company, a) {
     cost: train.loco.price + wagons * train.wagon.price };
   const orders = routeOrderFlags({ passengerOrMail: !!(cargoInfo?.passengers || cargoInfo?.mail), fromTown: !!from.town, toTown: !!to.town });
   plan.orders = { source: orders.source_flags || 'plain', dest: orders.dest_flags || 'plain' };
-  const estimate = src.cost + dst.cost + lineCheck.cost + depotCheck.cost + plan.train.cost;
+  const trainTiles = Math.ceil((wagons + 1) / 2);
+  const loopLength = Math.min(30, trainTiles + 2);
+  let loopCost = 0;
+  if (a.passing_loops > 0) {
+    const planned = plannedRail(line);
+    const view = overlayMap(s.map, pathCells(line, cells));
+    const picks = spreadLoops(loopSites(planned.path, planned.railAt, (x, y) => view.classAt(x, y), { length: loopLength }), a.passing_loops, planned.path.length, loopLength);
+    plan.passing_loops = [];
+    for (const c of picks) {
+      const lp = passingLoopSteps({ x: c.x, y: c.y, dir: dirIndex(c.dir), length: loopLength, side: c.side });
+      const dry = await s.exec(company, lp.loopSteps, { dryRun: true, railType });
+      plan.passing_loops.push({ x: c.x, y: c.y, dir: c.dir, side: c.side, length: loopLength, position_pct: Math.round((100 * c.path_index) / planned.path.length), cost: dry.cost, ...(dry.ok ? {} : { dry_run_error: dry.error }) });
+      loopCost += dry.cost;
+    }
+    if (picks.length < a.passing_loops) (plan.warnings ??= []).push({ passing_loops: `only ${picks.length} of ${a.passing_loops} loops fit on straight stretches of the planned line (each needs ${loopLength + 4} straight tiles)` });
+  }
+  const estimate = src.cost + dst.cost + lineCheck.cost + depotCheck.cost + plan.train.cost + loopCost;
   plan.estimated_cost = estimate;
   plan.money = lineCheck.money;
   plan.affordable = lineCheck.money === null || lineCheck.money >= estimate;
@@ -472,6 +515,12 @@ async function buildCargoRoute(s, company, a) {
     spent += dep.cost ?? 0;
     if (dep.depot) built.push({ step: 'depot', x: dep.depot.x, y: dep.depot.y, front: dep.front, complete: dep.ok, cost: dep.cost });
     if (!dep.ok) return fail('depot', dep.hint ?? 'depot failed', { spent, depot_results: dep.results });
+    if (a.passing_loops > 0 && A.st && B.st) {
+      const loops = await buildLineLoops(s, company, A.st, B.st, a.passing_loops, loopLength, railType);
+      spent += loops.cost;
+      for (const l of loops.built) built.push({ step: 'passing_loop', ...l });
+      if (loops.warning) (plan.warnings ??= []).push({ passing_loops: loops.warning });
+    }
     const locoRes = await exec([['veh_buy', dep.depot.x, dep.depot.y, train.loco.id, -1, -1]]);
     spent += locoRes.cost;
     const loco = locoRes.ok ? locoRes.results[0].value : null;
@@ -2206,7 +2255,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-cargo-route', group: 'build', session: true,
-    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. A town end with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked). warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). Refused (failed_step existing_route) when your rail stations near both ends are already served by one of your vehicles: clone that train instead, or --allow_existing true. Stations nobody serves (e.g. after selling the fleet) do not block it. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
+    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. --passing_loops N lays N passing loops on straight stretches spread along the line, each sized for the train (length = train tiles + 2), so more trains can run on the single track (passing_loops in the result; a loop that does not fit is a warning, not a failure). A town end with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked). warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). Refused (failed_step existing_route) when your rail stations near both ends are already served by one of your vehicles: clone that train instead, or --allow_existing true. Stations nobody serves (e.g. after selling the fleet) do not block it. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
     args: z.object({
       ...act,
       from_industry: int().optional().describe('source industry id (see industries / find-cargo-pairs)'), from_town: z.string().optional().describe('source town id or name'),
@@ -2219,6 +2268,7 @@ export const COMMANDS = [
       margin: int().min(2).max(80).default(20).describe('how far the line may wander outside the two stations'),
       max_bridge: int().min(3).max(40).default(12), rail_type: int().optional().describe('see rail-types; default: the one with the cheapest track'),
       allow_existing: bool().default(false).describe('build even when one of your vehicles already serves your stations at both ends (refused by default: clone trains instead)'),
+      passing_loops: int().min(0).max(6).default(0).describe('passing loops to build on the line, spread along it on straight stretches (loop-sites logic), sized for the train'),
     }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);

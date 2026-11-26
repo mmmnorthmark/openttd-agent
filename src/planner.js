@@ -370,8 +370,9 @@ export function straightRuns(path, railAt) {
 
 /**
  * Passing-loop sites on a traced line. Each straight run long enough for the loop footprint
- * (length + 4 tiles) gets one candidate per side, centred in the run, so the gap to the nearest
- * bend, points, signal or station is as large as the run allows (`gap`). Lane tiles are checked
+ * (length + 4 tiles) gets a candidate per side centred in the run, so the gap to the nearest
+ * bend, points, signal or station is as large as the run allows (`gap`); long runs also get
+ * positions every length + 6 tiles that keep minGap. Lane tiles are checked
  * with loopSiteProblem. Returns candidates [{ x, y, dir, side, length, gap, path_index, problem }]
  * sorted: no problem first, then gap >= minGap, then nearest the middle of the line.
  */
@@ -379,22 +380,61 @@ export function loopSites(path, railAt, classAt, { length = 6, minGap = 8 } = {}
   const need = length + 4;
   const out = [];
   for (const run of straightRuns(path, railAt)) {
-    if (run.tiles.length < need) continue;
-    const offset = Math.floor((run.tiles.length - need) / 2);
-    const gap = Math.min(offset, run.tiles.length - need - offset);
-    const [x0, y0] = run.tiles[offset];
-    const [x1, y1] = run.tiles[offset + need - 1];
-    // Anchor (x, y) is footprint tile 1 (the main track starts one tile behind it), pointing along the run.
-    const dir = run.axis === 'x' ? (x1 > x0 ? 0 : 2) : (y1 > y0 ? 1 : 3);
-    const [ax, ay] = run.tiles[offset + 1];
-    for (const side of [1, -1]) {
-      const loop = passingLoopSteps({ x: ax, y: ay, dir, length, side });
-      const problem = loopSiteProblem(loop, railAt, classAt);
-      out.push({ x: ax, y: ay, dir: DIR_NAMES[dir], side, length, gap, run_tiles: run.tiles.length, path_index: run.from_index + offset + 1, problem });
+    const R = run.tiles.length;
+    if (R < need) continue;
+    // The centred position, plus (on long runs) positions every need + 2 tiles that keep minGap,
+    // so a long straight line can take several loops.
+    const offsets = new Set([Math.floor((R - need) / 2)]);
+    for (let off = minGap; off + need <= R - minGap; off += need + 2) offsets.add(off);
+    for (const offset of [...offsets].sort((p, q) => p - q)) {
+      const gap = Math.min(offset, R - need - offset);
+      const [x0, y0] = run.tiles[offset];
+      const [x1, y1] = run.tiles[offset + need - 1];
+      // Anchor (x, y) is footprint tile 1 (the main track starts one tile behind it), pointing along the run.
+      const dir = run.axis === 'x' ? (x1 > x0 ? 0 : 2) : (y1 > y0 ? 1 : 3);
+      const [ax, ay] = run.tiles[offset + 1];
+      for (const side of [1, -1]) {
+        const loop = passingLoopSteps({ x: ax, y: ay, dir, length, side });
+        const problem = loopSiteProblem(loop, railAt, classAt);
+        out.push({ x: ax, y: ay, dir: DIR_NAMES[dir], side, length, gap, run_tiles: R, path_index: run.from_index + offset + 1, problem });
+      }
     }
   }
   const mid = path.length / 2;
   return out.sort((a, b) => (!!a.problem - !!b.problem) || ((b.gap >= minGap) - (a.gap >= minGap)) || (Math.abs(a.path_index - mid) - Math.abs(b.path_index - mid)) || (b.gap - a.gap));
+}
+
+/**
+ * Pick n loop sites spread along a line: for target positions (i+1)/(n+1) of the path, the free
+ * candidate (loopSites, no problem) nearest to it, keeping chosen loops at least length + 6 path
+ * tiles apart. Returns the chosen candidates (may be fewer than n).
+ */
+export function spreadLoops(cands, n, pathLen, length) {
+  const free = cands.filter((c) => !c.problem);
+  const chosen = [];
+  for (let i = 0; i < n; i++) {
+    const target = ((i + 1) * pathLen) / (n + 1);
+    const pick = free.filter((c) => chosen.every((q) => Math.abs(q.path_index - c.path_index) > length + 6))
+      .sort((p, q) => Math.abs(p.path_index - target) - Math.abs(q.path_index - target))[0];
+    if (pick) chosen.push(pick);
+  }
+  return chosen.sort((p, q) => p.path_index - q.path_index);
+}
+
+/** rail_tiles-like tiles for a planned (not yet built) rail plan, so loopSites can run on it. Returns { path, railAt }. */
+export function plannedRail({ tiles, bridges }) {
+  const heads = new Set();
+  for (const i of bridges) { heads.add(i); heads.add(i + 1); }
+  const map = new Map();
+  const path = [];
+  for (let i = 1; i < tiles.length - 1; i++) {
+    const [x, y] = tiles[i];
+    const [px, py] = tiles[i - 1], [nx, ny] = tiles[i + 1];
+    const tracks = px === x && nx === x ? 2 : py === y && ny === y ? 1 : 4;
+    map.set(`${x},${y}`, { x, y, kind: heads.has(i) ? 'b' : 't', tracks: heads.has(i) ? 0 : tracks, signals: 0 });
+    path.push({ x, y });
+  }
+  return { path, railAt: (x, y) => map.get(`${x},${y}`) ?? null };
 }
 
 // ---- terminus site search -------------------------------------------------------------------

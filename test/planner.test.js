@@ -195,13 +195,33 @@ test('loopSites: centres a loop in each long straight run and ranks by the gap t
   const runs = straightRuns(path, railAt);
   assert.deepEqual(runs.map((r) => [r.axis, r.tiles.length]), [['x', 29], ['y', 8]]);
   const sites = loopSites(path, railAt, () => 'b', { length: 6, minGap: 8 });
-  assert.equal(sites.length, 2); // one run long enough, two sides
+  assert.equal(sites.length, 4); // one run long enough: centred and one more position, two sides each
   const s0 = sites[0];
   assert.deepEqual([s0.dir, s0.length, s0.gap, s0.problem], ['sw', 6, 9, null]);
   // Run x=1..29 (29 tiles), footprint 10, offset 9: footprint x=10..19, anchor x=11.
   assert.deepEqual([s0.x, s0.y], [11, 10]);
   // A house beside the track on one side: that side gets a problem and sorts last.
   const blocked = loopSites(path, railAt, (x, y) => ((y === 11 || y === 9) && x === 14 ? 'o' : 'b'), { length: 6 });
-  assert.equal(blocked.filter((q) => q.problem).length, 2);
+  assert.equal(blocked.filter((q) => q.problem).length, 4);
   assert.equal(blocked[0].problem.code, 'loop_side_occupied_at');
+});
+
+test('plannedRail + spreadLoops: loops spread along a planned straight line, kept apart', async () => {
+  const { plannedRail, spreadLoops, loopSites } = await import('../src/planner.js');
+  const tiles = [];
+  for (let x = 0; x <= 81; x++) tiles.push([x, 5]);
+  const { path, railAt } = plannedRail({ tiles, bridges: [] });
+  assert.equal(path.length, 80);
+  assert.equal(railAt(10, 5).tracks, 1);
+  // The whole line is one straight run, so loopSites offers its middle; spreadLoops needs more
+  // candidates to spread, so build them by hand at several positions.
+  const cands = [10, 20, 30, 40, 50, 60, 70].map((i) => ({ x: i, y: 5, dir: 'sw', side: 1, path_index: i, problem: null }));
+  const two = spreadLoops(cands, 2, 80, 6);
+  assert.deepEqual(two.map((c) => c.path_index), [30, 50]);
+  const three = spreadLoops(cands, 3, 80, 6);
+  assert.deepEqual(three.map((c) => c.path_index), [20, 40, 60]);
+  assert.equal(spreadLoops(cands.slice(0, 1), 2, 80, 6).length, 1);
+  const sites = loopSites(path, railAt, () => 'b', { length: 6 });
+  assert.ok(sites.length >= 8, `long straight run gives several positions (${sites.length})`);
+  assert.equal(spreadLoops(sites, 2, path.length, 6).length, 2);
 });
