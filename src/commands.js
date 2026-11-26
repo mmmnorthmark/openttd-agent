@@ -14,7 +14,7 @@ import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
 import { guide } from './guide.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
-import { vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
+import { ratingTable, vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
@@ -1104,6 +1104,23 @@ export const COMMANDS = [
     description: 'All companies: money, loan, last-quarter income/expenses/value/cargo delivered/performance. Use for competitor assessment.',
     args: z.object({}),
     run: async (ctx) => { const rows = await (await ctx.session()).gs.call('companies'); return listResult('companies', rows, rows); },
+  },
+  {
+    name: 'rating', group: 'game', session: true,
+    description: 'Your performance rating broken down the way the game computes it (out of 1000): per component the value now, what is needed for full points, points and max: vehicles (profitable last year, 120 for 100 points), stations (served station parts, 80 for 100), min_profit (worst vehicle over 2 years old, 10000 for 100), min_income / max_income (worst/best quarter of the last 12, 50000 for 50 / 100000 for 100), delivered (last 4 quarters, 40000 for 400), cargo_types (8 for 50; scripts cannot read it: null), money (10M for 50), loan (no loan = 50). Sorted by missing points, so the first rows are where points are easiest to find. stations counts parts with a vehicle order (the game counts those served in the last 20 days). AgentBridge v12.',
+    args: z.object({ ...who }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      let parts, history;
+      try { [parts, history] = await Promise.all([s.gs.call('rating_parts', { company }), s.gs.call('company_history', { company, quarters: 12 })]); } catch (e) {
+        if (/unknown cmd/.test(e.message)) throw new Error('refused: rating needs AgentBridge v12; the host re-runs install-gamescript and loads the game again');
+        throw e;
+      }
+      const t = ratingTable(parts, history);
+      const last = history.find((r) => r[0] === 1);
+      return { company, game_rating_last_quarter: last ? last[5] : null, estimate_now: t.points_known, estimate_note: `out of ${t.max_known} known points; cargo_types (max 50) is not readable by scripts`,
+        quarters_used: t.quarters_used, components: [...t.components].sort((p, q) => (q.missing ?? -1) - (p.missing ?? -1)) };
+    },
   },
   {
     name: 'chat', group: 'game', session: true,

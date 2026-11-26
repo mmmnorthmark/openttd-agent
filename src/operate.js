@@ -233,3 +233,52 @@ export function stationLine(st) {
   const cargo = st.cargo.length ? st.cargo.map((c) => `${c.name} ${c.waiting} waiting ${c.rating_pct}%`).join(', ') : 'no cargo rating yet';
   return `id ${st.id} ${st.name} [${st.facilities.join('+')}]${st.vehicles !== undefined ? ` ${st.vehicles} veh` : ''}: ${cargo}`;
 }
+
+// ---- performance rating (rating command) --------------------------------------------
+// OpenTTD 15.3 economy.cpp _score_info: { needed, max points } per component; the total is out of 1000.
+export const SCORE_INFO = {
+  vehicles: [120, 100], stations: [80, 100], min_profit: [10000, 100], min_income: [50000, 50], max_income: [100000, 100],
+  delivered: [40000, 400], cargo_types: [8, 50], money: [10000000, 50], loan: [250000, 50],
+};
+
+const HOW = {
+  vehicles: 'vehicles with a profit last year (each counts once)',
+  stations: 'station parts (rail, bus, truck, airport, dock) that a vehicle served in the last 20 days',
+  min_profit: 'profit last year of your worst vehicle older than 2 years (sell or fix loss makers)',
+  min_income: 'worst quarter (income + expenses) of the last 12',
+  max_income: 'best quarter (income + expenses) of the last 12',
+  delivered: 'cargo units delivered in the last 4 quarters',
+  cargo_types: 'cargo types delivered last quarter',
+  money: 'bank balance',
+  loan: '250000 minus your loan (no loan = full points)',
+};
+
+/**
+ * Performance-rating components as OpenTTD's UpdateCompanyRatingAndValue computes them, from the GS
+ * `rating_parts` table and `company_history` rows ([q, value, income, expenses, delivered, perf]).
+ * cargo_types is not readable by scripts: null, and its points are left out of `points_known`.
+ */
+export function ratingTable(parts, history) {
+  const past = history.filter((r) => r[0] >= 1).sort((p, q) => p[0] - q[0]);
+  let valid = 0;
+  for (const r of past) { if (r[1] === 0 && r[2] === 0 && r[3] === 0 && r[4] === 0) break; valid++; }
+  const net = past.slice(0, Math.min(valid, 12)).map((r) => r[2] + r[3]);
+  const raw = {
+    vehicles: parts.profitable_vehicles,
+    stations: parts.station_facilities_served,
+    min_profit: parts.vehicles_over_2_years > 0 && parts.min_profit > 0 ? parts.min_profit : 0,
+    min_income: net.length && Math.min(...net) > 0 ? Math.min(...net) : 0,
+    max_income: net.length ? Math.max(...net) : 0,
+    delivered: past.slice(0, Math.min(valid, 4)).reduce((n, r) => n + r[4], 0),
+    cargo_types: null,
+    money: Math.max(0, parts.money),
+    loan: SCORE_INFO.loan[0] - parts.loan,
+  };
+  const components = Object.entries(SCORE_INFO).map(([name, [needed, max]]) => {
+    const v = raw[name];
+    const points = v === null ? null : Math.floor((Math.min(Math.max(v, 0), needed) * max) / needed);
+    return { component: name, value: v, needed, points, max, missing: points === null ? null : max - points, what: HOW[name] };
+  });
+  const known = components.filter((c) => c.points !== null);
+  return { components, points_known: known.reduce((n, c) => n + c.points, 0), max_known: known.reduce((n, c) => n + c.max, 0), quarters_used: Math.min(valid, 12) };
+}

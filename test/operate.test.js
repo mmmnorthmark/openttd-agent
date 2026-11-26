@@ -511,3 +511,19 @@ test('summary: one line per vehicle and station; filters', async () => {
   const st = await run('summary', { stations: 'Sawmill Halt' });
   assert.deepEqual([st.vehicles, st.stations], [undefined, ['id 5 Sawmill Halt [rail] 1 veh: no cargo rating yet']]);
 });
+
+test('rating: components with points from rating_parts and company_history', async () => {
+  const { ratingTable } = await import('../src/operate.js');
+  const t = ratingTable({ profitable_vehicles: 60, station_facilities_served: 80, vehicles_over_2_years: 3, min_profit: 5000, money: 2_000_000, loan: 100000 },
+    [[0, 1, 0, 0, 0, -1], [1, 10, 60000, -20000, 8000, 300], [2, 10, 30000, -10000, 9000, 290], [3, 0, 0, 0, 0, 0]]);
+  const by = Object.fromEntries(t.components.map((c) => [c.component, c]));
+  assert.deepEqual([by.vehicles.points, by.stations.points, by.min_profit.points], [50, 100, 50]);
+  assert.deepEqual([by.min_income.value, by.min_income.points, by.max_income.value, by.max_income.points], [20000, 20, 40000, 40]);
+  assert.deepEqual([by.delivered.value, by.delivered.points], [17000, 170]);
+  assert.deepEqual([by.money.points, by.loan.value, by.loan.points, by.cargo_types.points], [10, 150000, 30, null]);
+  assert.equal(t.quarters_used, 2);
+  const res = await run('rating', {});
+  assert.equal(res.ok, true);
+  assert.equal(res.components.length, 9);
+  assert.equal(res.game_rating_last_quarter, 209);
+});

@@ -234,7 +234,7 @@ refusal: time, player, company, command, arguments, outcome).
 |---|---|
 | setup | `guide` (what to do next, host or player), `doctor`, `install-gamescript`, `configure`, `show-config`, `launch`, `scenario-prepare` (host) |
 | relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player` |
-| game | `status`, `companies`, `chat`, `rate`, `goal-status` |
+| game | `status`, `companies`, `rating` (performance rating by component), `chat`, `rate`, `goal-status` |
 | host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance`, `save` |
 | world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns; town to town for passengers and mail), `acceptance`, `route-effort`, `airport-types`, `airport-sites` (with your company: `owned` per site), `tiles` (owner marks: `*` yours, `#` another company), `rail-tiles` (exact track, signals and owner per tile), `owned-land` (your owned land as rectangles; GameScript v10) |
 | operate: look | `summary` (one line per vehicle and station), `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |

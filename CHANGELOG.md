@@ -135,6 +135,11 @@ Behaviour changes agents must know:
   compact text line per vehicle (profit this/last year, age, reliability, state, position,
   destination; worst profit first) and per station (vehicles, cargo waiting and rating; worst
   rating first), plus the profit totals. Agents hand-rolled this from `vehicles` and `stations`.
+- New `rating` (GS v12): your performance rating split into the game's nine components (value,
+  needed for full points, points, max, `missing`, what counts), sorted by missing points, with
+  `estimate_now` and `game_rating_last_quarter`. `cargo_types` is not readable by scripts (null);
+  `stations` counts station parts with a vehicle order (the game: served in the last 20 days).
+  Live check: estimate 32 of 950 known points against the game's 37 (one cargo type is ~6 points).
 
 ## 0.6.0 (2026-11-25)
 
