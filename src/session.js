@@ -26,6 +26,8 @@ export class Session {
     this._refreshRow = 0;
     this.pendingSales = new Map(); // "company:vehicle" -> { company, vehicle, replaced_by, since } (vehicle-replace)
     this._salesTimer = null;
+    this.pendingWagons = new Map(); // "company:vehicle" -> { company, vehicle, depot, wagon, cargo, count } (train-add-wagons)
+    this.jobLog = [];               // finished pending jobs, last 50
     this.vehicleHistory = new Map(); // vehicle-problems progress samples
     this.stallHistory = new Map();   // vehicle-problems standstill samples
     this._watchTimers = new Map();   // company -> interval sampling vehicles for stall detection
@@ -161,13 +163,18 @@ export class Session {
 
   // ---- vehicle-replace: sell old vehicles once they stop in a depot ------------------
 
-  /** Sell every pending vehicle that is stopped in a depot. Returns { sold: [...], waiting: [...], gone: [...] }. */
+  /**
+   * Finish pending vehicle jobs whose vehicle is stopped in a depot: sell replaced vehicles
+   * (pendingSales) and attach wagons, then restart (pendingWagons, train-add-wagons).
+   * Returns { sold, waiting, gone, wagons_added }.
+   */
   async finishSales() {
-    const out = { sold: [], waiting: [], gone: [] };
-    const companies = new Set([...this.pendingSales.values()].map((p) => p.company));
-    for (const company of companies) {
+    const out = { sold: [], waiting: [], gone: [], wagons_added: [] };
+    const all = [...this.pendingSales.values(), ...this.pendingWagons.values()];
+    for (const company of new Set(all.map((p) => p.company))) {
       const rows = await this.gs.call('vehicles', { company });
       const state = new Map(rows.map((r) => [r[0], r[11]])); // id -> GS state (2 = in depot)
+      const where = new Map(rows.map((r) => [r[0], { x: r[12], y: r[13] }]));
       for (const [k, p] of this.pendingSales) {
         if (p.company !== company) continue;
         if (!state.has(p.vehicle)) { this.pendingSales.delete(k); out.gone.push(p.vehicle); continue; }
@@ -175,19 +182,37 @@ export class Session {
         const res = await this.exec(company, [['veh_sell', p.vehicle]]);
         if (res.ok) { this.pendingSales.delete(k); out.sold.push({ vehicle: p.vehicle, income: -res.cost, replaced_by: p.replaced_by }); log.info('session', 'sold replaced vehicle', { company, vehicle: p.vehicle, income: -res.cost }); } else out.waiting.push(p.vehicle);
       }
+      for (const [k, p] of this.pendingWagons) {
+        if (p.company !== company) continue;
+        if (!state.has(p.vehicle)) { this.pendingWagons.delete(k); out.gone.push(p.vehicle); continue; }
+        if (state.get(p.vehicle) !== 2) {
+          if (!p.sent) { const r = await this.exec(company, [['veh_depot', p.vehicle, false]]); if (r.ok) p.sent = true; }
+          out.waiting.push(p.vehicle);
+          continue;
+        }
+        this.pendingWagons.delete(k);
+        const depot = p.depot ?? where.get(p.vehicle); // a vehicle in a depot is on the depot tile
+        const res = await this.exec(company, [...Array.from({ length: p.count }, () => ['veh_buy', depot.x, depot.y, p.wagon, p.cargo, p.vehicle]), ['veh_start_stop', p.vehicle, 1]], { keepGoing: true });
+        const added = res.results.filter((r) => r.op === 'veh_buy' && r.ok).length;
+        const entry = { vehicle: p.vehicle, wagons_added: added, of: p.count, cost: res.cost, restarted: res.results.at(-1)?.ok ?? false, ...(res.ok ? {} : { error: res.error }) };
+        out.wagons_added.push(entry);
+        this.jobLog.push({ t: new Date().toISOString(), company, kind: 'add_wagons', ...entry });
+        log.info('session', 'added wagons', { company, ...entry });
+      }
     }
+    if (this.jobLog.length > 50) this.jobLog.splice(0, this.jobLog.length - 50);
     return out;
   }
 
-  /** Check pending sales every 20 s while there are any (the daemon or relay keeps running). */
+  /** Check pending vehicle jobs every 20 s while there are any (the daemon or relay keeps running). */
   watchSales() {
-    if (this._salesTimer || !this.pendingSales.size) return;
+    if (this._salesTimer || !(this.pendingSales.size || this.pendingWagons.size)) return;
     let busy = false;
     this._salesTimer = setInterval(async () => {
       if (busy) return;
       busy = true;
-      try { await this.finishSales(); } catch (e) { log.warn('session', 'pending sale check failed', { error: e.message }); }
-      if (!this.pendingSales.size) { clearInterval(this._salesTimer); this._salesTimer = null; }
+      try { await this.finishSales(); } catch (e) { log.warn('session', 'pending vehicle job check failed', { error: e.message }); }
+      if (!this.pendingSales.size && !this.pendingWagons.size) { clearInterval(this._salesTimer); this._salesTimer = null; }
       busy = false;
     }, 20_000);
     this._salesTimer.unref?.();

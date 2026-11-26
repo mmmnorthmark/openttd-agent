@@ -591,3 +591,38 @@ test('execSummary keeps id 0 of a new vehicle (real runs only)', async () => {
   assert.deepEqual([real.results[0].value, real.results[1].value], [0, undefined]);
   assert.equal(execSummary(steps, [reply], true).results[0].value, undefined);
 });
+
+test('train-add-wagons: in depot now; else to depot, then wagons and restart on arrival', async () => {
+  fake.state.trainInDepot = true;
+  try {
+    const now = await run('train-add-wagons', { vehicle: 11, wagons: 2 });
+    assert.equal(now.ok, true, JSON.stringify(now));
+    assert.deepEqual(lastExec().steps, [['veh_buy', 13, 22, 27, 7, 11], ['veh_buy', 13, 22, 27, 7, 11], ['veh_start_stop', 11, 1]]);
+  } finally { fake.state.trainInDepot = false; }
+  const later = await run('train-add-wagons', { vehicle: 11, wagons: 1 });
+  assert.equal(later.heading_to_depot, true);
+  assert.deepEqual(lastExec().steps, [['veh_depot', 11, false]]);
+  fake.state.trainInDepot = true;
+  try {
+    const fin = await run('train-add-wagons', { finish: true });
+    assert.deepEqual(fin.wagons_added.map((w) => [w.vehicle, w.wagons_added, w.restarted]), [[11, 1, true]]);
+    assert.deepEqual(lastExec().steps, [['veh_buy', 13, 22, 27, 7, 11], ['veh_start_stop', 11, 1]]);
+    assert.deepEqual(fin.pending, []);
+  } finally { fake.state.trainInDepot = false; }
+});
+
+test('add-train: refuses without a loop for the extra train; --force clones, starts and verifies', async () => {
+  fake.state.lostTrain = true; // vehicle 13: orders for stations 3 and 5
+  try { await addTrainChecks(); } finally { fake.state.lostTrain = false; }
+});
+async function addTrainChecks() {
+  const no = await run('add-train', { vehicle: 13 });
+  assert.equal(no.ok, false);
+  assert.equal(no.first_error, 'needs_loop');
+  assert.deepEqual([no.check.trains_on_line, no.check.passing_loops], [1, 0]);
+  const yes = await run('add-train', { vehicle: 13, force: true });
+  assert.equal(yes.ok, true, JSON.stringify(yes).slice(0, 300));
+  assert.deepEqual(fake.received.filter((q) => q.cmd === 'exec').slice(-2).map((q) => q.args.steps[0][0]), ['veh_clone', 'veh_start_stop']);
+  assert.equal(yes.started, true);
+  assert.ok('verify' in yes);
+}

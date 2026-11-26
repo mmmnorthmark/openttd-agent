@@ -273,6 +273,44 @@ async function buildLineLoops(s, company, from, to, n, length, railType) {
   return out;
 }
 
+/**
+ * Passing loops on a traced line: points (tiles with more than one track piece) on the path, not in
+ * a station and not the junction of a depot spur, counted in pairs. A heuristic: other junctions
+ * on the line count too.
+ */
+async function countLoops(tracer, path) {
+  let points = 0;
+  // Terminus throats (points just outside the platforms) are not loops: skip 5 tiles past the
+  // last station tile at the start and before the first one at the end.
+  const kinds = [];
+  for (const p of path) kinds.push((await tracer.tileAt(p.x, p.y))?.kind ?? null);
+  let startEnd = 0;
+  while (startEnd + 1 < kinds.length && kinds[startEnd + 1] === 's') startEnd++;
+  let endStart = kinds.length - 1;
+  while (endStart - 1 >= 0 && kinds[endStart - 1] === 's') endStart--;
+  for (const [i, p] of path.entries()) {
+    if (i <= startEnd + 5 || i >= endStart - 5) continue;
+    const t = await tracer.tileAt(p.x, p.y);
+    if (!t || t.kind !== 't') continue;
+    const pieces = [1, 2, 4, 8, 16, 32].filter((b) => t.tracks & b).length;
+    if (pieces < 2) continue;
+    let spur = false;
+    for (const [dx, dy] of TRACE_DIRS) {
+      const n = await tracer.tileAt(p.x + dx, p.y + dy);
+      if (n && n.kind === 'd' && n.a === p.x && n.b === p.y) spur = true;
+      // A short spur to a depot one tile away.
+      if (n && n.kind === 't' && !path.some((q) => q.x === n.x && q.y === n.y)) {
+        for (const [ex, ey] of TRACE_DIRS) {
+          const m = await tracer.tileAt(n.x + ex, n.y + ey);
+          if (m && m.kind === 'd' && m.a === n.x && m.b === n.y) spur = true;
+        }
+      }
+    }
+    if (!spur) points++;
+  }
+  return Math.floor(points / 2);
+}
+
 /** Terminus search options to try in order for a town end: as asked, wider, shorter, one platform, all three. */
 export function siteFallbacks(o) {
   const out = [o, { ...o, radius: o.radius + 4 }, { ...o, radius: o.radius + 4, length: Math.max(2, o.length - 1) },
@@ -2105,6 +2143,89 @@ export const COMMANDS = [
       return { ok: !bad.length, dry_run: a.dry_run, error: bad.length ? bad.map((r) => `vehicle ${r.vehicle}: ${r.error}`).join('; ') : null,
         ...(bad.length ? { first_error: bad[0].first_error ?? errorCode(bad[0].error) } : {}),
         cost: replaced.reduce((n, r) => n + (r.cost ?? 0), 0), replaced, pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
+    },
+  },
+  {
+    name: 'add-train', group: 'operate', session: true,
+    description: 'Add a train to a running line safely, in one call: counts the trains on the line of --vehicle (same order stations) and the passing loops on its track between its first two stations (pairs of points outside stations and depot spurs), refuses when the trains would outnumber the loops + 1 (single track: each loop lets one more train run; first_error needs_loop with the loop-sites command), then clones the train at a depot on its own route (sharing orders), starts it and traces the new train\'s route (verify). --force true skips the loop check. AgentBridge v12 (counts) and v9 (trace).',
+    args: z.object({ ...act, vehicle: int(), count: int().min(1).max(10).default(1), force: bool().default(false) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const info = await s.gs.call('info');
+      const stops = await orderStations(s, company, a.vehicle);
+      if (stops.length < 2) throw new Error(`refused: vehicle ${a.vehicle} has fewer than two station orders`);
+      const ids = await stationVehicleIds(s, company);
+      const sameLine = ids ? (ids.get(stops[0].id) ?? []).filter((v) => stops.every((st) => (ids.get(st.id) ?? []).includes(v))) : null;
+      const tracer = (info.bridge_version ?? 0) >= 9 ? await makeTracer(s, company, info) : null;
+      let loops = null;
+      if (tracer) {
+        const r = await tracer.trace(await tracer.stationStarts(stops[0]), stops[1]);
+        if (r.connected) loops = await countLoops(tracer, r.path);
+      }
+      const trains = sameLine ? sameLine.length : null;
+      const check = { trains_on_line: trains, passing_loops: loops, after: trains === null ? null : trains + a.count, allowed: loops === null ? null : loops + 1 };
+      if (!a.force && trains !== null && loops !== null && trains + a.count > loops + 1) {
+        return { ok: false, dry_run: a.dry_run, error: `needs_loop: the line already runs ${trains} train${trains === 1 ? '' : 's'} with ${loops} passing loop${loops === 1 ? '' : 's'}; ${trains + a.count} trains on single track need ${trains + a.count - 1} loops. Build one first: loop-sites --vehicle ${a.vehicle}, or --force true`,
+          first_error: 'needs_loop', check };
+      }
+      const { depot, ...routeCheck } = await depotForRoute(s, company, { depot: 'auto', check_route: true }, a.vehicle, { cmd: 'vehicle-clone' });
+      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, true]));
+      const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
+      const out = { ...res, check, depot, ...routeCheck, vehicles };
+      if (a.dry_run || !vehicles.length) return out;
+      const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
+      out.started = started.ok;
+      if (tracer) {
+        try {
+          const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+          const legs = await routeLegs(s, company, tracer, stations, await vehicleOf(s, company, vehicles[0]));
+          out.verify = { connected: legs.connected, ...(legs.connected ? {} : { legs: legs.legs.filter((l) => !l.connected) }) };
+          if (!legs.connected) { out.ok = false; out.error = `route_broken: the new train ${vehicles[0]} has no path to all its stations; see verify`; out.first_error = 'route_broken'; }
+        } catch (e) { out.verify = { connected: null, error: e.message }; }
+      }
+      return out;
+    },
+  },
+  {
+    name: 'train-add-wagons', group: 'operate', session: true,
+    description: 'Lengthen a train by N wagons in one call: if it is stopped in a depot the wagons are bought and attached at once; otherwise it is sent to a depot (vehicle-depot) and the daemon (or relay) attaches them when it arrives and starts it again (checked every 20 s; --finish true does it now and lists what is pending). --wagon defaults to the train\'s own wagon type (AgentBridge v12), refitted to its cargo. Check the platforms and passing loops still fit the longer train (loop-sites --train_tiles N).',
+    args: z.object({ ...act, vehicle: int().optional(), wagons: int().min(1).max(60).optional(), wagon: int().optional(), finish: bool().default(false) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      if (a.finish) {
+        const done = await s.finishSales();
+        return { wagons_added: done.wagons_added, pending: [...s.pendingWagons.values()].filter((p) => p.company === company), recent: s.jobLog.filter((j) => j.company === company && j.kind === 'add_wagons').slice(-10) };
+      }
+      if (a.vehicle === undefined || a.wagons === undefined) throw new Error('give --vehicle ID and --wagons N (or --finish true)');
+      const d = vehicleDetail(await s.gs.call('vehicle', { company, vehicle: a.vehicle }), s.cargos);
+      if (d.type !== 'rail') throw new Error(`refused: vehicle ${a.vehicle} is not a train`);
+      const cargo = d.capacity.find((c) => c.capacity > 0)?.cargo ?? -1;
+      let wagon = a.wagon;
+      if (wagon === undefined) {
+        if (((await s.gs.call('info')).bridge_version ?? 0) < 12) throw new Error('refused: give --wagon ENGINE_ID (the running AgentBridge is older than v12 and cannot read the train\'s wagon type)');
+        const parts = (await s.gs.call('vehicle_wagons', { company, vehicle: a.vehicle })).filter((r) => r[0] > 0);
+        if (!parts.length) throw new Error(`refused: train ${a.vehicle} has no wagons to copy; give --wagon ENGINE_ID (engines --wagons true)`);
+        const freq = new Map();
+        for (const r of parts) freq.set(r[1], (freq.get(r[1]) ?? 0) + 1);
+        wagon = [...freq.entries()].sort((p, q) => q[1] - p[1])[0][0];
+      }
+      const tiles = Math.ceil((d.length ?? 0) / 16);
+      const job = { company, vehicle: a.vehicle, wagon, cargo, count: a.wagons, since: new Date().toISOString() };
+      const now = await vehicleOf(s, company, a.vehicle);
+      if (now.state === 'in_depot') {
+        const res = await run(ctx, a, [...Array.from({ length: a.wagons }, () => ['veh_buy', now.x, now.y, wagon, cargo, a.vehicle]), ['veh_start_stop', a.vehicle, 1]]);
+        return { ...res, vehicle: a.vehicle, wagon, added_now: true, train_tiles_before: tiles };
+      }
+      const sent = await run(ctx, a, [['veh_depot', a.vehicle, false]]);
+      // no_depot: the game finds no depot ahead (a train does not look behind it); retry until it turns.
+      const retry = !sent.ok && sent.first_error === 'no_depot';
+      if (!sent.ok && !retry) return { ...sent, vehicle: a.vehicle };
+      if (a.dry_run) return { ...sent, vehicle: a.vehicle, wagon, would: `send to a depot, then attach ${a.wagons} wagons of engine ${wagon} and restart` };
+      // The depot it stops in is known only on arrival: read it then from the vehicle position.
+      s.pendingWagons.set(`${company}:${a.vehicle}`, { ...job, depot: null, sent: !retry });
+      s.watchSales();
+      return { ...sent, ...(retry ? { ok: true, error: null, first_error: undefined, note: 'no depot ahead of the train yet: the daemon sends it again every 20 s (after it turns at a station it finds one)' } : {}),
+        vehicle: a.vehicle, wagon, heading_to_depot: !retry, pending: [...s.pendingWagons.values()].filter((p) => p.company === company), train_tiles_before: tiles };
     },
   },
   {

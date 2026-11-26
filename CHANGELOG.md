@@ -187,6 +187,14 @@ Behaviour changes agents must know:
   traced connected.
 - Fix: a new vehicle (or sign or group) with id 0 lost its id in exec results, so commands that
   continue with the new vehicle (orders, start, wagons) could not.
+- New `train-add-wagons --vehicle T --wagons N [--wagon W]`: attaches the wagons at once when
+  the train is stopped in a depot; otherwise sends it to a depot (retrying while no depot is ahead
+  of it) and the daemon attaches the wagons on arrival and restarts it (`--finish true` does it now
+  and lists `pending` and `recent`). Live-tested: 4 -> 5 wagons, restarted.
+- New `add-train --vehicle T [--count N] [--force true]`: counts the trains on T's line and the
+  passing loops on its track, refuses with `needs_loop` when the trains would outnumber loops + 1,
+  else clones T on its own route, starts it and traces the new train's route (`verify`).
+  Live-tested: refused on a 3-train/1-loop line, added on a 2-train/2-loop line (connected).
 
 ## 0.6.0 (2026-11-25)
 
