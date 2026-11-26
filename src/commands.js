@@ -16,7 +16,7 @@ import { guide } from './guide.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
 import { vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
-import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
+import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
 import { traceRail, traceRoad, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, vehicleProblems, manhattan as tileDistance } from './problems.js';
@@ -1866,6 +1866,61 @@ export const COMMANDS = [
         out.route_after = 'not_checked: give --for_vehicle ID to trace a train\'s route through the loop';
       }
       return out;
+    },
+  },
+
+  {
+    name: 'loop-sites', group: 'build', session: true,
+    description: 'Where a passing loop fits on one of your lines: walks your own track from one station to the other (--vehicle ID: its first two order stations; or --from_station A --to_station B), finds straight plain stretches long enough for build-passing-loop (length + 4 tiles, no points, curves or signals), puts the loop in the middle of each, checks the lane beside it and dry-runs the best ones. Each site has x, y, dir, side, length, gap (straight tiles left between the loop and the nearest bend, points, signal or station on each side; min_gap_from_bend, default 8, ranks sites that keep that gap first), distance_from_station, position_pct along the line, cost and build (the command to run). length defaults to train_tiles + 2 (train_tiles: --train_tiles, else the longest train on --vehicle\'s line, else 4). Needs AgentBridge v9.',
+    args: z.object({ ...who, vehicle: int().optional(), from_station: z.coerce.string().optional().describe('station id or name'), to_station: z.coerce.string().optional(),
+      train_tiles: int().min(1).max(28).optional(), length: int().min(2).max(30).optional().describe('loop length; default train_tiles + 2'),
+      min_gap_from_bend: int().min(0).default(8).describe('straight tiles wanted between the loop and a bend/points/station on each side'),
+      limit: int().min(1).max(20).default(5).describe('sites returned (each is dry-run)') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const info = await s.gs.call('info');
+      if ((info.bridge_version ?? 0) < 9) throw new Error(`refused: ${OLD_GS_TRACE}`);
+      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      let from, to, train = null;
+      if (a.vehicle !== undefined) {
+        const stops = await orderStations(s, company, a.vehicle);
+        if (stops.length < 2) throw new Error(`refused: vehicle ${a.vehicle} has fewer than two station orders; give --from_station and --to_station`);
+        [from, to] = stops;
+        if (a.train_tiles === undefined) train = await longestTrainOnLine(s, company, a.vehicle);
+      } else {
+        if (a.from_station === undefined || a.to_station === undefined) throw new Error('give --vehicle ID, or both --from_station and --to_station (id or name)');
+        from = findStation(stations, a.from_station); to = findStation(stations, a.to_station);
+      }
+      const trainTiles = a.train_tiles ?? train?.tiles ?? 4;
+      const length = a.length ?? Math.min(30, trainTiles + 2);
+      await s.ensureTiles();
+      const tracer = await makeTracer(s, company, info);
+      const r = await tracer.trace(await tracer.stationStarts(from), to);
+      if (!r.connected) return { ok: false, error: `not_connected: no rail path from ${from.name} to ${to.name}; run verify-route first`, first_error: 'not_connected', first_gap: r.first_gap ?? null };
+      const rail = new Map();
+      for (const p of r.path) {
+        for (const [dx, dy] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const t = await tracer.tileAt(p.x + dx, p.y + dy);
+          if (t) rail.set(`${t.x},${t.y}`, t);
+        }
+      }
+      const railAt = (x, y) => rail.get(`${x},${y}`) ?? null;
+      const cands = loopSites(r.path, railAt, (x, y) => s.map.classAt(x, y), { length, minGap: a.min_gap_from_bend });
+      const sites = [];
+      for (const c of cands.filter((q) => !q.problem).slice(0, a.limit)) {
+        const loop = passingLoopSteps({ x: c.x, y: c.y, dir: dirIndex(c.dir), length, side: c.side });
+        const dry = await s.exec(company, loop.steps, { dryRun: true, railType: railAt(c.x, c.y)?.rail_type });
+        const dist = Math.min(tileDistance(c, from), tileDistance(c, to));
+        sites.push({ x: c.x, y: c.y, dir: c.dir, side: c.side, length, gap: c.gap, meets_min_gap: c.gap >= a.min_gap_from_bend, distance_from_station: dist,
+          position_pct: Math.round((100 * c.path_index) / r.path.length), cost: dry.cost, buildable: dry.ok, ...(dry.ok ? {} : { dry_run_error: dry.error }),
+          build: `build-passing-loop --x ${c.x} --y ${c.y} --dir ${c.dir} --side ${c.side} --length ${length}${a.vehicle !== undefined ? ` --for_vehicle ${a.vehicle}` : ` --train_tiles ${trainTiles}`}` });
+      }
+      sites.sort((p, q) => (q.buildable - p.buildable) || (q.meets_min_gap - p.meets_min_gap));
+      const blocked = cands.filter((q) => q.problem);
+      return { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, line_tiles: r.path.length, train_tiles: trainTiles, ...(train ? { longest_train: train } : {}), length,
+        min_gap_from_bend: a.min_gap_from_bend, straight_stretches_long_enough: new Set(cands.map((q) => `${q.x},${q.y}`)).size,
+        ...listResult('sites', sites, sites, a.limit),
+        ...(sites.length ? {} : { note: blocked.length ? `no free stretch: ${blocked.slice(0, 4).map((q) => `(${q.x},${q.y}) side ${q.side}: ${q.problem.code} at (${q.problem.x},${q.problem.y})`).join('; ')}` : `no straight stretch of ${length + 4} tiles on this line; build a straight section (or a shorter --length for shorter trains)` }) };
     },
   },
 

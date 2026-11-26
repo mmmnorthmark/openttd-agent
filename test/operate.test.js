@@ -402,3 +402,13 @@ test('vehicle-depot: idempotent (already heading / in depot) and decoded failure
     assert.match(old.note, /older than v11/);
   } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 11; }
 });
+
+test('loop-sites: traces the line and explains when no stretch is long enough', async () => {
+  const res = await run('loop-sites', { from_station: 3, to_station: 'Sawmill Halt', train_tiles: 2 });
+  assert.equal(res.ok, true);
+  assert.equal(res.length, 4);
+  assert.ok(res.line_tiles >= 12, JSON.stringify(res));
+  assert.deepEqual(res.sites, []);
+  assert.match(res.note, /no straight stretch of 8 tiles/);
+  await assert.rejects(run('loop-sites', {}), /give --vehicle ID/);
+});

@@ -336,8 +336,65 @@ export function loopSiteProblem(loop, railAt, classAt) {
   }
   for (const [tx, ty] of loop.lane) {
     if (railAt(tx, ty) || classAt(tx, ty) === 'r') return { code: 'loop_side_occupied_at', x: tx, y: ty, detail: 'track already there; pick the other --side or another place' };
+    const c = classAt(tx, ty);
+    if (!LOOP_OK_CLASSES.has(c)) return { code: 'loop_side_occupied_at', x: tx, y: ty, detail: `map class '${c}' (not free land); pick the other --side or another place` };
   }
   return null;
+}
+
+// ---- passing-loop site search (loop-sites) ----------------------------------------------------
+
+/**
+ * Straight runs of a traced line: consecutive path tiles that are plain straight track along the
+ * direction of travel, without signals. path: [{x, y}] in order (traceRail `path`); railAt(x, y)
+ * -> rail_tiles tile. Returns [{ tiles: [[x, y]...], axis: 'x'|'y', from_index }] in path order.
+ */
+export function straightRuns(path, railAt) {
+  const runs = [];
+  let cur = null;
+  for (let i = 0; i < path.length; i++) {
+    const p = path[i];
+    const t = railAt(p.x, p.y);
+    const next = path[i + 1] ?? null, prev = path[i - 1] ?? null;
+    const step = next ?? prev;
+    const axis = step ? (step.x !== p.x ? 'x' : 'y') : null;
+    const straight = t && t.kind === 't' && !t.signals && axis && t.tracks === (axis === 'x' ? 1 : 2)
+      && (!prev || (axis === 'x' ? prev.y === p.y : prev.x === p.x)) && (!next || (axis === 'x' ? next.y === p.y : next.x === p.x));
+    if (straight && cur && cur.axis === axis) { cur.tiles.push([p.x, p.y]); continue; }
+    if (cur) runs.push(cur);
+    cur = straight ? { tiles: [[p.x, p.y]], axis, from_index: i } : null;
+  }
+  if (cur) runs.push(cur);
+  return runs;
+}
+
+/**
+ * Passing-loop sites on a traced line. Each straight run long enough for the loop footprint
+ * (length + 4 tiles) gets one candidate per side, centred in the run, so the gap to the nearest
+ * bend, points, signal or station is as large as the run allows (`gap`). Lane tiles are checked
+ * with loopSiteProblem. Returns candidates [{ x, y, dir, side, length, gap, path_index, problem }]
+ * sorted: no problem first, then gap >= minGap, then nearest the middle of the line.
+ */
+export function loopSites(path, railAt, classAt, { length = 6, minGap = 8 } = {}) {
+  const need = length + 4;
+  const out = [];
+  for (const run of straightRuns(path, railAt)) {
+    if (run.tiles.length < need) continue;
+    const offset = Math.floor((run.tiles.length - need) / 2);
+    const gap = Math.min(offset, run.tiles.length - need - offset);
+    const [x0, y0] = run.tiles[offset];
+    const [x1, y1] = run.tiles[offset + need - 1];
+    // Anchor (x, y) is footprint tile 1 (the main track starts one tile behind it), pointing along the run.
+    const dir = run.axis === 'x' ? (x1 > x0 ? 0 : 2) : (y1 > y0 ? 1 : 3);
+    const [ax, ay] = run.tiles[offset + 1];
+    for (const side of [1, -1]) {
+      const loop = passingLoopSteps({ x: ax, y: ay, dir, length, side });
+      const problem = loopSiteProblem(loop, railAt, classAt);
+      out.push({ x: ax, y: ay, dir: DIR_NAMES[dir], side, length, gap, run_tiles: run.tiles.length, path_index: run.from_index + offset + 1, problem });
+    }
+  }
+  const mid = path.length / 2;
+  return out.sort((a, b) => (!!a.problem - !!b.problem) || ((b.gap >= minGap) - (a.gap >= minGap)) || (Math.abs(a.path_index - mid) - Math.abs(b.path_index - mid)) || (b.gap - a.gap));
 }
 
 // ---- terminus site search -------------------------------------------------------------------

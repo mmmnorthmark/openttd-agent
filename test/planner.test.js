@@ -183,3 +183,25 @@ test('depotCandidates: depot beside a straight line piece, away from the station
   assert.deepEqual(steps[1].slice(5), [6, 10]);
   assert.deepEqual(steps[2].slice(5), [8, 10]);
 });
+
+test('loopSites: centres a loop in each long straight run and ranks by the gap to bends', async () => {
+  const { loopSites, straightRuns } = await import('../src/planner.js');
+  // Line: 30 tiles along y=10 from x=0, a curve at (30,10), then 8 tiles down x=30 (too short for length 6).
+  const path = [];
+  for (let x = 0; x <= 30; x++) path.push({ x, y: 10 });
+  for (let y = 11; y <= 18; y++) path.push({ x: 30, y });
+  const rail = new Map(path.map((p, i) => [`${p.x},${p.y}`, { x: p.x, y: p.y, kind: i === 0 ? 's' : 't', tracks: p.x === 30 && p.y === 10 ? 32 : p.y === 10 ? 1 : 2, signals: 0, owner: 0 }]));
+  const railAt = (x, y) => rail.get(`${x},${y}`) ?? null;
+  const runs = straightRuns(path, railAt);
+  assert.deepEqual(runs.map((r) => [r.axis, r.tiles.length]), [['x', 29], ['y', 8]]);
+  const sites = loopSites(path, railAt, () => 'b', { length: 6, minGap: 8 });
+  assert.equal(sites.length, 2); // one run long enough, two sides
+  const s0 = sites[0];
+  assert.deepEqual([s0.dir, s0.length, s0.gap, s0.problem], ['sw', 6, 9, null]);
+  // Run x=1..29 (29 tiles), footprint 10, offset 9: footprint x=10..19, anchor x=11.
+  assert.deepEqual([s0.x, s0.y], [11, 10]);
+  // A house beside the track on one side: that side gets a problem and sorts last.
+  const blocked = loopSites(path, railAt, (x, y) => ((y === 11 || y === 9) && x === 14 ? 'o' : 'b'), { length: 6 });
+  assert.equal(blocked.filter((q) => q.problem).length, 2);
+  assert.equal(blocked[0].problem.code, 'loop_side_occupied_at');
+});

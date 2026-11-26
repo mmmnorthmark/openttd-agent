@@ -94,6 +94,19 @@ Behaviour changes agents must know:
 - Cargo names match loosely everywhere (`iron_ore`, `Iron Ore`, `iron-ore`); an unknown cargo
   error lists the known names.
 
+- **GameScript v12** (host: `install-gamescript`, then load the game again): `veh_reverse`, `sign`,
+  `sign_remove` and `hq` steps; `company_history`, `rating_parts`, `station_vehicles`,
+  `tile_owners`, `vehicle_wagons`, `signs`, `road_types` queries; `companies` rows gain
+  `station_count` and `vehicles_by_type`, `depots` rows the front tile. Commands that need them
+  say so on an older GameScript.
+- New `loop-sites --vehicle ID` (or `--from_station A --to_station B`): walks your own track
+  between the stations, finds straight plain stretches long enough for `build-passing-loop`
+  (length + 4 tiles), centres the loop in each, checks the lane beside it and dry-runs the best;
+  each site has `gap` (straight tiles to the nearest bend, points, signal or station; ranked by
+  `--min_gap_from_bend`, default 8), `distance_from_station`, `position_pct`, `cost` and `build`.
+- `build-passing-loop` also refuses a loop lane on houses, water or other non-free land
+  (`loop_side_occupied_at` with the map class) before building.
+
 ## 0.6.0 (2026-11-25)
 
 - `purchase-land --x0 --y0 --x1 --y1 [--dry_run true]` (build, your company): buys a rectangle as
