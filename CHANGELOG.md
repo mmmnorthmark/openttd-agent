@@ -32,6 +32,10 @@ Behaviour changes agents must know:
 - `build-cargo-route` refuses `existing_route` only when one of your vehicles has orders at both
   of your stations there (`existing.served_by`); stations nobody serves any more (a sold fleet)
   no longer block a rebuild (`existing_unserved` notes them). The refusal hints `--allow_existing true`.
+- Player profiles: global `--profile NAME` (or `OPENTTD_AGENT_PROFILE=NAME`) reads and, with
+  `configure`, writes `~/.openttd-agent/players/NAME.json`; `OPENTTD_AGENT_PLAYER_FILE=<path>` uses
+  any JSON file (`token` accepted for `relay_token`). Keys override config.json; env vars override
+  both. `relay-add-player` also prints the profile form (`or_as_profile`).
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

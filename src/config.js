@@ -27,26 +27,65 @@ const ENV = {
   company: 'OPENTTD_AGENT_COMPANY', relay: 'OPENTTD_AGENT_RELAY', relay_token: 'OPENTTD_AGENT_RELAY_TOKEN', relay_port: 'OPENTTD_AGENT_RELAY_PORT', daemon_port: 'OPENTTD_AGENT_DAEMON_PORT', max_builds_per_minute: 'OPENTTD_AGENT_MAX_BUILDS_PER_MINUTE',
 };
 
+export const PLAYERS_DIR = path.join(CONFIG_DIR, 'players');
+
+/**
+ * Active player profile: OPENTTD_AGENT_PLAYER_FILE (a JSON file path) or OPENTTD_AGENT_PROFILE
+ * (a name: ~/.openttd-agent/players/<name>.json; the CLI's global --profile sets it). A profile
+ * holds config keys (typically relay, relay_token; `token` is accepted for relay_token) and sits
+ * between config.json and env vars. Returns { name, file } or null.
+ */
+export function activeProfile() {
+  const file = process.env.OPENTTD_AGENT_PLAYER_FILE;
+  if (file) return { name: path.basename(file).replace(/\.json$/i, ''), file: path.resolve(file) };
+  const name = process.env.OPENTTD_AGENT_PROFILE;
+  if (!name) return null;
+  if (!/^[A-Za-z0-9_.-]{1,32}$/.test(name) || name.startsWith('.')) throw new Error(`profile name must be 1-32 of A-Z a-z 0-9 _ . - (not starting with '.'), got '${name}'`);
+  return { name, file: path.join(PLAYERS_DIR, `${name}.json`) };
+}
+
+function readProfile(p) {
+  if (!fs.existsSync(p.file)) {
+    if (process.env.OPENTTD_AGENT_PLAYER_FILE) throw new Error(`player file ${p.file} (OPENTTD_AGENT_PLAYER_FILE) does not exist`);
+    return {};
+  }
+  let data;
+  try { data = JSON.parse(fs.readFileSync(p.file, 'utf8')); } catch (e) { throw new Error(`player profile ${p.file} is not valid JSON: ${e.message}`); }
+  const out = {};
+  for (const [k, v] of Object.entries(data)) {
+    const key = k === 'token' ? 'relay_token' : k;
+    if (key in DEFAULTS) out[key] = v; // other keys (notes, names) are ignored
+  }
+  return out;
+}
+
 export function loadConfig() {
   let file = {};
   if (fs.existsSync(CONFIG_FILE)) file = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-  const cfg = { ...DEFAULTS, ...file };
+  const profile = activeProfile();
+  const cfg = { ...DEFAULTS, ...file, ...(profile ? readProfile(profile) : {}) };
   for (const [key, env] of Object.entries(ENV)) {
     if (process.env[env] !== undefined) cfg[key] = typeof DEFAULTS[key] === 'number' || key === 'company' ? Number(process.env[env]) : process.env[env];
   }
+  if (profile) Object.defineProperty(cfg, 'profile', { value: profile.name, enumerable: true });
   return cfg;
 }
 
-/** Merge `updates` into the config file (only known keys) and return the new config. */
+/**
+ * Merge `updates` into the config file (only known keys) and return the new config. With a
+ * profile active the updates go to the profile file instead (configure --profile NAME ...).
+ */
 export function saveConfig(updates) {
+  const profile = activeProfile();
+  const target = profile ? profile.file : CONFIG_FILE;
   let file = {};
-  if (fs.existsSync(CONFIG_FILE)) file = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  if (fs.existsSync(target)) file = JSON.parse(fs.readFileSync(target, 'utf8'));
   for (const [k, v] of Object.entries(updates)) {
     if (!(k in DEFAULTS)) throw new Error(`unknown config key '${k}'. Known: ${Object.keys(DEFAULTS).join(', ')}`);
     if (v !== undefined) file[k] = v;
   }
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(file, null, 2) + '\n', { mode: 0o600 });
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, JSON.stringify(file, null, 2) + '\n', { mode: 0o600 });
   return loadConfig();
 }
 

@@ -662,7 +662,7 @@ export const COMMANDS = [
   },
   {
     name: 'configure', group: 'setup', session: false,
-    description: `Save settings to ${CONFIG_FILE}. PLAYER: relay (http://<host-LAN-IP>:<port>) and token, both from the host; game commands then go through the host's relay as the company the host bound you to. HOST: admin_password (stays on this machine), admin_port, relay_port. Either: max_builds_per_minute (0 = unlimited). relay "" switches back to the admin port directly.`,
+    description: `Save settings to ${CONFIG_FILE} (with the global --profile NAME or OPENTTD_AGENT_PROFILE: to ~/.openttd-agent/players/NAME.json instead, so several players or agents on one machine each keep their own relay token). PLAYER: relay (http://<host-LAN-IP>:<port>) and token, both from the host; game commands then go through the host's relay as the company the host bound you to. HOST: admin_password (stays on this machine), admin_port, relay_port. Either: max_builds_per_minute (0 = unlimited). relay "" switches back to the admin port directly.`,
     args: z.object({
       relay: z.string().optional().describe('player: relay URL, e.g. http://192.168.1.20:47978 ("" = off)'),
       token: z.string().optional().describe('player: token from the host (relay-add-player)'),
@@ -744,6 +744,7 @@ export const COMMANDS = [
       const urls = lanAddresses().map((ip) => `http://${ip}:${ctx.cfg.relay_port}`);
       return { ...p, relay_urls: urls,
         give_to_player: `openttd-agent configure --relay ${urls[0] ?? `http://<host-LAN-IP>:${ctx.cfg.relay_port}`} --token ${p.token}`,
+        or_as_profile: `openttd-agent --profile ${p.name} configure --relay ${urls[0] ?? `http://<host-LAN-IP>:${ctx.cfg.relay_port}`} --token ${p.token}  (then: openttd-agent --profile ${p.name} <command>, or OPENTTD_AGENT_PROFILE=${p.name})`,
         note: 'The token is shown only now. It is sent in clear text over the LAN (plain HTTP).' };
     },
   },

@@ -158,6 +158,22 @@ starts nothing and prints no secrets; agents should run it first.
    Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.6.0", "mcp"]`.
    Or let the agent use the CLI directly (`openttd-agent help`; every command prints JSON).
 
+### Several players or agents on one machine (profiles)
+
+Each relay token can live in its own profile instead of the shared config, so agents never need
+to export a token on every call:
+
+```sh
+openttd-agent --profile alice configure --relay http://192.168.1.20:47978 --token <alice's token>
+openttd-agent --profile alice status                 # or: OPENTTD_AGENT_PROFILE=alice openttd-agent status
+OPENTTD_AGENT_PLAYER_FILE=/path/to/alice.json openttd-agent status   # any JSON file with relay + relay_token (or token)
+```
+
+A profile is `~/.openttd-agent/players/<name>.json`; its keys override `config.json`, and env vars
+override both. `configure` with a profile writes to the profile. MCP: `openttd-agent --profile alice mcp`.
+A profile without a relay (direct admin-port mode) runs each call in its own process instead of the
+shared daemon, so its `company` applies.
+
 ### A human and an agent in one company
 
 Today the agent can act on anything the company owns: it can sell, reroute or demolish what you
