@@ -73,6 +73,8 @@ test('client-side rate limit blocks builds over max_builds_per_minute', async ()
   try {
     await runCommand(ctx, 'build-road', { x1: 1, y1: 1, x2: 2, y2: 1 });
     await assert.rejects(runCommand(ctx, 'build-road', { x1: 1, y1: 1, x2: 2, y2: 1 }), /client rate limit/);
+    const dry = await runCommand(ctx, 'build-road', { x1: 1, y1: 1, x2: 2, y2: 1, dry_run: true });
+    assert.deepEqual([dry.ok, dry.dry_run, dry.cost], [true, true, 1234], 'a dry run needs no build slot');
   } finally { ctx.close(); }
 });
 

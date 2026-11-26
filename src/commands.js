@@ -1011,12 +1011,14 @@ export const COMMANDS = [
   },
   {
     name: 'build-road', group: 'build', session: true,
-    description: 'Build a straight road from (x1,y1) to (x2,y2) as your company. Subject to client and GameScript rate limits.',
-    args: z.object({ x1: int(), y1: int(), x2: int(), y2: int(), company: int().optional() }),
-    run: async (ctx, a) => {
+    description: 'Build a straight road from (x1,y1) to (x2,y2) as your company. dry_run=true = cost only (same as test-build-road). Subject to client and GameScript rate limits.',
+    args: z.object({ ...act, x1: int(), y1: int(), x2: int(), y2: int() }),
+    run: async (ctx, { dry_run, ...a }) => {
       const s = await ctx.session();
+      const args = { x1: a.x1, y1: a.y1, x2: a.x2, y2: a.y2, company: s.companyOrThrow(a.company) };
+      if (dry_run) return { ...(await s.gs.call('test_build_road', args)), dry_run: true };
       s.throttleBuild();
-      return s.gs.call('build_road', { ...a, company: s.companyOrThrow(a.company) });
+      return { ...(await s.gs.call('build_road', args)), dry_run: false };
     },
   },
 

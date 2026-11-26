@@ -22,6 +22,7 @@ Behaviour changes agents must know:
   the same command lays (build-terminus, build-passing-loop) is marked `skipped_in_dry_run` with
   its `dry_run_error`, and the top-level `ok` counts only real problems.
 - `build-cargo-route` results carry `cost`, `vehicles[]`, and `complete` on every `built[]` entry.
+- `build-road` takes `--dry_run true` like every other build (it was refused as an unknown argument).
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

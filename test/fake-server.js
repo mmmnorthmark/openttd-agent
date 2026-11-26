@@ -174,6 +174,7 @@ const GS = {
   },
   echo: (a) => a,
   build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 98766, echoed_company: a.company }),
+  test_build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 100000, echoed_company: a.company }),
   // operate (row formats: see main.nut)
   stations: () => [
     [3, 'Bigton Woods', 12, 20, 1, [[7, 240, 35]], 2],
