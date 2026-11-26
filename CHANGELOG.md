@@ -69,6 +69,11 @@ Behaviour changes agents must know:
   (`already_heading`; a second send cancelled the depot order), ones already in a depot are
   `already_in_depot`; failures are decoded in `failed[]` (`not_found`, `broken_down`,
   `loading_full_load`, `crashed`, `no_depot`). Older GameScripts only skip vehicles in a depot.
+- `build-road-depot` and `build-road-station` return `connected` (GS v11): true when the entrance
+  (or one end of a drive-through stop) joins a road beyond it, with `ends[]`. `--connect auto`
+  builds a road path from the entrance to the nearest road (`connect`). A refused drive-through
+  stop says why where it can tell: `first_error: drive_through_refused` with `junction`,
+  `one_way_road`, `other_owner_road`, `not_plain_road` or `slope` (the game only said ERR_UNKNOWN).
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

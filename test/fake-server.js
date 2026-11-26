@@ -7,9 +7,10 @@ import { PKT, PacketSplitter, Reader, encodePacket, cstr } from '../src/admin-cl
 export const FAKE_MAP = 64;
 
 // 64x64 world: flat clear land height 2, a water column at x=30 (y 0..63) except
-// a land bridge at y=50..52, a "town" block of houses at 40..44,10..14.
+// a land bridge at y=50..52, a "town" block of houses at 40..44,10..14, a road at y=9 (35..47).
 export function fakeTileClass(x, y) {
   if (x === 30 && !(y >= 50 && y <= 52)) return 'w';
+  if (y === 9 && x >= 35 && x <= 47) return x === 41 || x === 47 ? 's' : 'd'; // the road world of fakeRoadRows
   if (x >= 40 && x <= 44 && y >= 10 && y <= 14) return 'o';
   return 'b';
 }

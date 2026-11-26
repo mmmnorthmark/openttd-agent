@@ -87,9 +87,11 @@ test('build-track sends one rail piece from -> tile -> to', async () => {
 });
 
 test('build-road-depot also joins its entrance to the road', async () => {
-  await cli('build-road-depot', '--x', '27', '--y', '62', '--front_x', '26', '--front_y', '62');
-  const steps = fake.received.at(-1).args.steps;
+  const res = await cli('build-road-depot', '--x', '27', '--y', '62', '--front_x', '26', '--front_y', '62');
+  const steps = fake.received.filter((r) => r.cmd === 'exec').at(-1).args.steps;
   assert.deepEqual(steps[1], ['road', 26, 62, 27, 62]);
+  assert.equal(res.connected, false, 'the fake road world has no road there');
+  assert.match(res.hint, /--connect auto/);
 });
 
 test('unknown flags are refused and nothing runs; --help prints command help', async () => {

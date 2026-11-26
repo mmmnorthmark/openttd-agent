@@ -280,3 +280,20 @@ test('build-signal --remove: no_signal_here instead of ERR_PRECONDITION_FAILED',
   assert.deepEqual(lastExec().steps, [['signal_remove', 18, 20, 19, 20]]);
   assert.equal((await run('build-signal', { x: 5, y: 5, front_x: 7, front_y: 5, remove: true })).first_error, 'front_not_adjacent');
 });
+
+test('road stops and depots: connected, --connect auto, decoded drive-through refusals', async () => {
+  const dep = await run('build-road-depot', { x: 38, y: 12, front_x: 38, front_y: 11, connect: 'auto' });
+  assert.equal(dep.ok, true);
+  assert.deepEqual([dep.connect.ok, dep.connect.from, dep.connect.to], [true, { x: 38, y: 11 }, { x: 38, y: 9 }]);
+  assert.equal(lastExec().steps[0][0], 'road');
+  fake.state.failOps = ['road_station'];
+  try {
+    const dt = await run('build-road-station', { x: 36, y: 9, front_x: 37, front_y: 9, drive_through: true });
+    assert.equal(dt.first_error, 'drive_through_refused');
+    assert.match(dt.error, /junction: road leaves \(36,9\) sideways/);
+  } finally { fake.state.failOps = []; }
+  const bay = await run('build-road-station', { x: 47, y: 10, front_x: 47, front_y: 9 });
+  assert.equal(bay.connected, false, 'the fake world has no stop there');
+  const dry = await run('build-road-depot', { x: 38, y: 12, front_x: 38, front_y: 11, dry_run: true });
+  assert.equal(dry.connected, undefined, 'a dry run builds nothing to check');
+});
