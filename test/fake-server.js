@@ -14,11 +14,12 @@ export function fakeTileClass(x, y) {
   return 'b';
 }
 
-function dumpRows({ y0, y1, x0 = 0, x1 = FAKE_MAP - 1 }) {
+// Owned land (any company) shows as 'o' in the mirror, like objects in the real TileClass.
+function dumpRows({ y0, y1, x0 = 0, x1 = FAKE_MAP - 1 }, state) {
   const out = [];
   for (let y = y0; y <= y1; y++) {
     let s = `${y},${x0},`;
-    for (let x = x0; x <= x1; x++) s += '02' + '0' + fakeTileClass(x, y);
+    for (let x = x0; x <= x1; x++) s += '02' + '0' + (fakeLandOwner(x, y, state) !== null ? 'o' : fakeTileClass(x, y));
     out.push(s);
   }
   return out;
@@ -49,6 +50,40 @@ function fakeLoanStep([, kind, n], dry, state) {
   if (want - state.loan + state.money < 0) return [false, 0, `refused: repaying ${state.loan - want} needs that much cash; bank balance is ${state.money}`, want];
   if (!dry) { state.money += want - state.loan; state.loan = want; }
   return [true, 0, '', want];
+}
+
+// Owned land as BuyLandStep / CmdOwnedLand in main.nut (AgentBridge v10). state.land maps "x,y" -> owning
+// company. Tiles with class 'o' (houses) are town buildings, 'w' water, state.landOwnedBy["x,y"] another
+// company's property. Each tile costs 50. state.landFailAt ("x,y") makes the real purchase fail there.
+const FAKE_LAND_PRICE = 50;
+function fakeLandOwner(x, y, state) { return state?.land.get(`${x},${y}`) ?? null; }
+function fakeLandRefusal(company, x, y, state) {
+  if (x < 0 || y < 0 || x >= FAKE_MAP || y >= FAKE_MAP) return 'is outside the map';
+  const owner = fakeLandOwner(x, y, state);
+  if (owner === company) return 'is already your owned land';
+  if (owner !== null) return `belongs to company ${owner}`;
+  if (state.landOwnedBy[`${x},${y}`] !== undefined) return `belongs to company ${state.landOwnedBy[`${x},${y}`]}`;
+  if (fakeTileClass(x, y) === 'o') return 'is a town building';
+  if (fakeTileClass(x, y) === 'w') return 'is water';
+  return null;
+}
+function fakeBuyLand([, x0, y0, x1, y1], company, dry, state) {
+  if (state.gsVersion < 10) return [false, 0, 'unknown exec op: buy_land', 0];
+  const total = (x1 - x0 + 1) * (y1 - y0 + 1);
+  const bad = [];
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const why = fakeLandRefusal(company, x, y, state);
+    if (why) bad.push(`${x},${y} ${why}`);
+  }
+  if (bad.length) return [false, 0, `refused: ${bad.length} of ${total} tiles cannot be bought, nothing was bought: ${bad.slice(0, 6).join('; ')}${bad.length > 6 ? '; ...' : ''}`, 0];
+  if (!dry && total * FAKE_LAND_PRICE > state.money) return [false, 0, `refused: ${total} tiles cost about ${total * FAKE_LAND_PRICE}, bank balance is ${state.money}; nothing was bought`, 0];
+  let done = 0;
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    if (!dry && state.landFailAt === `${x},${y}`) return [false, done * FAKE_LAND_PRICE, `tile ${x},${y}: ERR_NOT_ENOUGH_CASH (${done} tiles bought before it)`, done];
+    if (!dry) { state.land.set(`${x},${y}`, company); state.money -= FAKE_LAND_PRICE; }
+    done++;
+  }
+  return [true, done * FAKE_LAND_PRICE, '', done];
 }
 
 // Goal rows as CmdGoalStatus sends them. Progress comes from state.delivered[label] (tests set it).
@@ -123,6 +158,10 @@ const GS = {
   companies: (_a, state) => [{ id: 0, name: 'Test Transport', money: state.money, loan: state.loan, max_loan: FAKE_MAX_LOAN }],
   get_rate: () => ({ command_delay_ticks: 0, max_builds_per_day: 0 }),
   dump_tiles: dumpRows,
+  // owned_land (v10): indices of the points that are a.company's owned land.
+  owned_land: (a, state) => a.points.map(([x, y], i) => (fakeLandOwner(x, y, state) === a.company ? i : -1)).filter((i) => i >= 0),
+  check_airport: (a) => ({ noise_increase: 1, nearest_town: 0, town_allowed_noise: 4,
+    ...(a.company !== undefined ? { buildable: true, cost: 5000, error: '' } : {}) }),
   acceptance: (a) => {
     const rows = [];
     a.points.forEach((p, i) => {
@@ -192,6 +231,11 @@ const GS = {
     const rows = [];
     let stopped = '';
     for (const st of a.steps) {
+      if (st[0] === 'buy_land') {
+        rows.push(fakeBuyLand(st, a.company, a.dry_run, state));
+        if (!rows.at(-1)[0] && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+        continue;
+      }
       if (st[0] === 'loan') {
         rows.push(fakeLoanStep(st, a.dry_run, state));
         if (!rows.at(-1)[0] && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
@@ -209,7 +253,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], money: 100000, loan: 300000, gsVersion: 9, lostTrain: false, railGap: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], money: 100000, loan: 300000, gsVersion: 10, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null };
   const server = net.createServer((sock) => {
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));
@@ -225,7 +269,7 @@ export function startFakeServer({ password = 'pw' } = {}) {
         } else if (type === PKT.ADMIN_GAMESCRIPT) {
           const req = JSON.parse(r.str());
           received.push(req);
-          const handler = GS[req.cmd];
+          const handler = req.cmd === 'owned_land' && state.gsVersion < 10 ? undefined : GS[req.cmd];
           const base = { id: req.id, client: req.client };
           if (!handler) { send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: false, part: 0, last: true, error: `unknown cmd: ${req.cmd}` }))); continue; }
           let data;
