@@ -3,6 +3,23 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
+## Unreleased (next: 0.6.0)
+
+- `purchase-land --x0 --y0 --x1 --y1 [--dry_run true]` (build, your company): buys a rectangle as
+  owned land ("Purchase land for future use"), any two opposite corners, at most 400 tiles per
+  call. All or nothing: refused, buying nothing, if any tile belongs to another company, is an
+  industry, a town building, road, rail, a station, water or an object, is already yours, or the
+  bank balance is short; the error lists up to 6 tiles and why. A dry run returns `tiles`,
+  `estimated_cost` and `affordable`. A failure while buying returns `tiles_bought`, `bought`
+  (rectangles), `failed_tile` and `not_bought`.
+- `owned-land [--x0 --y0 --x1 --y1] [--limit 50]` (your company): owned land as `tiles` and merged
+  `rects` [x0, y0, x1, y1]; the whole map comes from the map mirror, a given rectangle is read fresh.
+- `airport-sites`: with a company, your owned land counts as buildable, each site has `owned`
+  (whole footprint is your owned land) and owned sites come first.
+- GameScript v10 (the host re-runs `install-gamescript`; a running game picks it up when it is
+  loaded again): `buy_land` exec step and `owned_land` query. With an older GameScript,
+  `purchase-land` and `owned-land` say so and `airport-sites` leaves out `owned`.
+
 ## 0.5.0 (2026-11-25)
 
 - Agent skills in `skills/` (`openttd-host-game`, `openttd-join-game`, `openttd-play`), installable as a

@@ -209,13 +209,13 @@ refusal: time, player, company, command, arguments, outcome).
 | relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player` |
 | game | `status`, `companies`, `chat`, `rate`, `goal-status` |
 | host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance`, `save` |
-| world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns; town to town for passengers and mail), `acceptance`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
+| world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns; town to town for passengers and mail), `acceptance`, `route-effort`, `airport-types`, `airport-sites` (with your company: `owned` per site), `tiles`, `owned-land` (your owned land as rectangles; GameScript v10) |
 | operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
 | operate: diagnose | `vehicle-problems` (one row per problem: `problem`, `severity` (`action` or `info`; `--severity action` for only what needs a command), `evidence`, `suggested_fix`, with the id and the unit number the game shows as "Train #4"), `verify-route` (`--vehicle ID`, or `--from_station A --to_station B`: is there a rail path, and if not, the last reachable tile and the first gap) |
 | operate: change | `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot`, `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace`, `loan` (`--amount N`, `--borrow N`, `--repay N` or `--max true`; GameScript v8) |
 | build: rail | `build-cargo-route` (stations, line, depot, train, orders in one call), `station-sites`, `build-line-depot`, `rail-types`, `build-rail` (planned path), `build-track` (one piece, for junctions and depot spurs), `build-rail-station`, `build-rail-depot`, `build-signal`, `build-terminus`, `build-passing-loop` |
 | build: road | `build-road-path` (planned path), `build-road-station`, `build-road-depot`, `build-road` / `test-build-road` (straight) |
-| build: other | `bridge-types`, `build-bridge`, `build-tunnel`, `terraform`, `demolish`, `build-dock`, `build-buoy`, `build-water-depot`, `build-airport` |
+| build: other | `bridge-types`, `build-bridge`, `build-tunnel`, `terraform`, `demolish`, `purchase-land` (owned land, up to 400 tiles; GameScript v10), `build-dock`, `build-buoy`, `build-water-depot`, `build-airport` |
 
 Every command that changes the game takes `--dry_run true` (cost and feasibility only). It acts as
 your company: the one the host bound your token to (a different `--company` is refused).
@@ -351,6 +351,10 @@ openttd-agent unpause
   `demolish`, other anchors) and run the same command again: existing pieces are skipped.
 - **`demolish` is guarded** in the GameScript: never another company's property, industries or town
   roads, and town buildings only with `--allow_houses true`.
+- **`purchase-land` is all or nothing**: the GameScript checks every tile first (another
+  company's property, industries, town buildings, roads, rail, stations, water, objects, land you
+  already own) and the cost against your bank balance, and buys nothing if one fails. If the game
+  still refuses a tile while buying, the reply lists the `bought` rectangles and the `failed_tile`.
 - The planner's slope rules are simpler than the game's; on hilly ground expect to iterate.
 
 ## Tips for agents
