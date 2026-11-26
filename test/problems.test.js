@@ -46,3 +46,12 @@ test('vehicleProblems: broken line, idle and old vehicles', () => {
   const waiting = vehicleProblems(train({ speed: 0 }), { today: 100, stuckDays: 30, progress: { since: 40, best: 3 } });
   assert.match(waiting[0].suggested_fix, /red signal/);
 });
+
+test('breakdowns, low reliability and old age are info; the fix does not stop a running train', () => {
+  const info = vehicleProblems(train({ state: 'broken', age_pct: 104 }), { today: 10 });
+  assert.deepEqual(info.map((p) => [p.problem, p.severity]), [['old', 'info'], ['broken_down', 'info']]);
+  const low = vehicleProblems(train({ reliability_pct: 30 }), { today: 10 });
+  assert.equal(low[0].severity, 'info');
+  assert.match(low[0].suggested_fix, /^none needed.*--vehicles 31 --service true/);
+  assert.equal(vehicleProblems(train({ state: 'in_depot' }), { today: 10 })[0].severity, 'action');
+});

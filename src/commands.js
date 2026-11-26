@@ -994,10 +994,11 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-problems', group: 'operate', session: true,
-    description: 'Vehicles with problems, one row per problem: problem, evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot, stopped, old, broken_down, low_reliability, crashed. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
+    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot, stopped, old, broken_down, low_reliability, crashed. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
     args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'),
       stuck_days: int().min(1).default(30).describe('game days without progress before a vehicle counts as stuck or lost'),
-      trace: bool().default(true).describe('check rail connectivity to each train\'s destination') }),
+      trace: bool().default(true).describe('check rail connectivity to each train\'s destination'),
+      severity: z.enum(['all', 'action', 'info']).default('all').describe('action = only problems that need a command') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const info = await s.gs.call('info');
@@ -1047,13 +1048,14 @@ export const COMMANDS = [
           }
         }
         for (const p of vehicleProblems(v, { today: info.date, stuckDays: a.stuck_days, progress, reach, line })) {
-          rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p });
+          if (a.severity === 'all' || a.severity === p.severity) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p });
         }
       }
       const samples = vehicles.map((v) => s.vehicleHistory.get(`${company}:${v.id}`)).filter(Boolean);
       const watched = samples.length ? info.date - Math.min(...samples.map((e) => e.first)) : 0;
       return {
         date: gameDate(info), checked: vehicles.length, vehicles_with_problems: new Set(rows.map((r) => r.id)).size,
+        vehicles_needing_action: new Set(rows.filter((r) => r.severity === 'action').map((r) => r.id)).size,
         trace_method: tracer?.method ?? 'off', ...(tracer?.method === 'mirror_adjacency' ? { trace_note: OLD_GS_TRACE } : {}),
         history: { days_watched: watched, stuck_check: watched >= a.stuck_days ? 'active' : `needs another call in ${a.stuck_days - watched} game days` },
         problems: rows,

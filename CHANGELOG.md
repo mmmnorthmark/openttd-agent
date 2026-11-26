@@ -3,6 +3,14 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
+## (unreleased)
+
+- `vehicle-problems` rows carry `severity`: `action` (it cannot earn until fixed) or `info`
+  (`broken_down`, `low_reliability`, `old`, `crashed`: leave a running train alone).
+  `--severity action|info` filters; the reply adds `vehicles_needing_action`. The fixes for
+  breakdowns and low reliability no longer suggest a plain `vehicle-depot`, which stopped working
+  trains in the depot (an agent then restarted them, over and over, in a live game).
+
 ## 0.3.0 (2026-11-25)
 
 - `vehicle-problems [--vehicle ID] [--stuck_days 30]` (player, own company): one row per problem

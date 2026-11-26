@@ -35,11 +35,14 @@ const fmtTile = (p) => `(${p.x},${p.y})`;
  * dest_station, dest_name, speed. `progress`: entry from recordProgress (or null).
  * `reach`: trace from the vehicle to its destination ({ connected, method, last_reachable, first_gap }) or null.
  * `line`: trace between the vehicle's own order stations, or null.
- * Returns [{ problem, evidence, suggested_fix }].
+ * Returns [{ problem, severity, evidence, suggested_fix }]. severity 'action': the vehicle cannot
+ * earn until fixed; 'info': worth knowing, no command needed now (do not stop a working train for it).
  */
+export const INFO_PROBLEMS = new Set(['crashed', 'old', 'broken_down', 'low_reliability']);
+
 export function vehicleProblems(v, { today, stuckDays = 30, progress = null, reach = null, line = null } = {}) {
   const out = [];
-  const add = (problem, evidence, suggested_fix) => out.push({ problem, evidence, suggested_fix });
+  const add = (problem, evidence, suggested_fix) => out.push({ problem, severity: INFO_PROBLEMS.has(problem) ? 'info' : 'action', evidence, suggested_fix });
   const dest = v.dest_name ? `${v.dest_name} ${v.dest ? fmtTile(v.dest) : ''}`.trim() : v.dest ? fmtTile(v.dest) : 'its destination';
   if (v.state === 'crashed') add('crashed', 'state crashed', 'nothing to do: the wreck disappears; replace the train if the line needs it');
   if (v.order_count === 0) add('no_orders', 'order_count 0', `give it orders: order-add --vehicle ${v.id} (or orders-copy from a working vehicle of the same line)`);
@@ -73,9 +76,9 @@ export function vehicleProblems(v, { today, stuckDays = 30, progress = null, rea
     add('no_income', `profit_last_year ${v.profit_last_year} at age ${Math.floor(v.age_days / 365)} years`,
       out.length ? 'fix the problems above first; they stop it earning' : 'check that it loads (stations: cargo waiting, rating) and delivers to a station that accepts the cargo; sell it if the line cannot pay');
   }
-  if (v.age_pct >= 100) add('old', `age ${v.age_days} days is ${v.age_pct}% of its max age`, `replace it: group-autoreplace, or vehicle-sell and buy a newer engine (engines --type ${v.type})`);
-  if (v.state === 'broken') add('broken_down', 'broken down now', `reliability ${v.reliability_pct}%: replace old engines and keep servicing on (breakdown counts are not exposed to scripts)`);
-  else if (v.reliability_pct < 40 && v.state !== 'crashed') add('low_reliability', `reliability ${v.reliability_pct}%`, `it will break down often: send it for servicing (vehicle-depot --vehicles ${v.id} --service true) or replace it`);
+  if (v.age_pct >= 100) add('old', `age ${v.age_days} days is ${v.age_pct}% of its max age`, `when convenient: group-autoreplace, or buy a newer engine (engines --type ${v.type}) for its line and sell this one; it keeps running meanwhile`);
+  if (v.state === 'broken') add('broken_down', 'broken down now', `none now: it moves again by itself in a few days (reliability ${v.reliability_pct}%); do not send it to a depot. If it happens often, replace old engines`);
+  else if (v.reliability_pct < 40 && v.state !== 'crashed') add('low_reliability', `reliability ${v.reliability_pct}%`, `none needed while it runs: trains service at depots on their route automatically. Optional: vehicle-depot --vehicles ${v.id} --service true (service and carry on; without --service true it stops in the depot), or replace it when old`);
   return out;
 }
 
