@@ -14,6 +14,7 @@ import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
 import { guide } from './guide.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
+import { readStats, statsView, RELAY_STATS_FILE } from './relay-stats.js';
 import { ratingTable, vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
@@ -1136,6 +1137,16 @@ export const COMMANDS = [
     description: "HOST ONLY: bind a registered player to a company (or 'pending' to unbind), and/or change their build limit. Applies to their next request; the relay need not restart.",
     args: z.object({ name: z.string(), company: z.string().optional().describe("company id or 'pending'"), max_builds_per_minute: int().min(0).optional() }),
     run: (_ctx, a) => updatePlayer(a.name, { company: a.company, maxBuildsPerMinute: a.max_builds_per_minute }),
+  },
+  {
+    name: 'relay-stats', group: 'relay', session: false,
+    description: `HOST ONLY: is each relay player still active? Per player: last_call, seconds_since_last_call, last_command, calls_last_minute, calls_per_min_10min, calls_total, refused_total, errors_total, last_refusal (since the relay started). Read from ${RELAY_STATS_FILE}, which the running relay updates every few seconds; never served through the relay.`,
+    args: z.object({}),
+    run: () => {
+      const snap = readStats();
+      if (!snap) return { ok: true, error: null, running: false, note: 'no stats yet: the relay has not started or has had no calls (openttd-agent relay)', players: [] };
+      return { started: snap.started ?? null, ...statsView(snap) };
+    },
   },
   {
     name: 'relay-remove-player', group: 'relay', session: false,

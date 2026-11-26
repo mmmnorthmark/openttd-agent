@@ -109,7 +109,7 @@ test('every command that changes the game or reads company data takes a company 
 
 test('host-only commands are refused for players', async () => {
   for (const [name, args] of [['launch', { mode: 'dedicated', admin_password: 'sent-by-player' }], ['install-gamescript', {}], ['configure', { admin_password: 'x' }],
-    ['show-config', {}], ['relay-add-player', { name: 'eve', company: 0 }], ['relay-list-players', {}], ['rate', { max_builds_per_day: 1 }], ['rcon', { command: 'quit' }], ['scenario-prepare', { search: 'mini' }], ['goal-set', { deadline_year: 1960, targets: 'PASS:1' }], ['goal-clear', {}], ['pause', {}], ['unpause', {}], ['turn-advance', { days: 1 }], ['save', { name: 'x' }]]) {
+    ['show-config', {}], ['relay-add-player', { name: 'eve', company: 0 }], ['relay-list-players', {}], ['relay-stats', {}], ['rate', { max_builds_per_day: 1 }], ['rcon', { command: 'quit' }], ['scenario-prepare', { search: 'mini' }], ['goal-set', { deadline_year: 1960, targets: 'PASS:1' }], ['goal-clear', {}], ['pause', {}], ['unpause', {}], ['turn-advance', { days: 1 }], ['save', { name: 'x' }]]) {
     const r = await call(tokens.alice, name, args);
     assert.equal(r.status, 403, name);
     assert.match(r.error, /relay refused/, name);
@@ -223,4 +223,23 @@ test('authorize is pure and leaves the caller\'s args alone', () => {
   assert.equal(raw.company, undefined);
   assert.throws(() => relayMod.authorize({ name: 'p', company: 3 }, 'build-road', { company: '4' }), relayMod.Refused);
   assert.equal(relayMod.authorize({ name: 'p', company: 3 }, 'build-road', { company: '3' }).company, 3);
+});
+
+test('relay-stats (host): per player last call, calls per minute and refusals', async () => {
+  const { makeStatsRecorder, statsView, recordCall } = await import('../src/relay-stats.js');
+  const st = { players: {} };
+  recordCall(st, { player: 'p', outcome: 'ok', name: 'stations', now: 1_000_000 });
+  recordCall(st, { player: 'p', outcome: 'refused', name: 'launch', now: 1_030_000 });
+  const v = statsView(st, 1_050_000);
+  assert.deepEqual([v.players[0].calls_last_minute, v.players[0].refused_total, v.players[0].seconds_since_last_call, v.players[0].last_command], [2, 1, 20, 'launch']);
+  assert.equal(statsView(st, 1_000_000 + 11 * 60_000).players[0].calls_last_minute, 0);
+  // The running relay recorded the calls above; flush it and read it as the host would.
+  relay.close();
+  const { runCommand } = await import('../src/commands.js');
+  const res = await runCommand({ cfg: {} }, 'relay-stats', {});
+  const alice = res.players.find((p) => p.player === 'alice');
+  assert.ok(alice.calls_total > 0 && alice.refused_total > 0, JSON.stringify(alice));
+  assert.ok(makeStatsRecorder);
+  relay = await relayMod.startRelay({ port: 0, bind: '127.0.0.1' }); // for the tests after this one
+  url = `http://127.0.0.1:${relay.port}`;
 });

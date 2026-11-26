@@ -168,6 +168,10 @@ Behaviour changes agents must know:
   `front_joined` and `front_leads` (where a train leaving it can go) with a warning when nothing
   joins the entrance or trains can leave one way only (a new train then ran to the far end of the
   line to turn round, which looked lost).
+- New host-only `relay-stats`: per relay player `last_call`, `seconds_since_last_call`,
+  `last_command`, `calls_last_minute`, `calls_per_min_10min`, totals of calls, refusals and errors,
+  `last_refusal` (since the relay started; the relay writes `~/.openttd-agent/relay-stats.json`
+  every few seconds). Never served through the relay.
 
 ## 0.6.0 (2026-11-25)
 
