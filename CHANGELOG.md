@@ -131,6 +131,10 @@ Behaviour changes agents must know:
   vehicles share them), `--start true` starts them. Flags and stations are checked before buying.
 - `stations` rows carry `vehicle_ids` (GS v12: your vehicles with an order for that station), and
   `vehicles --station ID|name` lists only those.
+- New `summary [--group G | --vehicles A,B | --stations A,B | --what vehicles|stations]`: one
+  compact text line per vehicle (profit this/last year, age, reliability, state, position,
+  destination; worst profit first) and per station (vehicles, cargo waiting and rating; worst
+  rating first), plus the profit totals. Agents hand-rolled this from `vehicles` and `stations`.
 
 ## 0.6.0 (2026-11-25)
 

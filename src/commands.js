@@ -14,7 +14,7 @@ import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
 import { guide } from './guide.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
-import { vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
+import { vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
@@ -1475,6 +1475,36 @@ export const COMMANDS = [
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       return vehicleDetail(await s.gs.call('vehicle', { company, vehicle: a.vehicle }), s.cargos);
+    },
+  },
+  {
+    name: 'summary', group: 'operate', session: true,
+    description: 'One compact text line per vehicle and per station, for a quick look without big JSON: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination"; stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
+    args: z.object({ ...who, group: int().optional(), vehicles: ids().optional(), stations: z.string().optional().describe('comma-separated station ids or names'),
+      what: z.enum(['all', 'vehicles', 'stations']).default('all'), limit: int().min(1).default(200) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const names = new Map(stations.map((st) => [st.id, st.name]));
+      const picked = a.group !== undefined || a.vehicles || a.stations;
+      const wantV = a.what !== 'stations' && (!picked || a.group !== undefined || a.vehicles);
+      const wantS = a.what !== 'vehicles' && (!picked || a.stations);
+      const out = { company };
+      if (wantV) {
+        const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
+        const hit = all.filter((v) => (a.group === undefined || v.group === a.group) && (!a.vehicles || a.vehicles.includes(v.id))).sort((p, q) => p.profit_last_year - q.profit_last_year);
+        const lines = hit.map((v) => vehicleLine(v, names));
+        Object.assign(out, { vehicles_total: hit.length, vehicles: lines.slice(0, a.limit),
+          vehicles_profit: `this year ${hit.reduce((n, v) => n + v.profit_this_year, 0)}, last year ${hit.reduce((n, v) => n + v.profit_last_year, 0)}` });
+      }
+      if (wantS) {
+        const sel = a.stations ? a.stations.split(',').map((t) => findStation(stations, t.trim())) : stations;
+        const minRating = (st) => Math.min(101, ...st.cargo.map((c) => c.rating_pct));
+        const lines = [...sel].sort((p, q) => minRating(p) - minRating(q)).map(stationLine);
+        Object.assign(out, { stations_total: sel.length, stations: lines.slice(0, a.limit) });
+      }
+      out.truncated = (out.vehicles_total ?? 0) > a.limit || (out.stations_total ?? 0) > a.limit;
+      return out;
     },
   },
   {

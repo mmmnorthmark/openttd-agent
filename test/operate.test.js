@@ -498,3 +498,16 @@ test('stations carry vehicle_ids (v12); vehicles --station filters by them', asy
     await assert.rejects(run('vehicles', { station: 3 }), /needs AgentBridge v12/);
   } finally { fake.state.gsVersion = 12; }
 });
+
+test('summary: one line per vehicle and station; filters', async () => {
+  const res = await run('summary', {});
+  assert.equal(res.ok, true);
+  assert.equal(res.vehicles.length, 2);
+  assert.match(res.vehicles[0], /^#1 id 11 Train 1 \[rail\] profit -1\.2k\/-3k .* rel 62% running \(14,20\)/);
+  assert.match(res.stations.join('\n'), /id 3 Bigton Woods \[rail\] 2 veh: Wood 240 waiting 35%/);
+  const one = await run('summary', { vehicles: '12' });
+  assert.deepEqual([one.vehicles.length, one.stations], [1, undefined]);
+  assert.match(one.vehicles[0], /-> Bigton Central/);
+  const st = await run('summary', { stations: 'Sawmill Halt' });
+  assert.deepEqual([st.vehicles, st.stations], [undefined, ['id 5 Sawmill Halt [rail] 1 veh: no cargo rating yet']]);
+});

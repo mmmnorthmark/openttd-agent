@@ -216,3 +216,20 @@ export function findExistingRoute(stations, srcEnd, dstEnd, cargo, { radius = 8,
   };
   return match(srcEnd, dstEnd) ?? (bothWays ? match(dstEnd, srcEnd) : null);
 }
+
+// ---- summary lines (summary command) ----------------------------------------------
+
+const money = (n) => (Math.abs(n) >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
+
+/** One compact line per vehicle: "#4 id 31 Train 4 [rail] +1.2k/-3k age 2.1y 40% rel 62% running (22,7) -> North". */
+export function vehicleLine(v, stationNames = new Map()) {
+  const dest = v.dest_station >= 0 && stationNames.has(v.dest_station) ? ` -> ${stationNames.get(v.dest_station)}` : '';
+  return `#${v.unit_number} id ${v.id} ${v.name || v.engine_name} [${v.type}] profit ${money(v.profit_this_year)}/${money(v.profit_last_year)} (this/last yr) `
+    + `age ${(v.age_days / 365).toFixed(1)}y ${v.age_pct}% rel ${v.reliability_pct}% ${v.state} (${v.x},${v.y})${dest}`;
+}
+
+/** One compact line per station: "id 3 Bigton Woods [rail] 2 veh: Wood 240 waiting 35%". */
+export function stationLine(st) {
+  const cargo = st.cargo.length ? st.cargo.map((c) => `${c.name} ${c.waiting} waiting ${c.rating_pct}%`).join(', ') : 'no cargo rating yet';
+  return `id ${st.id} ${st.name} [${st.facilities.join('+')}]${st.vehicles !== undefined ? ` ${st.vehicles} veh` : ''}: ${cargo}`;
+}
