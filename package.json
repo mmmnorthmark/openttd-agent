@@ -1,13 +1,29 @@
 {
   "name": "openttd-agent",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "CLI + MCP server that lets coding agents read an OpenTTD world and build for their company, via the admin port and a bundled GameScript.",
   "type": "module",
-  "bin": { "openttd-agent": "bin/openttd-agent.js" },
+  "bin": {
+    "openttd-agent": "bin/openttd-agent.js"
+  },
   "main": "src/index.js",
-  "exports": { ".": "./src/index.js" },
-  "files": ["bin", "src", "gamescript", "ai", "docs", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"],
-  "engines": { "node": ">=20" },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "gamescript",
+    "ai",
+    "docs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "node --test test/*.test.js",
     "check": "node --check bin/openttd-agent.js && for f in src/*.js; do node --check $f || exit 1; done"
@@ -17,5 +33,8 @@
     "zod": "4.6.7"
   },
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/mmmnorthmark/openttd-agent.git" }
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mmmnorthmark/openttd-agent.git"
+  }
 }

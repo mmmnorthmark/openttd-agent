@@ -3,7 +3,7 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
-## (unreleased)
+## 0.3.0 (2026-11-25)
 
 - `vehicle-problems [--vehicle ID] [--stuck_days 30]` (player, own company): one row per problem
   with `problem`, `evidence`, `suggested_fix`, the vehicle id and its `unit_number` (the "Train #4"
