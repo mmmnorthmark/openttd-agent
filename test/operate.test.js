@@ -61,7 +61,7 @@ test('engines: cargo name resolved, newest first, wagons filter; groups; depots'
   assert.deepEqual((await run('engines', { type: 'rail', wagons: true })).map((e) => e.name), ['Wood Truck']);
   await assert.rejects(run('engines', { type: 'rail', cargo: 'unobtainium' }), /no cargo matching/);
   assert.equal((await run('groups', {}))[0].profit_last_year, -3000);
-  assert.deepEqual(await run('depots', { type: 'rail' }), [{ x: 13, y: 22, vehicles: 0 }]);
+  assert.deepEqual((await run('depots', { type: 'rail' }))[0], { x: 13, y: 22, vehicles: 0 });
 });
 
 test('events: since filter and latest_seq', async () => {
@@ -245,4 +245,35 @@ test('vehicle-problems: train on another line, losing money, then stuck; unit nu
     assert.match(old.problems[0].evidence, /coarse/);
     assert.ok(fake.received.some((r) => r.cmd === 'vehicle' && r.args.vehicle === 13), 'current order read per vehicle');
   } finally { fake.state.lostTrain = false; fake.state.gsVersion = 9; }
+});
+
+test('vehicle-clone: refuses a depot off the route, auto picks a joined one, skips checks off rail', async () => {
+  await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true }), /does not exist/); // no lost train in this world
+  fake.state.lostTrain = true;
+  try {
+    await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 31, depot_y: 41, dry_run: true }),
+      /refused: depot \(31,41\) is not rail-connected to Bigton Woods \(12,20\).*--depot auto \(picks \(13,22\)/);
+    const ok = await run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true });
+    assert.equal(ok.route_check, 'connected');
+    assert.deepEqual(lastExec().steps[0], ['veh_clone', 13, 22, 13, true]);
+    // (12,22) is nearer Bigton Woods but faces away from the line, so auto skips it.
+    const auto = await run('vehicle-clone', { vehicle: 13, depot: 'auto', count: 2, dry_run: true });
+    assert.deepEqual(auto.depot, { x: 13, y: 22 });
+    assert.deepEqual(auto.depot_auto.skipped.map((t) => t.depot), [{ x: 12, y: 22 }]);
+    assert.equal(lastExec().steps.length, 2);
+    assert.deepEqual((await run('vehicle-clone', { vehicle: 13, dry_run: true })).depot, { x: 13, y: 22 });
+    await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 40, depot_y: 40, dry_run: true }), /no rail depot of company 0 at \(40,40\)/);
+    await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 13, dry_run: true }), /both --depot_x and --depot_y/);
+    await assert.rejects(run('vehicle-clone', { vehicle: 13, depot: 'auto', depot_x: 13, depot_y: 22, dry_run: true }), /not both/);
+    const skip = await run('vehicle-clone', { vehicle: 13, depot_x: 31, depot_y: 41, check_route: false, dry_run: true });
+    assert.match(skip.route_check, /skipped/);
+    await assert.rejects(run('vehicle-buy', { depot_x: 31, depot_y: 41, engine: 5, route_of: 13, dry_run: true }), /refused: depot \(31,41\)/);
+    assert.equal((await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, route_of: 13, dry_run: true })).route_check, 'connected');
+    // Older GameScript: the coarse mirror trace still refuses what it cannot join.
+    fake.state.gsVersion = 8;
+    await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 31, depot_y: 41, dry_run: true }), /refused:.*coarse trace/);
+  } finally { fake.state.lostTrain = false; fake.state.gsVersion = 9; }
+  // A road vehicle is not traced: explicit depots pass with a note.
+  const road = await run('vehicle-clone', { vehicle: 12, depot_x: 41, depot_y: 8, dry_run: true });
+  assert.match(road.route_check, /road vehicle/);
 });

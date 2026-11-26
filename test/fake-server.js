@@ -61,12 +61,16 @@ function goalView(g, state) {
 // Rail world for rail_tiles (AgentBridge v9), as [x, y, kind, tracks, station, a, b, owner, rail_type, signals]:
 // station 3 "Bigton Woods" (10..12,20) - track (13..23,20) - station 5 "Sawmill Halt" (24..26,20), and a
 // separate line (28..34,40) where train 13 runs when state.lostTrain is set. state.railGap ("x,y") removes a tile.
+// Depots: (13,22) joined to the main line by a branch (13,21) onto a junction at (13,20); (12,22) facing
+// south onto nothing; (31,41) joined to the separate line at (31,40).
 function fakeRailRows(state) {
   const rows = [];
   for (let x = 10; x <= 12; x++) rows.push([x, 20, 's', 1, 3, -1, -1, 0, 0, 0]);
-  for (let x = 13; x <= 23; x++) rows.push([x, 20, 't', 1, -1, -1, -1, 0, 0, 0]);
+  for (let x = 13; x <= 23; x++) rows.push([x, 20, 't', x === 13 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, 0]);
   for (let x = 24; x <= 26; x++) rows.push([x, 20, 's', 1, 5, -1, -1, 0, 0, 0]);
-  for (let x = 28; x <= 34; x++) rows.push([x, 40, 't', 1, -1, -1, -1, 0, 0, 0]);
+  for (let x = 28; x <= 34; x++) rows.push([x, 40, 't', x === 31 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, 0]);
+  rows.push([13, 21, 't', 2, -1, -1, -1, 0, 0, 0], [13, 22, 'd', 0, -1, 13, 21, 0, 0, 0],
+    [12, 22, 'd', 0, -1, 12, 23, 0, 0, 0], [31, 41, 'd', 0, -1, 31, 40, 0, 0, 0]);
   return rows.filter((r) => `${r[0]},${r[1]}` !== state.railGap);
 }
 
@@ -172,7 +176,7 @@ const GS = {
     [6, 'SH 8P', 0xFF, 0, 128, 21000, 1800, 80, 7300, 1954, 1000, 85, false, 0],
   ].filter((r) => a.type === 0 && (a.cargo === undefined || a.cargo === 7)),
   groups: () => [[2, 'Wood line', 0, -1, 1, -1200, -3000, 40]],
-  depots: (a) => (a.type === 0 ? [[13, 22, 0]] : []),
+  depots: (a) => (a.type === 0 ? [[13, 22, 0], [12, 22, 0], [31, 41, 0]] : []),
   autorenew: () => ({ enabled: false, months: 6, money: 100000 }),
   events: (a) => [
     { seq: 1, date: '1950-1-3', type: 'industry_open', industry: 9, industry_type: 3, x: 5, y: 5 },

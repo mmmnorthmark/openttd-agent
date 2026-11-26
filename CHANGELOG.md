@@ -22,6 +22,13 @@ re-run `install-gamescript` when it changes.
   loaded again): `rail_tiles` (track bits, depot fronts, bridge and tunnel ends, signals);
   `vehicles` rows add `current_order`, `dest`, `dest_station` and `speed`; `vehicle` adds
   `unit_number` and `rail_type`.
+- `vehicle-clone` checks the depot (rail): `--depot auto` (or no depot) picks your depot nearest
+  the vehicle's first order station that is rail-connected to all its order stations;
+  `--depot_x/--depot_y` is refused when that depot is not (the clone would get lost), with the gap
+  and a depot that would work. Exact on GameScript v9; with an older one the coarse trace refuses
+  only what it cannot join. `--check_route false` skips the check; road, ship and air vehicles are
+  not traced. `depot_x/depot_y` are now optional.
+- `vehicle-buy --route_of ID`: the same check against that vehicle's order stations before buying.
 - Fix: `build-cargo-route` could put the route's depot, and so its first train, beside another
   line's track when that ran closer to the source than the new line. The train then never reached
   the route's stations ("cannot reach" in the game). The depot now goes only beside the route's

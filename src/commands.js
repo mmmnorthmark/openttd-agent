@@ -412,6 +412,7 @@ async function makeTracer(s, company, info) {
     const getTile = railTileSource(s);
     return {
       method: 'rail_tracks',
+      tileAt: getTile,
       stationStarts: (st) => stationTiles(getTile, st.x, st.y, st.id),
       trace: async (starts, goal) => ({ method: 'rail_tracks',
         ...await traceRail({ getTile, starts, isGoal: (t) => t.station === goal.id, goal, company }) }),
@@ -438,6 +439,105 @@ async function currentOrderOf(s, company, id) {
   const d = vehicleDetail(await s.gs.call('vehicle', { company, vehicle: id }), s.cargos);
   const o = d.orders.find((r) => r.position === d.current_order);
   return { current_order: d.current_order, dest: o && o.x >= 0 ? { x: o.x, y: o.y } : null, dest_station: o?.station ?? -1, speed: d.speed, orders: d.orders };
+}
+
+// ---- depot guard (vehicle-clone, vehicle-buy --route_of) ---------------------------------
+
+/** Source vehicle row (type, position) of this company. */
+async function vehicleOf(s, company, id) {
+  const veh = vehiclesFromRows(await s.gs.call('vehicles', { company })).find((v) => v.id === id);
+  if (!veh) throw new Error(`vehicle ${id} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
+  return veh;
+}
+
+/** A vehicle's order stations, in order, as rows from `stations`. */
+async function orderStations(s, company, id) {
+  const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+  const { orders } = await currentOrderOf(s, company, id);
+  const ids = [...new Set(orders.filter((o) => o.kind === 'station').map((o) => o.station))];
+  return ids.map((sid) => stations.find((st) => st.id === sid)).filter(Boolean);
+}
+
+/**
+ * Is rail depot `depot` ({x, y}) joined to every station in `stops`? Exact on GS v9 (also checks a
+ * rail depot of this company is there); with the mirror trace only "not connected" is trusted.
+ * Returns { connected, method, failed?: { station, station_name, first_gap, last_reachable }, error? }.
+ */
+async function depotServes(s, company, tracer, depot, stops, mirrorDepots) {
+  if (tracer.method === 'rail_tracks') {
+    const t = await tracer.tileAt(depot.x, depot.y);
+    if (!t || t.kind !== 'd' || t.owner !== company) return { connected: false, method: tracer.method, error: `no rail depot of company ${company} at (${depot.x},${depot.y}); run: openttd-agent depots --type rail` };
+  } else if (!mirrorDepots.some((d) => d.x === depot.x && d.y === depot.y)) {
+    return { connected: false, method: tracer.method, error: `no rail depot of company ${company} at (${depot.x},${depot.y}); run: openttd-agent depots --type rail` };
+  }
+  for (const st of stops) {
+    const r = await tracer.trace([depot], st);
+    if (!r.connected) return { connected: false, method: tracer.method, failed: { station: st.id, station_name: st.name, at: { x: st.x, y: st.y }, last_reachable: r.last_reachable ?? null, first_gap: r.first_gap ?? null } };
+  }
+  return { connected: true, method: tracer.method };
+}
+
+/**
+ * Depot for a vehicle of `veh`'s type on its own route: the company's depots nearest the first order
+ * station (else the vehicle), rail ones only if depotServes says connected. Tries up to `tries`.
+ * Returns { depot, distance, checked, tried } or { depot: null, tried }.
+ */
+async function routeDepot(s, company, tracer, veh, stops, { tries = 8 } = {}) {
+  const ref = stops[0] ?? veh;
+  const rows = (await s.gs.call('depots', { company, type: vehicleTypeId(veh.type) })).map(([x, y]) => ({ x, y }));
+  const cands = rows.map((d) => ({ ...d, distance: tileDistance(d, ref) })).sort((p, q) => p.distance - q.distance);
+  if (veh.type !== 'rail' || !tracer) return { depot: cands[0] ?? null, distance: cands[0]?.distance, checked: false, tried: [] };
+  const tried = [];
+  for (const c of cands.slice(0, tries)) {
+    const r = await depotServes(s, company, tracer, c, stops, rows);
+    if (r.connected) return { depot: { x: c.x, y: c.y }, distance: c.distance, checked: true, tried };
+    tried.push({ depot: { x: c.x, y: c.y }, not_connected_to: r.failed?.station_name ?? null, ...(r.error ? { error: r.error } : {}) });
+  }
+  return { depot: null, tried, depots_total: cands.length };
+}
+
+/**
+ * Resolve and check the depot for a clone (or a buy for vehicle `id`'s route). `a` has depot_x/depot_y
+ * or depot 'auto'. Throws a refusal when an explicit rail depot is not joined to the route.
+ * Returns { depot, route_check } for the reply.
+ */
+async function depotForRoute(s, company, a, id, { cmd }) {
+  const explicit = a.depot_x !== undefined || a.depot_y !== undefined;
+  if (explicit && (a.depot_x === undefined || a.depot_y === undefined)) throw new Error('give both --depot_x and --depot_y, or --depot auto');
+  if (explicit && a.depot === 'auto') throw new Error('give --depot auto or --depot_x/--depot_y, not both');
+  const veh = await vehicleOf(s, company, id);
+  const rail = veh.type === 'rail';
+  const stops = !explicit || (rail && a.check_route) ? await orderStations(s, company, id) : [];
+  if (explicit && (!a.check_route || !rail || !stops.length)) {
+    const why = !a.check_route ? 'skipped (--check_route false)' : !rail ? `not checked (${veh.type} vehicle; only rail is traced)` : `not checked (vehicle ${id} has no station orders)`;
+    return { depot: { x: a.depot_x, y: a.depot_y }, route_check: why };
+  }
+  const tracer = rail && stops.length ? await makeTracer(s, company, await s.gs.call('info')) : null;
+  const coarse = tracer?.method === 'mirror_adjacency';
+  const note = coarse ? { route_check_note: OLD_GS_TRACE } : {};
+  if (!explicit) {
+    const pick = await routeDepot(s, company, tracer, veh, stops);
+    if (!pick.depot) {
+      const first = stops[0];
+      throw new Error(`no depot of company ${company} for ${veh.type} vehicle ${id} is ${rail ? `rail-connected to its order stations (tried ${pick.tried.length} of ${pick.depots_total} nearest ${first ? `${first.name}` : 'the vehicle'})` : 'there'}; `
+        + (rail && first ? `build one on its line: openttd-agent build-line-depot --station ${first.id}` : 'build a depot first'));
+    }
+    return { depot: pick.depot, route_check: pick.checked ? (coarse ? 'coarse_not_refuted' : 'connected') : `not checked (${!rail ? `${veh.type} vehicle; only rail is traced` : `vehicle ${id} has no station orders`})`,
+      depot_auto: { nearest_to: stops[0] ? { station: stops[0].id, station_name: stops[0].name } : { vehicle: id }, distance: pick.distance, skipped: pick.tried }, ...note };
+  }
+  const depot = { x: a.depot_x, y: a.depot_y };
+  const mirrorDepots = coarse ? (await s.gs.call('depots', { company, type: 0 })).map(([x, y]) => ({ x, y })) : [];
+  const r = await depotServes(s, company, tracer, depot, stops, mirrorDepots);
+  if (!r.connected) {
+    let alt = null;
+    try { alt = (await routeDepot(s, company, tracer, veh, stops)).depot; } catch { alt = null; }
+    const where = r.error ?? `depot (${depot.x},${depot.y}) is not rail-connected to ${r.failed.station_name} (${r.failed.at.x},${r.failed.at.y}), an order station of vehicle ${id}`
+      + (r.failed.first_gap ? ` (first gap at (${r.failed.first_gap.x},${r.failed.first_gap.y}): ${r.failed.first_gap.reason})` : '')
+      + `; a ${cmd === 'vehicle-clone' ? 'clone' : 'train'} there would get lost`;
+    const fix = alt ? `use --depot auto (picks (${alt.x},${alt.y}) on its route) or --depot_x ${alt.x} --depot_y ${alt.y}` : `build a depot on its line: openttd-agent build-line-depot --station ${stops[0].id}`;
+    throw new Error(`refused: ${where}. ${fix}${coarse ? ' (coarse trace: the running AgentBridge is older than v9)' : ''}`);
+  }
+  return { depot, route_check: coarse ? 'coarse_not_refuted' : 'connected', ...note };
 }
 
 /** Run exec steps as the company (client throttle + GS rate gate apply). */
@@ -1147,26 +1247,32 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-buy', group: 'operate', session: true,
-    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>. New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start.',
-    args: z.object({ ...act, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1) }),
+    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>. New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one).',
+    args: z.object({ ...act, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1),
+      route_of: int().optional().describe('rail: check the depot is joined to this vehicle\'s order stations first') }),
     run: async (ctx, a) => {
-      const { s } = await mine(ctx, a);
+      const { s, company } = await mine(ctx, a);
       const cargo = cargoId(s.cargos, a.cargo) ?? -1;
+      const check = a.route_of !== undefined ? await depotForRoute(s, company, { ...a, check_route: true }, a.route_of, { cmd: 'vehicle-buy' }) : null;
       const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_buy', a.depot_x, a.depot_y, a.engine, cargo, a.attach_to]));
-      return { ...res, vehicles: res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value) };
+      return { ...res, vehicles: res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value), ...(check ? { route_check: check.route_check } : {}) };
     },
   },
   {
     name: 'vehicle-clone', group: 'operate', session: true,
-    description: 'Clone a vehicle `count` times at a depot tile, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`.',
-    args: z.object({ ...act, depot_x: int(), depot_y: int(), vehicle: int(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false) }),
+    description: 'Clone a vehicle `count` times, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check.',
+    args: z.object({ ...act, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
+      depot_x: int().optional(), depot_y: int().optional(), vehicle: int(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
+      check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations') }),
     run: async (ctx, a) => {
-      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', a.depot_x, a.depot_y, a.vehicle, a.share_orders]));
-      const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
-      if (!a.start || a.dry_run || !vehicles.length) return { ...res, vehicles };
       const { s, company } = await mine(ctx, a);
+      const { depot, ...check } = await depotForRoute(s, company, a, a.vehicle, { cmd: 'vehicle-clone' });
+      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, a.share_orders]));
+      const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
+      const out = { ...res, depot, ...check, vehicles };
+      if (!a.start || a.dry_run || !vehicles.length) return out;
       const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
-      return { ...res, vehicles, started: started.ok };
+      return { ...out, started: started.ok };
     },
   },
   {

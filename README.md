@@ -189,6 +189,7 @@ openttd-agent vehicle-buy --depot_x 13 --depot_y 22 --engine 27 --cargo wood --a
 openttd-agent order-add --vehicle 11 --station 3 --flags full_load_any,non_stop
 openttd-agent order-add --vehicle 11 --station 4 --flags unload,non_stop
 openttd-agent vehicle-start --vehicles 11
+openttd-agent vehicle-clone --vehicle 11 --depot auto --count 2 --start true   # more trains, same orders
 
 # Build a wood line: terminus at the forest, line to the sawmill, depot, then the train
 openttd-agent build-terminus --x 12 --y 20 --platforms 2 --length 5 --dry_run true   # cost first
@@ -301,7 +302,10 @@ openttd-agent unpause
   money lost last year, no orders, stopped, old or unreliable. Fix what it lists before building
   more; `verify-route --vehicle ID` shows where the track breaks.
 - **Clone a train only at a depot of its own line.** A clone keeps its orders; in another line's
-  depot it can never reach them (`vehicle-problems` reports `wrong_network`).
+  depot it can never reach them (`vehicle-problems` reports `wrong_network`). `vehicle-clone
+  --vehicle ID --depot auto` picks your depot nearest the train's first order station that is
+  rail-connected to all its order stations; with `--depot_x/--depot_y` it refuses a depot that is
+  not, and names one that is. `vehicle-buy --route_of ID` makes the same check before a buy.
 - **Keep notes outside the game** (ids of what you built, the plan, what failed). Long games
   outlast any one context window.
 - Slower or local models: keep each turn to a few composite calls; every call costs real time.
