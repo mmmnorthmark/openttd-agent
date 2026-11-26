@@ -486,3 +486,15 @@ test('vehicle-buy: wagons, orders and start in one call', async () => {
   assert.equal(res.started, true);
   await assert.rejects(run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, orders: '3,5', order_flags: 'a;b;c' }), /3 sets for 2 orders/);
 });
+
+test('stations carry vehicle_ids (v12); vehicles --station filters by them', async () => {
+  const res = await run('stations', {});
+  assert.deepEqual(res.stations.find((st) => st.id === 3).vehicle_ids, [11]);
+  const v = await run('vehicles', { station: 'Bigton Central' });
+  assert.deepEqual(v.vehicles.map((x) => x.id), [12]);
+  fake.state.gsVersion = 11;
+  try {
+    assert.equal((await run('stations', {})).stations[0].vehicle_ids, undefined);
+    await assert.rejects(run('vehicles', { station: 3 }), /needs AgentBridge v12/);
+  } finally { fake.state.gsVersion = 12; }
+});

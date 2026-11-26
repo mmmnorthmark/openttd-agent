@@ -129,6 +129,8 @@ Behaviour changes agents must know:
   wagons to each new locomotive, `--orders A,B` (station ids or names) with `--order_flags
   "full_load_any;unload,no_load"` (one set per order, or one for all) gives the orders (more
   vehicles share them), `--start true` starts them. Flags and stations are checked before buying.
+- `stations` rows carry `vehicle_ids` (GS v12: your vehicles with an order for that station), and
+  `vehicles --station ID|name` lists only those.
 
 ## 0.6.0 (2026-11-25)
 

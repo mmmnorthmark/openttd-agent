@@ -701,6 +701,18 @@ async function depotForRoute(s, company, a, id, { cmd }) {
   return { depot, route_check: coarse ? 'coarse_not_refuted' : 'connected', ...note };
 }
 
+/** Map station id -> [vehicle ids with an order for it] (GS v12 station_vehicles), or null on an older GameScript. */
+async function stationVehicleIds(s, company, station) {
+  let rows;
+  try { rows = await s.gs.call('station_vehicles', { company, ...(station !== undefined ? { station } : {}) }); } catch (e) {
+    if (/unknown cmd/.test(e.message)) return null;
+    throw e;
+  }
+  const out = new Map();
+  for (const [st, ids] of rows) out.set(st, [...(out.get(st) ?? []), ...ids]);
+  return out;
+}
+
 /** --orders "A,B" + --order_flags "f1;f2" -> [{ station, name, x, y, flags, flag_names }]. Pure over decoded stations. */
 export function orderPlan(stations, ordersText, flagsText = '') {
   const refs = String(ordersText).split(',').map((t) => t.trim()).filter(Boolean);
@@ -1411,14 +1423,18 @@ export const COMMANDS = [
   // ---- operate (read) -------------------------------------------------------------
   {
     name: 'stations', group: 'operate', session: true,
-    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving. Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations). --company X shows another company\'s stations as the game window shows them to anyone (location, facilities, waiting cargo, ratings; no vehicle counts); also through the relay. Returns {total, matched, stations, truncated}.',
+    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving (count, and vehicle_ids with AgentBridge v12: vehicles with an order for it). Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations). --company X shows another company\'s stations as the game window shows them to anyone (location, facilities, waiting cargo, ratings; no vehicle counts); also through the relay. Returns {total, matched, stations, truncated}.',
     args: z.object({ ...who, facility: z.enum(FACILITIES).optional(), cargo: z.string().optional(), min_waiting: int().default(0),
       max_rating_pct: int().default(100), name: z.string().optional(), limit: int().default(100) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargoFilter = a.cargo !== undefined || a.min_waiting > 0 || a.max_rating_pct < 100;
       const rival = isRival(s, company);
-      const all = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).map((st) => (rival ? (({ vehicles, ...rest }) => rest)(st) : st));
+      let all = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).map((st) => (rival ? (({ vehicles, ...rest }) => rest)(st) : st));
+      if (!rival) {
+        const ids = await stationVehicleIds(s, company);
+        if (ids) all = all.map((st) => ({ ...st, vehicle_ids: ids.get(st.id) ?? [] }));
+      }
       const hits = all.filter((st) => (!a.facility || st.facilities.includes(a.facility)) && (!a.name || lc(st.name).includes(lc(a.name)))
         && (!cargoFilter || st.cargo.some((c) => (!a.cargo || cargoMatches(c.name, a.cargo)) && c.waiting >= a.min_waiting && c.rating_pct <= a.max_rating_pct)));
       return { company, ...(rival ? { view: 'other company: what the game shows anyone' } : {}), ...listResult('stations', all, hits, a.limit) };
@@ -1426,9 +1442,10 @@ export const COMMANDS = [
   },
   {
     name: 'vehicles', group: 'operate', session: true,
-    description: 'Your vehicles (summary=true or another --company: counts per type and state only, as the company window shows anyone): type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: type, group, state, max_profit_last_year (e.g. 0 = loss makers), min_age_pct (e.g. 90 = due for replacement), max_reliability_pct, name. Breakdown counts and service intervals are not exposed by the game to scripts.',
+    description: 'Your vehicles (summary=true or another --company: counts per type and state only, as the company window shows anyone): type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: type, group, state, max_profit_last_year (e.g. 0 = loss makers), min_age_pct (e.g. 90 = due for replacement), max_reliability_pct, name, station (vehicles with an order for it; AgentBridge v12). Breakdown counts and service intervals are not exposed by the game to scripts.',
     args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
       max_profit_last_year: int().optional(), min_age_pct: int().default(0), max_reliability_pct: int().default(100), name: z.string().optional(), limit: int().min(1).default(1000),
+      station: z.coerce.string().optional().describe('only vehicles with an order for this station (id or name; AgentBridge v12)'),
       summary: bool().default(false).describe('counts per type and state only (always so for another company)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
@@ -1438,7 +1455,14 @@ export const COMMANDS = [
         return { company, ...(isRival(s, company) ? { view: 'other company: counts only, as the company window shows them' } : {}), total: all.length, by_type: count('type'),
           ...(isRival(s, company) ? {} : { by_state: count('state') }) };
       }
-      const vehicles = all.filter((v) => (!a.type || v.type === a.type) && (a.group === undefined || v.group === a.group) && (!a.state || v.state === a.state)
+      let atStation = null;
+      if (a.station !== undefined) {
+        const st = findStation(stationsFromRows(await s.gs.call('stations', { company }), s.cargos), a.station);
+        const ids = await stationVehicleIds(s, company, st.id);
+        if (!ids) throw new Error('refused: vehicles --station needs AgentBridge v12; the host re-runs install-gamescript and loads the game again');
+        atStation = new Set(ids.get(st.id) ?? []);
+      }
+      const vehicles = all.filter((v) => (!atStation || atStation.has(v.id)) && (!a.type || v.type === a.type) && (a.group === undefined || v.group === a.group) && (!a.state || v.state === a.state)
         && (a.max_profit_last_year === undefined || v.profit_last_year <= a.max_profit_last_year) && v.age_pct >= a.min_age_pct
         && v.reliability_pct <= a.max_reliability_pct && (!a.name || lc(v.name).includes(lc(a.name))));
       return { company, ...listResult('vehicles', all, vehicles, a.limit) };
