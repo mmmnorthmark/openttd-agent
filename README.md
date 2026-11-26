@@ -81,48 +81,102 @@ is then reachable too.
 
 ## Game night
 
-**Host** (the machine running the game):
+One **host** on the LAN runs a dedicated server. Every **player** joins it in the OpenTTD window
+and founds a company; each player's coding agent then drives that company through the host's
+**relay** (the agent may run on the host or on the player's own machine).
 
-```sh
-openttd-agent install-gamescript
-openttd-agent launch --mode dedicated --map_bits 9      # generates the admin password and keeps it in your config
-# optional rate limit for everyone: --command_delay_ticks 2 --max_builds_per_day 50
-openttd-agent relay                                     # leave running; listens on port 47978
-```
+Lost? `openttd-agent guide` (or `guide --role host|player`) checks what is already done on this
+machine and prints the steps as JSON, with `next` = the first one still to do. It is read-only,
+starts nothing and prints no secrets; agents should run it first.
 
-Then everyone, the host included, joins the game from OpenTTD's Multiplayer menu (or
-`openttd-agent launch --mode join --join_host <host-LAN-IP>`) and starts or joins their company.
+### Before you start (every machine)
 
-Register each player (the host too, if their agent should be held to the same rules):
+1. **Same OpenTTD version everywhere** (15.x): `openttd-agent doctor` prints `openttd_version`.
+2. **Node 20+**, and the same openttd-agent tag as the host (`guide` on a player compares them).
+3. **Graphics:** OpenGFX is fine. To use the original TTD graphics, put your own original files in
+   `Documents/OpenTTD/baseset`. Run OpenTTD once on each machine.
 
-```sh
-openttd-agent relay-add-player --name joe --company pending   # prints joe's token once, plus the line to send him
-openttd-agent companies                                       # once joe has started his company: find its id
-openttd-agent relay-set-company --name joe --company 1
-openttd-agent relay-list-players
-openttd-agent relay-remove-player --name joe                  # his token stops working at once
-```
+### Host
 
-**Each player** (once), with the two values the host sent:
+1. `openttd-agent install-gamescript` (again after every openttd-agent update).
+2. `openttd-agent launch --mode dedicated --map_bits 9`: a headless server bound to `0.0.0.0`
+   (game 3979, admin 3977). It generates the admin password and keeps it in your config.
+   Optional rate limit for everyone: `--command_delay_ticks 2 --max_builds_per_day 50`.
+3. `openttd-agent relay` in its own terminal; leave it running (port 47978).
+4. Allow incoming **TCP 3979** (game) and **TCP 47978** (relay) in the firewall (macOS asks the
+   first time; on Windows allow Node.js and OpenTTD on private networks).
+5. Find your LAN IP to give the players: macOS `ipconfig getifaddr en0`; Windows `ipconfig`
+   (IPv4 Address); Linux `hostname -I`. `guide --role host` lists it too.
+6. Everyone, host included, opens OpenTTD → **Multiplayer** → **Add server** `<host-LAN-IP>:3979` →
+   join → **New company**.
+7. Register each agent that should play, and send the player the `configure` line it prints
+   (the token is shown only once):
 
-```sh
-openttd-agent configure --relay http://<host-LAN-IP>:47978 --token <token>
-openttd-agent status          # my_company shows the company the host bound you to
-```
+   ```sh
+   openttd-agent relay-add-player --name joe --company pending
+   ```
 
-What a player's token can do:
+8. Once joe has founded his company, bind him to it:
+
+   ```sh
+   openttd-agent companies                           # find the company ids
+   openttd-agent relay-set-company --name joe --company 1
+   openttd-agent relay-list-players                  # who is bound to what
+   ```
+
+9. Optional, so there is a winner: the same goal for every company,
+   `openttd-agent goal-set --company <id> --deadline_year 1960 --targets VALUE:500000` (see Goals).
+10. End of the night: `openttd-agent save --name game-night-1` (writes `save/game-night-1.sav` in the
+    launch profile); next time `openttd-agent launch --mode dedicated --load game-night-1`.
+    `relay-remove-player --name joe` stops a token at once.
+
+### Each player
+
+1. Run the `configure` line the host sent:
+   `openttd-agent configure --relay http://<host-LAN-IP>:47978 --token <token>`.
+2. `openttd-agent status`: `my_company` is the company the host bound you to (`null` = not yet;
+   ask the host to run step 8).
+3. Connect your agent. Claude Code:
+
+   ```sh
+   claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.4.0 mcp
+   ```
+
+   Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.4.0", "mcp"]`.
+   Or let the agent use the CLI directly (`openttd-agent help`; every command prints JSON).
+
+### A human and an agent in one company
+
+Today the agent can act on anything the company owns: it can sell, reroute or demolish what you
+built by hand, and you can do the same to its work. Agree up front who builds what (for example:
+the agent runs rail, you run road vehicles), and have the agent check `vehicles` and `stations`
+before changing them. A guard that keeps the agent off things it did not build is planned.
+
+### What a player's token can do
 
 - Read the world (towns, industries, map, all companies' figures) and run every analysis command.
 - Build and operate **only as the company the host bound it to**. `--company <other>` is refused;
   leaving it out always means "my company".
-- Not: `rate` changes, `launch`, `install-gamescript`, `scenario-prepare`, setting goals, pausing or
-  advancing turns, anything on the host's config, or raw console access.
+- Not: `rate` changes, `launch`, `install-gamescript`, `scenario-prepare`, `save`, setting goals,
+  pausing or advancing turns, anything on the host's config, or raw console access.
 - Chat sent through the relay is prefixed with the player's name.
 
 The host sees who did what in `~/.openttd-agent/relay-audit.jsonl` (one JSON line per command or
 refusal: time, player, company, command, arguments, outcome).
 
-Security notes, so nobody is surprised:
+### Troubleshooting
+
+- Start with `openttd-agent guide`: its `next` step usually names the problem, with the error in `detail`.
+- **Can't join the game:** same OpenTTD version on both machines? Firewall open for TCP 3979? Right IP
+  (the host's LAN address, not 127.0.0.1)?
+- **`cannot reach the relay`:** is `openttd-agent relay` running on the host, TCP 47978 open, and the
+  URL in `show-config` right?
+- **`missing or unknown token`:** the host re-issues one (`relay-remove-player`, then `relay-add-player`).
+- **`not bound to a company yet`:** the host runs `relay-set-company` (step 8).
+- **`unknown command` through the relay:** player and host run different openttd-agent versions.
+- **AgentBridge did not answer:** the host runs `install-gamescript` and launches the game again.
+
+### Security notes
 
 - **Never hand out the admin password.** Anyone holding it has the full server console and can act
   as any company; the GameScript cannot tell admin connections apart. That is why the relay exists.
@@ -138,10 +192,10 @@ Security notes, so nobody is surprised:
 
 | Group | Commands |
 |---|---|
-| setup | `doctor`, `install-gamescript`, `configure`, `show-config`, `launch`, `scenario-prepare` (host) |
+| setup | `guide` (what to do next, host or player), `doctor`, `install-gamescript`, `configure`, `show-config`, `launch`, `scenario-prepare` (host) |
 | relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player` |
 | game | `status`, `companies`, `chat`, `rate`, `goal-status` |
-| host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance` |
+| host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance`, `save` |
 | world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns; town to town for passengers and mail), `acceptance`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
 | operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
 | operate: diagnose | `vehicle-problems` (one row per problem: `problem`, `severity` (`action` or `info`; `--severity action` for only what needs a command), `evidence`, `suggested_fix`, with the id and the unit number the game shows as "Train #4"), `verify-route` (`--vehicle ID`, or `--from_station A --to_station B`: is there a rail path, and if not, the last reachable tile and the first gap) |
