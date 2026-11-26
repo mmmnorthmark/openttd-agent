@@ -245,6 +245,25 @@ async function stationAt(s, company, site) {
 }
 
 /**
+ * A vehicle of `company` with orders at both stations, or null. Station rows count vehicles with
+ * orders there (GSVehicleList_Station); 0 at either end = nobody serves the pair. Otherwise the
+ * order lists of likely vehicles (current destination one of the two, AgentBridge v9; else all
+ * trains) are read, at most 30.
+ */
+export async function vehicleServing(s, company, stations, aId, bId) {
+  const count = (id) => stations.find((st) => st.id === id)?.vehicles ?? 0;
+  if (!count(aId) || !count(bId)) return null;
+  const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
+  const likely = all.filter((v) => (v.dest_station === undefined ? v.type === 'rail' : v.dest_station === aId || v.dest_station === bId));
+  for (const v of likely.slice(0, 30)) {
+    const { orders } = await currentOrderOf(s, company, v.id);
+    const at = new Set(orders.filter((o) => o.kind === 'station').map((o) => o.station));
+    if (at.has(aId) && at.has(bId)) return v.id;
+  }
+  return null;
+}
+
+/**
  * build-cargo-route: plan everything as a dry run (both termini, the line between their connect_at
  * anchors, a depot beside the line near the source, a train), then, unless dryRun, build it step by
  * step. On a failure it stops and reports the step and everything already built; it never demolishes.
@@ -273,10 +292,13 @@ async function buildCargoRoute(s, company, a) {
     const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
     const bothWays = !!(cargoInfo?.passengers || cargoInfo?.mail);
     const existing = findExistingRoute(stations, lineEnd(s, economy, from), lineEnd(s, economy, to), cargo, { radius: a.radius + 2, bothWays });
-    if (existing) {
-      return fail('existing_route', `you already have rail stations serving this route: ${existing.from_station.name} (${existing.from_station.id}) and ${existing.to_station.name} (${existing.to_station.id})`,
-        { existing, hint: 'add capacity instead: vehicle-clone --vehicle <a train of that route> --depot auto --start true (vehicles shows them); --allow_existing true builds a second line anyway' });
+    const servedBy = existing ? await vehicleServing(s, company, stations, existing.from_station.id, existing.to_station.id) : null;
+    if (existing && servedBy !== null) {
+      return fail('existing_route', `refused: you already run this route: ${existing.from_station.name} (${existing.from_station.id}) and ${existing.to_station.name} (${existing.to_station.id}), served by vehicle ${servedBy}`,
+        { existing: { ...existing, served_by: servedBy }, first_error: 'existing_route',
+          hint: `add capacity instead: vehicle-clone --vehicle ${servedBy} --depot auto --start true; or pass --allow_existing true to build a second line anyway` });
     }
+    if (existing) plan.existing_unserved = { ...existing, note: 'your stations there have no vehicle serving both, so a new line is built (they are not reused)' };
   }
 
   // 1. Stations: best dry-run-checked site at each end, facing the other end, not overlapping.
@@ -1490,7 +1512,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-cargo-route', group: 'build', session: true,
-    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. Refused (failed_step existing_route) when your rail stations already serve both ends: clone a train instead, or --allow_existing true. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
+    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. Refused (failed_step existing_route) when your rail stations near both ends are already served by one of your vehicles: clone that train instead, or --allow_existing true. Stations nobody serves (e.g. after selling the fleet) do not block it. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
     args: z.object({
       ...act,
       from_industry: int().optional().describe('source industry id (see industries / find-cargo-pairs)'), from_town: z.string().optional().describe('source town id or name'),
@@ -1502,7 +1524,7 @@ export const COMMANDS = [
       radius: int().min(2).max(20).default(8).describe('station search box around each end'),
       margin: int().min(2).max(80).default(20).describe('how far the line may wander outside the two stations'),
       max_bridge: int().min(3).max(40).default(12), rail_type: int().optional().describe('see rail-types; default: the one with the cheapest track'),
-      allow_existing: bool().default(false).describe('build even when your rail stations already serve both ends (refused by default: clone trains instead)'),
+      allow_existing: bool().default(false).describe('build even when one of your vehicles already serves your stations at both ends (refused by default: clone trains instead)'),
     }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);

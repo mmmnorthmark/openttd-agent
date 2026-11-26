@@ -29,6 +29,9 @@ Behaviour changes agents must know:
 - `vehicle-buy --attach_to TRAIN` first checks (also in a dry run) that the train is stopped in
   that depot and refuses with `first_error: train_not_in_depot` and the fix; nothing is bought. If
   the game still refuses to couple a wagon, the wagon is sold back at once (`sold_back`).
+- `build-cargo-route` refuses `existing_route` only when one of your vehicles has orders at both
+  of your stations there (`existing.served_by`); stations nobody serves any more (a sold fleet)
+  no longer block a rebuild (`existing_unserved` notes them). The refusal hints `--allow_existing true`.
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

@@ -333,3 +333,14 @@ test('argument aliases: --id and --vehicle/--vehicles; engines and depots defaul
   assert.equal((await run('engines', {})).engines.length, 3);
   await assert.rejects(run('vehicle', { vehicle: 'abc' }), /--vehicle: .*\(got "abc"\)/);
 });
+
+test('existing route: only a vehicle with orders at both stations blocks build-cargo-route', async () => {
+  const { vehicleServing } = await import('../src/commands.js');
+  const s = await ctx.session();
+  const st = (id, vehicles) => ({ id, vehicles });
+  // Train 11 has orders for station 3 and a depot only (fake `vehicle`), so 3 + 5 is not served by it.
+  assert.equal(await vehicleServing(s, 0, [st(3, 2), st(5, 1)], 3, 5), null);
+  assert.equal(await vehicleServing(s, 0, [st(3, 2), st(5, 0)], 3, 5), null, 'nobody has orders at station 5');
+  fake.state.lostTrain = true; // train 13 heads for station 3 with orders 3 -> 5
+  try { assert.equal(await vehicleServing(s, 0, [st(3, 2), st(5, 1)], 3, 5), 13); } finally { fake.state.lostTrain = false; }
+});
