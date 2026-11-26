@@ -38,6 +38,17 @@ const lanAddresses = () => Object.values(os.networkInterfaces()).flat().filter((
 /** Is `company` another company than the caller's own (cfg.company; through the relay the player's)? */
 const isRival = (s, company) => s.cfg.company !== null && s.cfg.company !== undefined && company !== s.cfg.company;
 
+/**
+ * Where this machine's CLI reaches the admin port of a server bound to `bind`: 127.0.0.1 for a
+ * wildcard or loopback bind, else the bound address itself (a server on 10.0.0.5 only does not
+ * answer on 127.0.0.1). Several addresses: the first.
+ */
+export function adminHostForBind(bind) {
+  const first = String(bind ?? '').split(',')[0].trim().replace(/^\[|\]$/g, '');
+  if (!first || first === '0.0.0.0' || first === '::' || /^127\./.test(first) || first === 'localhost' || first === '::1') return '127.0.0.1';
+  return first;
+}
+
 /** Session + company for read commands. */
 async function mine(ctx, a) {
   const s = await ctx.session();
@@ -715,9 +726,15 @@ export const COMMANDS = [
         seed: a.seed, mapBits: a.map_bits, load: a.load, commandDelayTicks: a.command_delay_ticks,
         maxBuildsPerDay: a.max_builds_per_day, scriptOpcodes: a.script_opcodes, terrain: a.terrain, bind: a.bind, adminPort: ctx.cfg.admin_port, dryRun: a.dry_run,
       });
-      // The relay on this machine reads the password from the config, so keep the two in step.
-      if (hosting && !a.dry_run && adminPassword !== ctx.cfg.admin_password) saveConfig({ admin_password: adminPassword });
-      return { ...result, ...(generated ? { admin_password: a.dry_run ? 'would be generated' : 'generated and saved in the config' } : {}) };
+      // The relay and the CLI on this machine read the password and admin address from the config, so keep them in step.
+      const host = hosting ? adminHostForBind(a.bind) : null;
+      const updates = {
+        ...(hosting && adminPassword !== ctx.cfg.admin_password ? { admin_password: adminPassword } : {}),
+        ...(host && host !== ctx.cfg.host ? { host } : {}),
+      };
+      if (!a.dry_run && Object.keys(updates).length) saveConfig(updates);
+      return { ...result, ...(generated ? { admin_password: a.dry_run ? 'would be generated' : 'generated and saved in the config' } : {}),
+        ...(updates.host ? { admin_host: a.dry_run ? `would be saved as host: ${host}` : `saved as host: ${host} (the server listens only there)` } : {}) };
     },
   },
   {

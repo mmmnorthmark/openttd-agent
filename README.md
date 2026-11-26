@@ -90,7 +90,13 @@ openttd-agent launch --mode dedicated --bind 127.0.0.1      # headless server on
 
 To play from another machine (a laptop on the same network or VPN), launch with `--bind 0.0.0.0`
 and join `<this machine's IP>:3979`. Read the security notes under Game night first: the admin port
-is then reachable too.
+is then reachable too. With `--bind <one address>` the server listens only there, so `launch` saves
+that address as `host` in the config (the CLI on this machine then reaches the admin port there).
+
+`launch` writes its own launch profile: `[game_scripts]` lists AgentBridge only (an entry copied
+from your own openttd.cfg, such as `none =`, used to win and the game ran without AgentBridge),
+and `private.cfg` names the server (`server_name`) and the dedicated server's own client
+(`client_name = openttd-agent server`, instead of "Unnamed Client").
 
 ## Game night
 
@@ -205,7 +211,9 @@ refusal: time, player, company, command, arguments, outcome).
 - **`missing or unknown token`:** the host re-issues one (`relay-remove-player`, then `relay-add-player`).
 - **`not bound to a company yet`:** the host runs `relay-set-company` (step 8).
 - **`unknown command` through the relay:** player and host run different openttd-agent versions.
-- **AgentBridge did not answer:** the host runs `install-gamescript` and launches the game again.
+- **AgentBridge did not answer:** the host runs `install-gamescript` and launches the game again with
+  `openttd-agent launch` (`doctor` lists launch profiles whose `[game_scripts]` is wrong). A loaded
+  save runs the GameScript stored in it.
 
 ### Security notes
 

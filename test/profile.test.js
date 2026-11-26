@@ -29,3 +29,25 @@ test('--profile keeps a relay token per player; the base config is untouched', a
   assert.deepEqual([bob.relay, bob.relay_token, bob.profile], ['http://127.0.0.1:8', '***', 'bob.player']);
   await assert.rejects(cli(env, '--profile', '../x', 'show-config'), (e) => /profile name must be/.test(JSON.parse(e.stdout).error));
 });
+
+test('launch (dry run) writes AgentBridge as the only game script and names the server client', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'ottd-agent-launch-'));
+  const personal = path.join(home, 'personal');
+  fs.mkdirSync(personal);
+  fs.writeFileSync(path.join(personal, 'openttd.cfg'), '[game_scripts]\nnone = \n\n[network]\nserver_name = mine\n');
+  const env = { OPENTTD_AGENT_HOME: home, OPENTTD_AGENT_LOG: 'error', OPENTTD_EXE: process.execPath, OPENTTD_PERSONAL_DIR: personal };
+  const res = await cli(env, 'launch', '--mode', 'dedicated', '--admin_password', 'pw', '--bind', '10.9.8.7', '--dry_run', 'true');
+  assert.equal(res.admin_host, 'would be saved as host: 10.9.8.7');
+  const cfg = fs.readFileSync(path.join(home, 'profiles', 'dedicated', 'openttd.cfg'), 'utf8');
+  assert.match(cfg, /\[game_scripts\]\nAgentBridge = command_delay_ticks=0,max_builds_per_day=0\n/);
+  assert.doesNotMatch(cfg, /^none =/m);
+  const priv = fs.readFileSync(path.join(home, 'profiles', 'dedicated', 'private.cfg'), 'utf8');
+  assert.match(priv, /client_name = openttd-agent server/);
+  assert.match(priv, /server_name = openttd-agent game/);
+  const doc = await cli(env, 'doctor');
+  assert.equal(doc.launch_profile_game_scripts, undefined, 'the rewritten profile is fine');
+  fs.mkdirSync(path.join(home, 'profiles', 'old'));
+  fs.writeFileSync(path.join(home, 'profiles', 'old', 'openttd.cfg'), '[game_scripts]\nnone = \nAgentBridge = \n');
+  const bad = await cli(env, 'doctor');
+  assert.deepEqual(bad.launch_profile_game_scripts.map((p) => [p.profile, p.game_scripts]), [['old', ['none', 'AgentBridge']]]);
+});

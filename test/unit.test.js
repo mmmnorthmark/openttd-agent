@@ -101,3 +101,21 @@ test('GameScript reports the same bridge_version as info.nut GetVersion()', () =
   assert.ok(info && main, 'version markers not found');
   assert.equal(main[1], info[1], 'bump bridge_version in main.nut with GetVersion() in info.nut');
 });
+
+test('replaceIniSection: [game_scripts] holds only AgentBridge, other sections untouched', async () => {
+  const { replaceIniSection, iniSectionKeys } = await import('../src/setup.js');
+  const src = '[ai_players]\nnone = \n\n[game_scripts]\nnone = \nOtherGS = x=1\n\n[gui]\nx = 1\n';
+  const out = replaceIniSection(src, 'game_scripts', ['AgentBridge = a=1']);
+  assert.deepEqual(iniSectionKeys(out, 'game_scripts'), ['AgentBridge']);
+  assert.deepEqual(iniSectionKeys(out, 'ai_players'), ['none']);
+  assert.deepEqual(iniSectionKeys(out, 'gui'), ['x']);
+  assert.deepEqual(iniSectionKeys(replaceIniSection('[gui]\nx = 1', 'game_scripts', ['AgentBridge = ']), 'game_scripts'), ['AgentBridge']);
+});
+
+test('adminHostForBind: wildcard and loopback -> 127.0.0.1, a LAN address -> itself', async () => {
+  const { adminHostForBind } = await import('../src/commands.js');
+  assert.equal(adminHostForBind('0.0.0.0'), '127.0.0.1');
+  assert.equal(adminHostForBind('127.0.0.1'), '127.0.0.1');
+  assert.equal(adminHostForBind('10.0.0.5'), '10.0.0.5');
+  assert.equal(adminHostForBind('10.0.0.5,127.0.0.1'), '10.0.0.5');
+});

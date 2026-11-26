@@ -43,6 +43,14 @@ Behaviour changes agents must know:
 - A game without AgentBridge no longer piles up admin connections: a session whose GameScript
   does not answer closes its admin connection at once (a daemon retrying every call filled the
   server's admin slots: `read ECONNRESET`). The error names the likely cause and the fix.
+- `launch`: `[game_scripts]` in the launch profile is rewritten to hold only AgentBridge (a
+  `none =` copied from the user's openttd.cfg silently won, and the GS never answered). `doctor`
+  lists launch profiles where it is wrong (`launch_profile_game_scripts`).
+- `launch --bind <address>` (not 0.0.0.0 or loopback) saves that address as `host`, so the CLI on
+  the host reaches the admin port there instead of 127.0.0.1 (ECONNREFUSED).
+- `launch` writes `server_name` (and, for a dedicated server, `client_name = openttd-agent
+  server`) to the profile's private.cfg; OpenTTD 15 ignores them in openttd.cfg, so the server's
+  own client showed as "Unnamed Client".
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).
