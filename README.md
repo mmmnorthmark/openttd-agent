@@ -371,7 +371,8 @@ openttd-agent unpause
 ## Tips for agents
 
 - **Discover, don't guess:** `openttd-agent help` lists commands; `openttd-agent <command> --help`
-  prints one command's arguments. Unknown flags are refused and nothing runs.
+  prints one command's arguments. Unknown flags are refused and nothing runs. `--id` is accepted
+  for `--vehicle`, and `--vehicle`/`--vehicles` for each other.
 - **Prefer the composite commands** (`build-cargo-route`, `station-sites`, `build-line-depot`,
   `find-cargo-pairs`): one call each instead of a dozen small ones, and they place things with the
   map mirror. Reading `tiles` to plan by hand is slow and error-prone; use it to look at a failure.

@@ -305,3 +305,18 @@ test('save runs the console save with a checked name and never a path', async ()
   }
   assert.equal(fake.state.rcons.length, before, 'refused names never reach the console');
 });
+
+test('argument aliases: --id and --vehicle/--vehicles; engines and depots default to rail; NaN echoes the value', async () => {
+  const { aliasArgs } = await import('../src/commands.js');
+  assert.deepEqual(aliasArgs(['vehicle'], { id: 5 }), { vehicle: 5 });
+  assert.deepEqual(aliasArgs(['vehicles'], { vehicle: '5,6' }), { vehicles: '5,6' });
+  assert.deepEqual(aliasArgs(['vehicles'], { id: 7 }), { vehicles: 7 });
+  assert.deepEqual(aliasArgs(['vehicle'], { vehicles: '9' }), { vehicle: '9' });
+  assert.deepEqual(aliasArgs(['vehicle', 'id'], { id: 1 }), { id: 1 }, 'a real --id is kept');
+  assert.equal((await run('vehicle', { id: 11 })).id, 11);
+  await run('vehicle-stop', { vehicle: 11 });
+  assert.deepEqual(lastExec().steps, [['veh_start_stop', 11, 0]]);
+  assert.equal((await run('depots', {})).type, 'rail');
+  assert.equal((await run('engines', {})).engines.length, 3);
+  await assert.rejects(run('vehicle', { vehicle: 'abc' }), /--vehicle: .*\(got "abc"\)/);
+});

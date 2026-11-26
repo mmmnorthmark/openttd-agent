@@ -1165,8 +1165,8 @@ export const COMMANDS = [
   },
   {
     name: 'engines', group: 'operate', session: true,
-    description: 'Engines/wagons/vehicles your company can buy now: price, capacity, max speed, reliability, running cost per year, lifespan, design year, power. type is required; cargo (name) keeps wagons/vehicles refittable to it and locomotives that can pull it; rail_type keeps trains for that track (see rail-types). Newest design first: compare with your fleet to decide replacements.',
-    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES), cargo: z.string().optional(), rail_type: int().optional(), wagons: bool().optional().describe('rail only: true = wagons only, false = locomotives only'), limit: int().default(60) }),
+    description: 'Engines/wagons/vehicles your company can buy now: price, capacity, max speed, reliability, running cost per year, lifespan, design year, power. type defaults to rail; cargo (name) keeps wagons/vehicles refittable to it and locomotives that can pull it; rail_type keeps trains for that track (see rail-types). Newest design first: compare with your fleet to decide replacements.',
+    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).default('rail'), cargo: z.string().optional(), rail_type: int().optional(), wagons: bool().optional().describe('rail only: true = wagons only, false = locomotives only'), limit: int().default(60) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargo = cargoId(s.cargos, a.cargo);
@@ -1185,7 +1185,7 @@ export const COMMANDS = [
   {
     name: 'depots', group: 'operate', session: true,
     description: 'Your depots (or hangars) of one type with the number of vehicles inside. Vehicles are bought and cloned at a depot tile.',
-    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES) }),
+    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).default('rail') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const rows = (await s.gs.call('depots', { company, type: vehicleTypeId(a.type) })).map(([x, y, vehicles]) => ({ x, y, vehicles }));
@@ -1666,6 +1666,33 @@ export const COMMANDS = [
 
 export const COMMANDS_BY_NAME = new Map(COMMANDS.map((c) => [c.name, c]));
 
+/**
+ * Forgiving argument names: --id for --vehicle, --vehicle for --vehicles and back (one id).
+ * Returns a new args object; keys the command really has always win.
+ */
+export function aliasArgs(known, raw) {
+  const out = { ...raw };
+  const has = (k) => known.includes(k);
+  const move = (from, to, fn = (v) => v) => {
+    if (from in out && !has(from) && has(to) && !(to in out)) { out[to] = fn(out[from]); delete out[from]; }
+  };
+  move('id', 'vehicle');
+  move('vehicle', 'vehicles');
+  move('id', 'vehicles');
+  const single = (v) => (Array.isArray(v) && v.length === 1 ? v[0] : typeof v === 'string' && /^\s*\d+\s*$/.test(v) ? v.trim() : v);
+  move('vehicles', 'vehicle', single);
+  return out;
+}
+
+/** zod issues -> "--key: message (got 'raw')" lines, so a bad number shows what was received. */
+function argErrors(error, raw) {
+  return error.issues.map((i) => {
+    const key = i.path[0];
+    const got = key !== undefined && key in raw ? ` (got ${JSON.stringify(raw[key])})` : '';
+    return `${key !== undefined ? `--${i.path.join('.')}` : 'arguments'}: ${i.message}${got}`;
+  }).join('; ');
+}
+
 /** Validate args and run. Throws with a readable message on bad args. */
 export async function runCommand(ctx, name, rawArgs = {}) {
   const cmd = COMMANDS_BY_NAME.get(name);
@@ -1673,14 +1700,15 @@ export async function runCommand(ctx, name, rawArgs = {}) {
   // Refuse unknown keys: a mistyped or `--help` flag must never run the command with defaults
   // (`turn-advance --help` once advanced the game 30 days).
   const known = Object.keys(cmd.args.shape ?? {});
-  const unknown = Object.keys(rawArgs ?? {}).filter((k) => !known.includes(k));
+  const args = aliasArgs(known, rawArgs ?? {});
+  const unknown = Object.keys(args).filter((k) => !known.includes(k));
   if (unknown.length) {
     throw new Error(`unknown argument${unknown.length > 1 ? 's' : ''} for ${name}: ${unknown.map((k) => `--${k}`).join(', ')}. Valid: ${known.map((k) => `--${k}`).join(' ') || '(none)'}. Nothing was run.`);
   }
-  const parsed = cmd.args.safeParse(rawArgs);
-  if (!parsed.success) throw new Error(`bad arguments for ${name}: ${z.prettifyError(parsed.error)}`);
+  const parsed = cmd.args.safeParse(args);
+  if (!parsed.success) throw new Error(`bad arguments for ${name}: ${argErrors(parsed.error, args)}`);
   // Player with a relay configured: the host's relay runs every game command (it holds the admin connection and the map mirror).
-  if (cmd.session && ctx.cfg.relay) return envelope(await callRelay(ctx.cfg, name, rawArgs));
+  if (cmd.session && ctx.cfg.relay) return envelope(await callRelay(ctx.cfg, name, args));
   return envelope(await cmd.run(ctx, parsed.data));
 }
 
