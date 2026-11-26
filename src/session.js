@@ -194,7 +194,11 @@ export class Session {
         const depot = p.depot ?? where.get(p.vehicle); // a vehicle in a depot is on the depot tile
         const res = await this.exec(company, [...Array.from({ length: p.count }, () => ['veh_buy', depot.x, depot.y, p.wagon, p.cargo, p.vehicle]), ['veh_start_stop', p.vehicle, 1]], { keepGoing: true });
         const added = res.results.filter((r) => r.op === 'veh_buy' && r.ok).length;
-        const entry = { vehicle: p.vehicle, wagons_added: added, of: p.count, cost: res.cost, restarted: res.results.at(-1)?.ok ?? false, ...(res.ok ? {} : { error: res.error }) };
+        // A wagon the game sold but would not couple (the train was not stopped there after all): sell it back.
+        const stray = res.results.filter((r) => r.op === 'veh_buy' && !r.ok && r.value && /could not attach/.test(r.error ?? '')).map((r) => r.value);
+        const soldBack = stray.length ? await this.exec(company, stray.map((v) => ['veh_sell', v]), { keepGoing: true }) : null;
+        const entry = { vehicle: p.vehicle, wagons_added: added, of: p.count, cost: res.cost + (soldBack?.cost ?? 0), restarted: res.results.at(-1)?.ok ?? false,
+          ...(res.ok ? {} : { error: res.error }), ...(stray.length ? { sold_back: stray, sold_back_ok: soldBack.ok } : {}) };
         out.wagons_added.push(entry);
         this.jobLog.push({ t: new Date().toISOString(), company, kind: 'add_wagons', ...entry });
         log.info('session', 'added wagons', { company, ...entry });
