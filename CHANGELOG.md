@@ -74,6 +74,9 @@ Behaviour changes agents must know:
   builds a road path from the entrance to the nearest road (`connect`). A refused drive-through
   stop says why where it can tell: `first_error: drive_through_refused` with `junction`,
   `one_way_road`, `other_owner_road`, `not_plain_road` or `slope` (the game only said ERR_UNKNOWN).
+- Fix: the rail trace read one-way path signals backwards (`rail_tiles` bit d is a signal facing
+  trains that come from neighbour d, per OpenTTD's GetSignalType/HasSignalOnTrackdir), so
+  `verify-route` could call a working one-way stretch blocked and a blocked one open.
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

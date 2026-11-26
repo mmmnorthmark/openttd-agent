@@ -53,7 +53,10 @@ export function entryRefusal(t, edge, company) {
   if (t.kind === 'd') return dirTo(t.x, t.y, t.a, t.b) === edge ? null : 'depot_entrance_faces_away';
   if (t.kind === 'b' || t.kind === 'u') return opposite(dirTo(t.x, t.y, t.a, t.b)) === edge ? null : (t.kind === 'b' ? 'bridge_side' : 'tunnel_side');
   if (!trackEdges(t.tracks).has(edge)) return t.kind === 's' ? 'station_platform_side' : 'track_not_joined';
-  if (t.signals & (1 << edge)) return 'one_way_signal_against';
+  // rail_tiles bit d: a one-way path signal facing trains that come from neighbour d (GSRail.GetSignalType
+  // with front = that neighbour; OpenTTD's HasSignalOnTrackdir). A train entering through `edge` came
+  // from neighbour `edge`, so it is against a signal facing trains from the other side.
+  if (t.signals & (1 << opposite(edge))) return 'one_way_signal_against';
   return null;
 }
 

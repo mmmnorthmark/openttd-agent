@@ -55,8 +55,9 @@ test('traceRail: track that touches but does not join (crossing at right angles)
 });
 
 test('traceRail: a one-way path signal facing the wrong way blocks the line', async () => {
-  // Signal on (10,5) facing -x (bit 2): trains heading -x pass it; trains heading +x come from behind.
-  const specs = [...row(2, 4, 5, 's', 1), ...row(5, 9, 5), [10, 5, 't', X, -1, -1, -1, 0, 1 << 2], ...row(11, 20, 5), ...row(21, 23, 5, 's', 2)];
+  // Signal on (10,5) facing trains from +x (bit 0, as GSRail.GetSignalType(tile, front = (11,5))): trains
+  // heading -x pass it; trains heading +x come from behind.
+  const specs = [...row(2, 4, 5, 's', 1), ...row(5, 9, 5), [10, 5, 't', X, -1, -1, -1, 0, 1 << 0], ...row(11, 20, 5), ...row(21, 23, 5, 's', 2)];
   const getTile = world(specs);
   const west = await traceRail({ getTile, starts: [{ x: 22, y: 5 }], isGoal: goalStation(1), goal: { x: 3, y: 5 } });
   assert.equal(west.connected, true);
