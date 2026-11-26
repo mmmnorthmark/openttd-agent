@@ -1294,26 +1294,31 @@ export const COMMANDS = [
   },
   {
     name: 'towns', group: 'world', session: true,
-    description: 'Towns with population and last-month passenger/mail production and transported %. Filter by min_population; sorted by population.',
-    args: z.object({ min_population: int().default(0), limit: int().default(50), name: z.string().optional() }),
+    description: 'Towns with population and last-month passenger/mail production and transported %. Filter by min_population, name, id, near_x/near_y within radius (each row then has distance); sorted by population (by distance with near_x/near_y).',
+    args: z.object({ min_population: int().default(0), limit: int().default(50), name: z.string().optional(), id: int().optional(),
+      near_x: int().optional(), near_y: int().optional(), radius: int().min(1).default(50) }),
     run: async (ctx, a) => {
+      if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
       const { towns } = await (await ctx.session()).economy();
-      const hits = towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())))
-        .sort((x, y) => y.population - x.population);
+      const near = a.near_x !== undefined ? { x: a.near_x, y: a.near_y } : null;
+      const hits = towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())) && (a.id === undefined || t.id === a.id))
+        .map((t) => (near ? { ...t, distance: manhattan(t, near) } : t)).filter((t) => !near || t.distance <= a.radius)
+        .sort((x, y) => (near ? x.distance - y.distance : y.population - x.population));
       return listResult('towns', towns, hits, a.limit);
     },
   },
   {
     name: 'industries', group: 'world', session: true,
-    description: 'Industries with location, last-month production per cargo and % transported ("unexploited" = low %). Filter by type name / cargo name substring, max_transported_pct, min_production, near x,y within radius. Secondary (processing) industries are marked secondary: true and kept by min_production: they produce only after deliveries, so last_month 0 is normal.',
+    description: 'Industries with location, last-month production per cargo and % transported ("unexploited" = low %). Filter by id, type name / cargo name substring, max_transported_pct, min_production, near x,y within radius. Secondary (processing) industries are marked secondary: true and kept by min_production: they produce only after deliveries, so last_month 0 is normal.',
     args: z.object({
       type: z.string().optional(), cargo: z.string().optional(), max_transported_pct: int().default(100),
       min_production: int().default(0), near_x: int().optional(), near_y: int().optional(), radius: int().optional(), limit: int().default(50),
+      id: int().optional().describe('one industry by id'),
     }),
     run: async (ctx, a) => {
       const { industries } = await (await ctx.session()).economy();
       const lc = (s) => String(s).toLowerCase();
-      const hits = industries.filter((i) => (!a.type || lc(i.type_name).includes(lc(a.type)))
+      const hits = industries.filter((i) => (a.id === undefined || i.id === a.id) && (!a.type || lc(i.type_name).includes(lc(a.type)))
         && (a.near_x === undefined || manhattan(i, { x: a.near_x, y: a.near_y }) <= (a.radius ?? 50))
         && (!a.cargo && a.max_transported_pct >= 100 && a.min_production <= 0
           ? true

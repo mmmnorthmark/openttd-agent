@@ -158,6 +158,8 @@ Behaviour changes agents must know:
 - `find-cargo-pairs` defaults to 20..200 tiles when `--min_distance`/`--max_distance` are not
   given (it was 0..1000 and offered 900-tile pairs); `distance_bounds` says which bounds applied.
   `--near_x --near_y [--radius 60]` keeps sources near a tile.
+- `towns --near_x --near_y [--radius 50]` (rows gain `distance`, nearest first) and `--id`;
+  `industries --id`.
 
 ## 0.6.0 (2026-11-25)
 

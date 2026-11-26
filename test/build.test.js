@@ -329,3 +329,11 @@ test('find-cargo-pairs: default distance bounds and --near_x/--near_y/--radius',
   assert.equal(far.total_candidates, 0);
   assert.equal(far.distance_bounds.defaulted, undefined);
 });
+
+test('towns --near_x/--near_y/--radius and --id; industries --id', async () => {
+  const near = await run('towns', { near_x: 12, near_y: 48, radius: 10 });
+  assert.deepEqual(near.towns.map((t) => [t.name, t.distance]), [['Smallham', 4]]);
+  assert.equal((await run('towns', { id: 1 })).towns[0].name, 'Bigton');
+  const ind = await run('industries', { id: 2 });
+  assert.deepEqual(ind.industries.map((i) => i.id), [2]);
+});
