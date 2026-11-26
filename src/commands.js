@@ -534,7 +534,7 @@ async function depotForRoute(s, company, a, id, { cmd }) {
     const where = r.error ?? `depot (${depot.x},${depot.y}) is not rail-connected to ${r.failed.station_name} (${r.failed.at.x},${r.failed.at.y}), an order station of vehicle ${id}`
       + (r.failed.first_gap ? ` (first gap at (${r.failed.first_gap.x},${r.failed.first_gap.y}): ${r.failed.first_gap.reason})` : '')
       + `; a ${cmd === 'vehicle-clone' ? 'clone' : 'train'} there would get lost`;
-    const fix = alt ? `use --depot auto (picks (${alt.x},${alt.y}) on its route) or --depot_x ${alt.x} --depot_y ${alt.y}` : `build a depot on its line: openttd-agent build-line-depot --station ${stops[0].id}`;
+    const fix = alt ? `Use --depot auto (picks (${alt.x},${alt.y}) on its route) or --depot_x ${alt.x} --depot_y ${alt.y}` : `Build a depot on its line: openttd-agent build-line-depot --station ${stops[0].id}`;
     throw new Error(`refused: ${where}. ${fix}${coarse ? ' (coarse trace: the running AgentBridge is older than v9)' : ''}`);
   }
   return { depot, route_check: coarse ? 'coarse_not_refuted' : 'connected', ...note };
