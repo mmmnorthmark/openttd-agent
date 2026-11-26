@@ -147,6 +147,9 @@ Behaviour changes agents must know:
 - Periodic saves (host): `save --every_months N --prefix P` saves now and then `P-YYYY-MM` every N
   game months (the daemon checks every 20 s; `--every_months 0` stops; `save` alone shows the
   schedule). `pause --save NAME` pauses and saves. Live-tested.
+- New `sign --x --y --text`, `signs`, `sign-remove --ids|--x --y|--text` (GS v12): free company
+  signs to mark plots, instead of placing track as a marker (which cost money and could not be
+  told apart from real track). Live-tested.
 
 ## 0.6.0 (2026-11-25)
 

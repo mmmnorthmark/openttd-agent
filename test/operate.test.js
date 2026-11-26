@@ -555,3 +555,17 @@ test('save --every_months: saves now, schedule shows, 0 stops; pause --save save
   assert.ok(fake.state.rcons.includes('pause'));
   await run('unpause', {});
 });
+
+test('sign, signs, sign-remove (v12)', async () => {
+  const r = await run('sign', { x: 5, y: 6, text: 'plot A' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(typeof r.sign, 'number');
+  await run('sign', { x: 7, y: 6, text: 'plot B' });
+  assert.deepEqual((await run('signs', { text: 'plot' })).signs.map((g) => g.text), ['plot A', 'plot B']);
+  const rm = await run('sign-remove', { x: 5, y: 6 });
+  assert.deepEqual(rm.removed, [r.sign]);
+  assert.equal((await run('sign-remove', { text: 'nothing' })).first_error, 'not_found');
+  await run('sign-remove', { text: 'plot' });
+  assert.equal((await run('signs', {})).total, 0);
+  await assert.rejects(run('sign', { x: 1, y: 1, text: 'x'.repeat(32) }), /31/);
+});

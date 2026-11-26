@@ -72,6 +72,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const gameDate = (i) => `${i.year}-${String(i.month).padStart(2, '0')}-${String(i.day).padStart(2, '0')}`;
 
 /** Pause or unpause over the server console and wait until the game reports it. Returns the fresh GS info. */
+/** Throw a clear refusal when the running AgentBridge is older than v12. */
+async function needV12(s, cmd) {
+  if (((await s.gs.call('info')).bridge_version ?? 0) < 12) throw new Error(`refused: ${cmd} needs AgentBridge v12 (the running GameScript is older); the host re-runs install-gamescript and loads the game again`);
+}
+
 /** Console save of the running game (host). Returns the reply for `save`. */
 export async function saveGame(s, name) {
   const out = await s.admin.rcon(`save ${name}`, 30000);
@@ -1451,6 +1456,47 @@ export const COMMANDS = [
       }
       const tiles = rows.map(railTileFromRow).map((t) => describeRailTile(t, company)).filter((t) => a.mine === undefined || t.mine === a.mine);
       return { company, ...listResult('tiles', tiles, tiles, 1024) };
+    },
+  },
+
+  {
+    name: 'sign', group: 'build', session: true,
+    description: 'Put a sign on the map as your company (free, visible to everyone in the game; use it to mark planned plots and lines instead of placing track). Text up to 31 characters. The sign id is in `sign`. AgentBridge v12.',
+    args: z.object({ ...act, ...point, text: z.string().min(1).max(31) }),
+    run: async (ctx, a) => {
+      const { s } = await mine(ctx, a);
+      await needV12(s, 'sign');
+      const res = await run(ctx, a, [['sign', a.x, a.y, a.text]]);
+      return { ...res, ...(res.ok && !a.dry_run ? { sign: res.results[0].value } : {}) };
+    },
+  },
+  {
+    name: 'sign-remove', group: 'build', session: true,
+    description: 'Remove your company\'s signs: --ids A,B, or --x/--y (every sign of yours on that tile), or --text (signs whose text contains it). AgentBridge v12.',
+    args: z.object({ ...act, ids: ids().optional(), x: int().optional(), y: int().optional(), text: z.string().optional() }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      await needV12(s, 'sign-remove');
+      const mineSigns = (await s.gs.call('signs', { company })).map(([id, x, y, owner, text]) => ({ id, x, y, owner, text }));
+      let pick;
+      if (a.ids) pick = a.ids;
+      else if (a.x !== undefined && a.y !== undefined) pick = mineSigns.filter((g) => g.x === a.x && g.y === a.y).map((g) => g.id);
+      else if (a.text) pick = mineSigns.filter((g) => lc(g.text).includes(lc(a.text))).map((g) => g.id);
+      else throw new Error('give --ids A,B, or --x and --y, or --text');
+      if (!pick.length) return { ok: false, error: 'not_found: no sign of yours matches; run: openttd-agent signs', first_error: 'not_found', removed: [] };
+      const res = await run(ctx, a, pick.map((id) => ['sign_remove', id]), { keepGoing: true });
+      return { ...res, removed: res.results.filter((r) => r.ok).map((r) => pick[r.step]) };
+    },
+  },
+  {
+    name: 'signs', group: 'world', session: true,
+    description: 'Your company\'s signs: id, x, y, text. Filter with --text. AgentBridge v12.',
+    args: z.object({ ...who, text: z.string().optional(), limit: int().default(200) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      await needV12(s, 'signs');
+      const all = (await s.gs.call('signs', { company })).map(([id, x, y, , text]) => ({ id, x, y, text }));
+      return listResult('signs', all, all.filter((g) => !a.text || lc(g.text).includes(lc(a.text))), a.limit);
     },
   },
 
