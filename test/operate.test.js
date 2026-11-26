@@ -527,3 +527,15 @@ test('rating: components with points from rating_parts and company_history', asy
   assert.equal(res.components.length, 9);
   assert.equal(res.game_rating_last_quarter, 209);
 });
+
+test('companies: period, station_count, vehicles_by_type; --history N quarters newest first', async () => {
+  const { quarterLabel } = await import('../src/commands.js');
+  assert.equal(quarterLabel({ year: 1951, month: 5 }, 1), '1951 Q1');
+  assert.equal(quarterLabel({ year: 1951, month: 2 }, 1), '1950 Q4');
+  const res = await run('companies', {});
+  const c = res.companies[0];
+  assert.deepEqual([c.period, c.station_count, c.vehicles_by_type], ['1949 Q4', 4, { rail: 1, road: 1, water: 0, air: 0 }]);
+  assert.equal(c.history, undefined);
+  const h = await run('companies', { history: 3 });
+  assert.deepEqual(h.companies[0].history.map((q) => [q.period, q.value]), [['1949 Q4', 49000], ['1949 Q3', 48000], ['1949 Q2', 47000]]);
+});

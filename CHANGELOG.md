@@ -140,6 +140,10 @@ Behaviour changes agents must know:
   `estimate_now` and `game_rating_last_quarter`. `cargo_types` is not readable by scripts (null);
   `stations` counts station parts with a vehicle order (the game: served in the last 20 days).
   Live check: estimate 32 of 950 known points against the game's 37 (one cargo type is ~6 points).
+- `companies`: each row says which quarter its figures are (`period`, e.g. "1951 Q2": the last full
+  quarter) and has `station_count` and `vehicles_by_type` {rail, road, water, air} (GS v12).
+  `--history N` adds the last N quarters per company (`history[]`: period, value, income,
+  expenses, delivered, performance; newest first).
 
 ## 0.6.0 (2026-11-25)
 

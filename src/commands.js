@@ -701,6 +701,12 @@ async function depotForRoute(s, company, a, id, { cmd }) {
   return { depot, route_check: coarse ? 'coarse_not_refuted' : 'connected', ...note };
 }
 
+/** "1951 Q2" for the quarter `back` quarters before the running one (GS quarter numbering: 0 = running). */
+export function quarterLabel(info, back) {
+  const idx = info.year * 4 + Math.floor((info.month - 1) / 3) - back;
+  return `${Math.floor(idx / 4)} Q${(idx % 4) + 1}`;
+}
+
 /** Map station id -> [vehicle ids with an order for it] (GS v12 station_vehicles), or null on an older GameScript. */
 async function stationVehicleIds(s, company, station) {
   let rows;
@@ -1101,9 +1107,30 @@ export const COMMANDS = [
   },
   {
     name: 'companies', group: 'game', session: true,
-    description: 'All companies: money, loan, last-quarter income/expenses/value/cargo delivered/performance. Use for competitor assessment.',
-    args: z.object({}),
-    run: async (ctx) => { const rows = await (await ctx.session()).gs.call('companies'); return listResult('companies', rows, rows); },
+    description: 'All companies: money, loan, and for the last full quarter (`period`, e.g. "1951 Q2") income, expenses (negative), company value, cargo delivered and performance rating; station_count and vehicles_by_type {rail, road, water, air} (AgentBridge v12; the company window shows both to anyone). --history N adds the last N quarters per company (`history`: period, value, income, expenses, delivered, performance; newest first; AgentBridge v12). Use for competitor assessment.',
+    args: z.object({ history: int().min(0).max(24).default(0).describe('quarters of history per company (0 = none)') }),
+    run: async (ctx, a) => {
+      const s = await ctx.session();
+      const [info, rows] = await Promise.all([s.gs.call('info'), s.gs.call('companies')]);
+      const out = [];
+      for (const c of rows) {
+        const { vehicles_by_type: vt, ...rest } = c;
+        const row = { ...rest, period: quarterLabel(info, 1), ...(vt ? { vehicles_by_type: { rail: vt[0], road: vt[1], water: vt[2], air: vt[3] } } : {}) };
+        if (a.history > 0) {
+          try {
+            const h = await s.gs.call('company_history', { company: c.id, quarters: a.history });
+            row.history = h.filter((r) => r[0] >= 1).sort((p, q) => p[0] - q[0])
+              .map(([q, value, income, expenses, delivered, performance]) => ({ period: quarterLabel(info, q), value, income, expenses, delivered, performance }));
+          } catch (e) {
+            if (!/unknown cmd/.test(e.message)) throw e;
+            row.history = null;
+            row.history_note = 'needs AgentBridge v12; the host re-runs install-gamescript and loads the game again';
+          }
+        }
+        out.push(row);
+      }
+      return listResult('companies', out, out);
+    },
   },
   {
     name: 'rating', group: 'game', session: true,
