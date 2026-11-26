@@ -3,7 +3,7 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
-## Unreleased (next: 0.6.0)
+## 0.6.0 (2026-11-25)
 
 - `purchase-land --x0 --y0 --x1 --y1 [--dry_run true]` (build, your company): buys a rectangle as
   owned land ("Purchase land for future use"), any two opposite corners, at most 400 tiles per

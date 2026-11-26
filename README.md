@@ -15,16 +15,16 @@ Needs Node 20+ and OpenTTD 15.x with the original TTD graphics or OpenGFX (run O
 Nothing to clone: run it straight from GitHub with `npx`, pinned to a release tag.
 
 ```sh
-npx -y github:mmmnorthmark/openttd-agent#v0.5.0 doctor      # checks OpenTTD, graphics, GameScript
+npx -y github:mmmnorthmark/openttd-agent#v0.6.0 doctor      # checks OpenTTD, graphics, GameScript
 ```
 
 Every example below writes `openttd-agent ...`. Either make that a short alias for the `npx` form:
 
 ```sh
-alias openttd-agent='npx -y github:mmmnorthmark/openttd-agent#v0.5.0'   # add to ~/.zshrc or ~/.bashrc
+alias openttd-agent='npx -y github:mmmnorthmark/openttd-agent#v0.6.0'   # add to ~/.zshrc or ~/.bashrc
 ```
 
-or install it once: `npm i -g github:mmmnorthmark/openttd-agent#v0.5.0`.
+or install it once: `npm i -g github:mmmnorthmark/openttd-agent#v0.6.0`.
 
 **Versions.** Releases follow [semver](https://semver.org) and are git tags `vX.Y.Z`
 ([CHANGELOG.md](CHANGELOG.md)); `main` may be ahead of the latest release. To update, change the
@@ -36,10 +36,10 @@ loads the game again (a running game keeps the GameScript it started with).
 Claude Code, as MCP tools:
 
 ```sh
-claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.5.0 mcp
+claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.6.0 mcp
 ```
 
-Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.5.0", "mcp"]`.
+Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.6.0", "mcp"]`.
 For a small or fast model, expose only the tools it needs and get compact results (unreleased, on `main`):
 `openttd-agent mcp --tools goal-status,stations,vehicles,find-cargo-pairs,build-cargo-route --compact true`.
 Agents that run shell commands can use the CLI directly; it is often faster than MCP because they
@@ -152,10 +152,10 @@ starts nothing and prints no secrets; agents should run it first.
 3. Connect your agent. Claude Code:
 
    ```sh
-   claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.5.0 mcp
+   claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.6.0 mcp
    ```
 
-   Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.5.0", "mcp"]`.
+   Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.6.0", "mcp"]`.
    Or let the agent use the CLI directly (`openttd-agent help`; every command prints JSON).
 
 ### A human and an agent in one company
