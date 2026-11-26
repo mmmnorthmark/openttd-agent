@@ -224,7 +224,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 8,
+		bridge_version = 9,
 		event_seq = this.event_seq,
 		goals = this.goals.len(),
 	};

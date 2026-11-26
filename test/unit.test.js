@@ -93,3 +93,11 @@ test('patchIni edits an existing [misc] key instead of adding a second section',
   assert.equal(out.match(/\[misc\]/g).length, 1);
   assert.match(out, /\[misc\]\nsavegame_format = none\nfoo = 1/);
 });
+
+test('GameScript reports the same bridge_version as info.nut GetVersion()', () => {
+  const dir = new URL('../gamescript/AgentBridge/', import.meta.url);
+  const info = fs.readFileSync(new URL('info.nut', dir), 'utf8').match(/GetVersion\(\)\s*\{\s*return (\d+);/);
+  const main = fs.readFileSync(new URL('main.nut', dir), 'utf8').match(/bridge_version = (\d+),/);
+  assert.ok(info && main, 'version markers not found');
+  assert.equal(main[1], info[1], 'bump bridge_version in main.nut with GetVersion() in info.nut');
+});

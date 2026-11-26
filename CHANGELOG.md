@@ -21,7 +21,8 @@ re-run `install-gamescript` when it changes.
 - GameScript v9 (the host re-runs `install-gamescript`; a running game picks it up when it is
   loaded again): `rail_tiles` (track bits, depot fronts, bridge and tunnel ends, signals);
   `vehicles` rows add `current_order`, `dest`, `dest_station` and `speed`; `vehicle` adds
-  `unit_number` and `rail_type`.
+  `unit_number` and `rail_type`. (`info` reported `bridge_version` 8 at first, so clients used
+  the coarse trace; fixed before release, with a test that it matches `GetVersion()`.)
 - `vehicle-clone` checks the depot (rail): `--depot auto` (or no depot) picks your depot nearest
   the vehicle's first order station that is rail-connected to all its order stations;
   `--depot_x/--depot_y` is refused when that depot is not (the clone would get lost), with the gap
