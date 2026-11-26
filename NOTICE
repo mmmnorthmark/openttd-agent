@@ -1,0 +1,17 @@
+openttd-agent
+Copyright (c) 2026 Matthew Miller. Licensed under the MIT License (see LICENSE).
+
+Ideas adapted from other projects (re-implemented here; no source code copied):
+
+- openttd-directorate-mcp, https://github.com/OVER99K/openttd-directorate-mcp
+  MIT License, Copyright (c) 2026 Nicolette.
+  verify-route: checking a route's topology, orders, running vehicles and revenue
+  (game/openttd_directorate/route_registry.nut, D4_VerifyRoute). Used in verify-route and
+  vehicle-problems.
+
+- nttd, https://github.com/deepsaia/nttd
+  Apache License 2.0, Copyright 2026 deepsaia.
+  trace_route: a directed rail walk over the game's own track data (a train cannot reverse
+  mid-line, and the first hop out of the start tile has no incoming direction), reporting how
+  much of the network was reachable (ottd_config/game/nttd-gs/main.nut, CmdTraceRoute).
+  Used in src/connectivity.js.

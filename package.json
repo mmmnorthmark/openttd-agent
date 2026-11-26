@@ -6,7 +6,7 @@
   "bin": { "openttd-agent": "bin/openttd-agent.js" },
   "main": "src/index.js",
   "exports": { ".": "./src/index.js" },
-  "files": ["bin", "src", "gamescript", "ai", "docs", "README.md", "CHANGELOG.md", "LICENSE"],
+  "files": ["bin", "src", "gamescript", "ai", "docs", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"],
   "engines": { "node": ">=20" },
   "scripts": {
     "test": "node --test test/*.test.js",
