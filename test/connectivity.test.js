@@ -106,3 +106,17 @@ test('adjacencyTrace: coarse flood over rail and station tiles, guessing bridges
   assert.deepEqual(r.last_reachable, { x: 11, y: 5 });
   assert.equal(r.first_gap.x, 12);
 });
+
+test('road gap reasons: one-way, depot and stop entrances, missing road', async () => {
+  const { roadGapReason, traceRoad } = await import('../src/connectivity.js');
+  const road = (x, y, links, extra = {}) => ({ x, y, kind: 'r', links, station: -1, a: -1, b: -1, owner: 0, ...extra });
+  assert.equal(roadGapReason(road(0, 0, 0), 0, null), 'no_road');
+  assert.equal(roadGapReason(road(0, 0, 0), 0, road(1, 0, 4)), 'one_way_road');
+  assert.equal(roadGapReason(road(0, 0, 0), 0, road(1, 0, 0, { kind: 's', a: 1, b: 1 })), 'stop_entrance_faces_away');
+  assert.equal(roadGapReason(road(0, 0, 0), 0, road(1, 0, 0, { kind: 'd', a: 0, b: 0 })), 'depot_not_joined');
+  assert.equal(roadGapReason(road(0, 0, 0, { kind: 'd', a: 1, b: 0 }), 0, road(1, 0, 0)), 'depot_not_joined');
+  // Another company's stop is not driven through.
+  const tiles = new Map([[`0,0`, road(0, 0, 1)], [`1,0`, road(1, 0, 5, { kind: 't', station: 9, owner: 3 })], [`2,0`, road(2, 0, 4, { kind: 's', station: 8, a: 1, b: 0 })]]);
+  const r = await traceRoad({ getTile: (x, y) => tiles.get(`${x},${y}`) ?? null, starts: [{ x: 0, y: 0 }], isGoal: (t) => t.station === 8, goal: { x: 2, y: 0 }, company: 0 });
+  assert.deepEqual([r.connected, r.first_gap.reason], [false, 'other_owner_road']);
+});

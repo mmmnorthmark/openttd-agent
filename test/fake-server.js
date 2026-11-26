@@ -109,6 +109,34 @@ function fakeRailRows(state) {
   return rows.filter((r) => `${r[0]},${r[1]}` !== state.railGap);
 }
 
+// Road world for road_tiles (AgentBridge v11), as [x, y, kind, links, station, a, b, owner]: road (35..46,9)
+// through drive-through stop 4 "Bigton Central" at (41,9), to bay stop 7 "Smallham Stop" at (47,9)
+// (front (46,9)); depot (36,8) facing (36,9). Bus 12 runs 4 -> 7. state.roadGap ("x,y") removes a
+// tile; state.roadOneWay ("x,y") lets vehicles on that tile drive only toward +x.
+function fakeRoadRows(state) {
+  const tiles = new Map(); // "x,y" -> { kind, edges, station, a, b }
+  const put = (x, y, kind, edges, extra = {}) => tiles.set(`${x},${y}`, { x, y, kind, edges: new Set(edges), station: -1, a: -1, b: -1, ...extra });
+  for (let x = 35; x <= 46; x++) put(x, 9, 'r', x === 35 ? [0] : [0, 2]);
+  tiles.get('36,9').edges.add(3);
+  put(41, 9, 't', [0, 2], { station: 4 });
+  put(47, 9, 's', [2], { station: 7, a: 46, b: 9 });
+  put(36, 8, 'd', [1], { a: 36, b: 9 });
+  if (state.roadGap) tiles.delete(state.roadGap);
+  const DX = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+  const rows = [];
+  for (const t of tiles.values()) {
+    let links = 0;
+    for (let d = 0; d < 4; d++) {
+      const n = tiles.get(`${t.x + DX[d][0]},${t.y + DX[d][1]}`);
+      if (!t.edges.has(d) || !n || !n.edges.has((d + 2) % 4)) continue;
+      if (state.roadOneWay === `${n.x},${n.y}` && d === 2) continue; // entering the one-way tile against it
+      links |= 1 << d;
+    }
+    rows.push([t.x, t.y, t.kind, links, t.station, t.a, t.b, 0]);
+  }
+  return rows;
+}
+
 const fakeDays = (state) => state.daysRun + (state.paused ? 0 : Math.floor((Date.now() - state.runningSince) / state.dayMs));
 
 // Console commands the package uses. Returns the output lines.
@@ -180,6 +208,7 @@ const GS = {
     [3, 'Bigton Woods', 12, 20, 1, [[7, 240, 35]], 2],
     [4, 'Bigton Central', 41, 9, 4 | 2, [[0, 15, 80]], 5],
     [5, 'Sawmill Halt', 24, 20, 1, [], 1],
+    [7, 'Smallham Stop', 47, 9, 2, [[0, 5, 60]], 1],
   ],
   // v9 rows end with [current_order, dest_x, dest_y, dest_station, speed].
   vehicles: (_a, state) => [
@@ -192,7 +221,20 @@ const GS = {
     if (state.gsVersion < 9) throw new Error('unknown cmd: rail_tiles');
     return fakeRailRows(state).filter(([x, y]) => x >= a.x0 && x <= a.x1 && y >= a.y0 && y <= a.y1);
   },
+  road_tiles: (a, state) => {
+    if (state.gsVersion < 11) throw new Error('unknown cmd: road_tiles');
+    return fakeRoadRows(state).filter(([x, y]) => x >= a.x0 && x <= a.x1 && y >= a.y0 && y <= a.y1);
+  },
   vehicle: (a, state) => {
+    if (a.vehicle === 12) {
+      return [
+        { id: 12, name: 'Road Vehicle 1', type: 1, engine: 9, engine_name: 'MPS Regal Bus', age_days: 100, max_age_days: 5475, reliability_pct: 98,
+          profit_this_year: 400, profit_last_year: 2500, value: 4000, running_cost: 300, state: 3, x: 41, y: 9, speed: 0, group: 0xFFFE,
+          wagons: 1, length: 8, capacity: [[0, 31, 10]], shared_orders: true, order_count: 2, current_order: 0, unit_number: 1 },
+        [0, 'station', 41, 9, 0, 4, 'Bigton Central', -1],
+        [1, 'station', 47, 9, 0, 7, 'Smallham Stop', -1],
+      ];
+    }
     if (a.vehicle === 13 && state.lostTrain) {
       return [
         { id: 13, name: 'Train 2', type: 0, engine: 5, engine_name: 'Kirby Paul Tank', age_days: 800, max_age_days: 7300, reliability_pct: 90,
@@ -243,6 +285,15 @@ const GS = {
         if (!rows.at(-1)[0] && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
         continue;
       }
+      if (st[0] === 'veh_depot' && state.gsVersion >= 11) {
+        // As DepotStep in main.nut: 404 unknown, state.headingDepot ids already on their way, 11 in depot with trainInDepot, state.brokenDown ids broken.
+        if (st[1] === 404) rows.push([false, 0, `not_found: vehicle 404 does not exist or is not yours`, 0]);
+        else if (st[1] === 11 && state.trainInDepot) rows.push([true, 0, '', 3]);
+        else if (state.headingDepot.includes(st[1])) rows.push([true, 0, '', 2]);
+        else if (state.brokenDown.includes(st[1])) rows.push([false, 0, `broken_down: vehicle ${st[1]} is broken down; send it again once it moves (a few days) (ERR_UNKNOWN)`, 0]);
+        else rows.push([true, 0, '', 1]);
+        continue;
+      }
       if (st[0] === 'veh_buy' && st[5] >= 0 && state.attachFails && !a.dry_run) {
         rows.push([false, 10, `bought vehicle ${100 + rows.length} but could not attach it to train ${st[5]}: ERR_UNKNOWN`, 100 + rows.length]);
         if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
@@ -260,7 +311,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, money: 100000, loan: 300000, gsVersion: 10, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 11, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null };
   const server = net.createServer((sock) => {
     state.openConnections++;
     sock.on('close', () => { state.openConnections--; });

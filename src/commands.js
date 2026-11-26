@@ -18,7 +18,7 @@ import { vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRow
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
-import { traceRail, adjacencyTrace, mirrorStationTiles, railTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
+import { traceRail, traceRoad, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
@@ -502,6 +502,48 @@ async function makeTracer(s, company, info) {
   };
 }
 
+const OLD_GS_ROAD = 'road vehicles and road stops are traced with the road_tiles query of AgentBridge v11; the running GameScript is older, so there is no road answer (rather than a wrong rail one). The host re-runs install-gamescript and loads the game again';
+
+/** Tile getter over GS `road_tiles` (v11), 16x16 blocks loaded on first use; cached for one command. */
+function roadTileSource(s, company) {
+  const blocks = new Map();
+  const tiles = new Map();
+  return async (x, y) => {
+    if (!s.map.inBounds(x, y)) return null;
+    const bx = Math.floor(x / TRACE_BLOCK), by = Math.floor(y / TRACE_BLOCK);
+    const bk = `${bx},${by}`;
+    if (!blocks.has(bk)) {
+      blocks.set(bk, s.gs.call('road_tiles', { company, x0: bx * TRACE_BLOCK, y0: by * TRACE_BLOCK, x1: bx * TRACE_BLOCK + TRACE_BLOCK - 1, y1: by * TRACE_BLOCK + TRACE_BLOCK - 1 })
+        .then((rows) => { for (const r of rows) tiles.set(`${r[0]},${r[1]}`, roadTileFromRow(r)); }));
+    }
+    await blocks.get(bk);
+    return tiles.get(`${x},${y}`) ?? null;
+  };
+}
+
+/** Road stop tiles of station `st`: flood from its sign tile, else the stop tiles within 6 tiles of it. */
+async function roadStopTiles(getTile, st) {
+  const out = await stationTiles(getTile, st.x, st.y, st.id);
+  if (out.length) return out;
+  for (let dy = -6; dy <= 6; dy++) for (let dx = -6; dx <= 6; dx++) {
+    const t = await getTile(st.x + dx, st.y + dy);
+    if (t && t.station === st.id) out.push({ x: t.x, y: t.y });
+  }
+  return out;
+}
+
+/** Road tracer (AgentBridge v11), the same interface as makeTracer's; null when the GS is older. */
+function makeRoadTracer(s, company, info) {
+  if ((info.bridge_version ?? 0) < 11) return null;
+  const getTile = roadTileSource(s, company);
+  return {
+    method: 'road_tiles',
+    tileAt: getTile,
+    stationStarts: (st) => roadStopTiles(getTile, st),
+    trace: async (starts, goal) => ({ method: 'road_tiles', ...await traceRoad({ getTile, starts, isGoal: (t) => t.station === goal.id, goal, company }) }),
+  };
+}
+
 const findStation = (stations, v) => {
   const hit = stations.find((st) => String(st.id) === String(v)) ?? stations.find((st) => lc(st.name) === lc(v));
   if (!hit) throw new Error(`no station '${v}' of this company; run: openttd-agent stations`);
@@ -513,6 +555,28 @@ async function currentOrderOf(s, company, id) {
   const d = vehicleDetail(await s.gs.call('vehicle', { company, vehicle: id }), s.cargos);
   const o = d.orders.find((r) => r.position === d.current_order);
   return { current_order: d.current_order, dest: o && o.x >= 0 ? { x: o.x, y: o.y } : null, dest_station: o?.station ?? -1, speed: d.speed, orders: d.orders };
+}
+
+/**
+ * Trace a vehicle's route: from its position to each order station, and between consecutive order
+ * stations. Returns { connected, from_vehicle: [...], legs: [...] }.
+ */
+async function routeLegs(s, company, tracer, stations, veh) {
+  const brief = (r) => ({ connected: r.connected, ...(r.connected ? {} : { last_reachable: r.last_reachable ?? null, first_gap: r.first_gap ?? null }), tiles_reached: r.tiles_reached });
+  const { orders, current_order } = await currentOrderOf(s, company, veh.id);
+  const stops = orders.filter((o) => o.kind === 'station' && stations.some((st) => st.id === o.station));
+  if (!stops.length) throw new Error(`vehicle ${veh.id} has no station orders; add some with order-add`);
+  const fromVehicle = [];
+  for (const o of stops) {
+    const st = stations.find((x) => x.id === o.station);
+    fromVehicle.push({ order: o.position, station: st.id, station_name: st.name, current: o.position === current_order, ...brief(await tracer.trace([{ x: veh.x, y: veh.y }], st)) });
+  }
+  const legs = [];
+  for (let i = 0; i < stops.length && stops.length > 1; i++) {
+    const from = stations.find((x) => x.id === stops[i].station), to = stations.find((x) => x.id === stops[(i + 1) % stops.length].station);
+    legs.push({ from: from.name, to: to.name, ...brief(await tracer.trace(await tracer.stationStarts(from), to)) });
+  }
+  return { connected: fromVehicle.every((r) => r.connected) && legs.every((r) => r.connected), from_vehicle: fromVehicle, legs };
 }
 
 // ---- depot guard (vehicle-clone, vehicle-buy --route_of) ---------------------------------
@@ -1154,10 +1218,10 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-problems', group: 'operate', session: true,
-    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot, stopped, old, broken_down, low_reliability, crashed. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
+    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot, stopped, old, broken_down, low_reliability, crashed. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
     args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'),
       stuck_days: int().min(1).default(30).describe('game days without progress before a vehicle counts as stuck or lost'),
-      trace: bool().default(true).describe('check rail connectivity to each train\'s destination'),
+      trace: bool().default(true).describe('check rail (and, AgentBridge v11, road) connectivity to each vehicle\'s destination'),
       severity: z.enum(['all', 'action', 'info']).default('all').describe('action = only problems that need a command') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
@@ -1170,7 +1234,9 @@ export const COMMANDS = [
       const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
       const stationById = new Map(stations.map((st) => [st.id, st]));
       s.vehicleHistory ??= new Map();
-      const tracer = a.trace ? await makeTracer(s, company, info) : null;
+      const railTracer = a.trace ? await makeTracer(s, company, info) : null;
+      const roadTracer = a.trace && vehicles.some((v) => v.type === 'road') ? makeRoadTracer(s, company, info) : null;
+      const tracer = railTracer;
       const lineCache = new Map();
       const rows = [];
       for (const v of vehicles) {
@@ -1188,13 +1254,15 @@ export const COMMANDS = [
           ? recordProgress(s.vehicleHistory, `${company}:${v.id}`, { date: info.date, order: v.current_order, dist: v.dist, atStation: v.state === 'at_station' })
           : null;
         let reach = null, line = null;
-        if (tracer && v.type === 'rail' && st && v.state !== 'in_depot' && v.state !== 'crashed') {
+        const vt = v.type === 'rail' ? railTracer : v.type === 'road' ? roadTracer : null;
+        if (vt && st && v.state !== 'in_depot' && v.state !== 'crashed') {
+          const tracer = vt;
           reach = await tracer.trace([{ x: v.x, y: v.y }], st);
           if (!reach.connected) {
             orders ??= (await currentOrderOf(s, company, v.id)).orders;
             const ids = [...new Set(orders.filter((o) => o.kind === 'station').map((o) => o.station))];
             if (ids.length >= 2 && ids.every((id) => stationById.has(id))) {
-              const lk = ids.join('>');
+              const lk = `${v.type}:${ids.join('>')}`;
               if (!lineCache.has(lk)) {
                 let ok = true;
                 for (let i = 0; i < ids.length && ok; i++) {
@@ -1217,6 +1285,7 @@ export const COMMANDS = [
         date: gameDate(info), checked: vehicles.length, vehicles_with_problems: new Set(rows.map((r) => r.id)).size,
         vehicles_needing_action: new Set(rows.filter((r) => r.severity === 'action').map((r) => r.id)).size,
         trace_method: tracer?.method ?? 'off', ...(tracer?.method === 'mirror_adjacency' ? { trace_note: OLD_GS_TRACE } : {}),
+        ...(a.trace && vehicles.some((v) => v.type === 'road') ? { road_trace: roadTracer ? 'road_tiles' : `off: ${OLD_GS_ROAD}` } : {}),
         history: { days_watched: watched, stuck_check: watched >= a.stuck_days ? 'active' : `needs another call in ${a.stuck_days - watched} game days` },
         problems: rows,
       };
@@ -1224,37 +1293,38 @@ export const COMMANDS = [
   },
   {
     name: 'verify-route', group: 'operate', session: true,
-    description: 'Is there a rail path? --vehicle ID traces from the train to each of its order stations and between consecutive order stations; --from_station A --to_station B (id or name) traces A to B. Reports connected and, if not, the last reachable tile and the first gap with a reason (no_track, track_not_joined, station_platform_side, depot_entrance_faces_away, one_way_signal_against, other_company_track, bridge_side, tunnel_side). Exact with AgentBridge v9 (track bits, signals, bridges, tunnels); coarse map-mirror trace with older GameScripts.',
-    args: z.object({ ...who, vehicle: int().optional(), from_station: z.coerce.string().optional().describe('station id or name'), to_station: z.coerce.string().optional().describe('station id or name') }),
+    description: 'Is there a rail or road path? --vehicle ID traces from the vehicle to each of its order stations and between consecutive order stations (rail for trains, road for road vehicles); --from_station A --to_station B (id or name) traces A to B (mode auto: rail when both have rail, road when both have truck or bus stops). Reports connected and, if not, the last reachable tile and the first gap with a reason. Rail (AgentBridge v9; coarse map-mirror trace before): no_track, track_not_joined, station_platform_side, depot_entrance_faces_away, one_way_signal_against, other_company_track, bridge_side, tunnel_side. Road (AgentBridge v11; refused before): no_road, road_not_joined, one_way_road, depot_not_joined, depot_entrance_faces_away, stop_not_joined, stop_entrance_faces_away, other_owner_road (another company\'s stop or depot).',
+    args: z.object({ ...who, vehicle: int().optional(), from_station: z.coerce.string().optional().describe('station id or name'), to_station: z.coerce.string().optional().describe('station id or name'),
+      mode: z.enum(['auto', 'rail', 'road']).default('auto').describe('station pair only: which network to trace') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
-      const tracer = await makeTracer(s, company, await s.gs.call('info'));
+      const info = await s.gs.call('info');
       const brief = (r) => ({ connected: r.connected, ...(r.connected ? {} : { last_reachable: r.last_reachable ?? null, first_gap: r.first_gap ?? null }), tiles_reached: r.tiles_reached });
-      const note = tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {};
+      const pick = async (mode) => {
+        if (mode === 'road') {
+          const t = makeRoadTracer(s, company, info);
+          if (!t) throw new Error(`refused: ${OLD_GS_ROAD}`);
+          return t;
+        }
+        return makeTracer(s, company, info);
+      };
       if (a.vehicle !== undefined) {
         const veh = vehiclesFromRows(await s.gs.call('vehicles', { company })).find((v) => v.id === a.vehicle);
         if (!veh) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
-        const { orders, current_order } = await currentOrderOf(s, company, a.vehicle);
-        const stops = orders.filter((o) => o.kind === 'station' && stations.some((st) => st.id === o.station));
-        if (!stops.length) throw new Error(`vehicle ${a.vehicle} has no station orders; add some with order-add`);
-        const fromVehicle = [];
-        for (const o of stops) {
-          const st = stations.find((x) => x.id === o.station);
-          fromVehicle.push({ order: o.position, station: st.id, station_name: st.name, current: o.position === current_order, ...brief(await tracer.trace([{ x: veh.x, y: veh.y }], st)) });
-        }
-        const legs = [];
-        for (let i = 0; i < stops.length && stops.length > 1; i++) {
-          const from = stations.find((x) => x.id === stops[i].station), to = stations.find((x) => x.id === stops[(i + 1) % stops.length].station);
-          legs.push({ from: from.name, to: to.name, ...brief(await tracer.trace(await tracer.stationStarts(from), to)) });
-        }
-        const connected = fromVehicle.every((r) => r.connected) && legs.every((r) => r.connected);
-        return { vehicle: veh.id, unit_number: veh.unit_number, at: { x: veh.x, y: veh.y }, connected, method: tracer.method, ...note, from_vehicle: fromVehicle, legs };
+        if (veh.type !== 'rail' && veh.type !== 'road') throw new Error(`refused: vehicle ${a.vehicle} is a ${veh.type === 'air' ? 'aircraft' : 'ship'}; verify-route traces rail and road only`);
+        const tracer = await pick(veh.type);
+        const legs = await routeLegs(s, company, tracer, stations, veh);
+        return { vehicle: veh.id, unit_number: veh.unit_number, type: veh.type, at: { x: veh.x, y: veh.y }, connected: legs.connected, method: tracer.method,
+          ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), from_vehicle: legs.from_vehicle, legs: legs.legs };
       }
       if (a.from_station === undefined || a.to_station === undefined) throw new Error('give --vehicle ID, or both --from_station and --to_station (id or name)');
       const from = findStation(stations, a.from_station), to = findStation(stations, a.to_station);
+      const roadish = (st) => st.facilities.includes('truck') || st.facilities.includes('bus');
+      const mode = a.mode !== 'auto' ? a.mode : (from.facilities.includes('rail') && to.facilities.includes('rail')) || !(roadish(from) && roadish(to)) ? 'rail' : 'road';
+      const tracer = await pick(mode);
       const r = await tracer.trace(await tracer.stationStarts(from), to);
-      return { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, method: tracer.method, ...note, ...brief(r) };
+      return { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, mode, method: tracer.method, ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), ...brief(r) };
     },
   },
   {

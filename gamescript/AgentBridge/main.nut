@@ -58,6 +58,7 @@ class AgentBridge extends GSController {
 			bridge_types = "CmdBridgeTypes",
 			acceptance = "CmdAcceptance",
 			rail_tiles = "CmdRailTiles",
+			road_tiles = "CmdRoadTiles",
 			goal_set = "CmdGoalSet",
 			goal_status = "CmdGoalStatus",
 			goal_clear = "CmdGoalClear",
@@ -67,7 +68,7 @@ class AgentBridge extends GSController {
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v10 started");
+	GSLog.Info("AgentBridge v11 started");
 	this.RestoreGoals();
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
@@ -225,7 +226,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 10,
+		bridge_version = 11,
 		event_seq = this.event_seq,
 		goals = this.goals.len(),
 	};
@@ -604,6 +605,59 @@ function AgentBridge::CmdRailTiles(args) {
 			if (kind == "") continue;
 			local station = GSStation.GetStationID(t);
 			out.append([x, y, kind, tracks, GSStation.IsValidStation(station) ? station : -1, a, b, GSTile.GetOwner(t), GSRail.GetRailType(t), sig]);
+		}
+	}
+	return out;
+}
+
+// args: company, x0, y0, x1, y1 (max 32x32) (v11). One row per tile with road for the company's road type:
+//   [x, y, kind, links, station, a, b, owner]
+// kind: "r" road or level crossing, "d" depot, "s" bay stop, "t" drive-through stop, "b" bridge head, "u" tunnel portal.
+// links: bit d (0 +x, 1 +y, 2 -x, 3 -y) when a road vehicle can drive from this tile into that neighbour
+// (GSRoad.AreRoadTilesConnected: road bits of both tiles and one-way roads). a, b: depot or bay stop
+// front tile, bridge or tunnel other end; else -1. station: road stop station id, else -1.
+function AgentBridge::CmdRoadTiles(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	GSRoad.SetCurrentRoadType(GSRoad.ROADTYPE_ROAD);
+	local x0 = max(0, args.x0), y0 = max(0, args.y0);
+	local x1 = min(GSMap.GetMapSizeX() - 1, args.x1), y1 = min(GSMap.GetMapSizeY() - 1, args.y1);
+	if ((x1 - x0 + 1) * (y1 - y0 + 1) > 1024) throw "area too large; max 32x32 tiles";
+	local mx = GSMap.GetMapSizeX(), my = GSMap.GetMapSizeY();
+	local dx = [1, 0, -1, 0], dy = [0, 1, 0, -1];
+	local out = [];
+	for (local y = y0; y <= y1; y++) {
+		for (local x = x0; x <= x1; x++) {
+			local t = GSMap.GetTileIndex(x, y);
+			local kind = "";
+			local a = -1, b = -1, station = -1;
+			if (GSRoad.IsRoadDepotTile(t)) {
+				kind = "d";
+				local f = GSRoad.GetRoadDepotFrontTile(t);
+				a = GSMap.GetTileX(f); b = GSMap.GetTileY(f);
+			} else if (GSRoad.IsRoadStationTile(t)) {
+				station = GSStation.GetStationID(t);
+				if (GSRoad.IsDriveThroughRoadStationTile(t)) {
+					kind = "t";
+				} else {
+					kind = "s";
+					local f = GSRoad.GetRoadStationFrontTile(t);
+					a = GSMap.GetTileX(f); b = GSMap.GetTileY(f);
+				}
+			} else if ((GSBridge.IsBridgeTile(t) || GSTunnel.IsTunnelTile(t)) && GSTile.HasTransportType(t, GSTile.TRANSPORT_ROAD)) {
+				kind = GSBridge.IsBridgeTile(t) ? "b" : "u";
+				local o = kind == "b" ? GSBridge.GetOtherBridgeEnd(t) : GSTunnel.GetOtherTunnelEnd(t);
+				a = GSMap.GetTileX(o); b = GSMap.GetTileY(o);
+			} else if (GSRoad.IsRoadTile(t)) {
+				kind = "r";
+			}
+			if (kind == "") continue;
+			local links = 0;
+			for (local d = 0; d < 4; d++) {
+				local nx = x + dx[d], ny = y + dy[d];
+				if (nx < 0 || ny < 0 || nx >= mx || ny >= my) continue;
+				if (GSRoad.AreRoadTilesConnected(t, GSMap.GetTileIndex(nx, ny))) links = links | (1 << d);
+			}
+			out.append([x, y, kind, links, station, a, b, GSTile.GetOwner(t)]);
 		}
 	}
 	return out;
@@ -1092,8 +1146,8 @@ function AgentBridge::ExecStep(company, s, dry) {
 			if (s[2] == (stopped ? 0 : 1)) return [true, 0];
 			return [GSVehicle.StartStopVehicle(s[1]), 0];
 		}
-		// [op, vehicle, service_only]
-		case "veh_depot": return [s[2] ? GSVehicle.SendVehicleToDepotForServicing(s[1]) : GSVehicle.SendVehicleToDepot(s[1]), 0];
+		// [op, vehicle, service_only] (v11: own refusals; value 1 sent, 2 already heading to a depot, 3 already stopped in one)
+		case "veh_depot": return this.DepotStep(s[1], s[2]);
 		case "veh_sell": return [GSVehicle.SellVehicle(s[1]), 0];
 		case "veh_refit": return [GSVehicle.RefitVehicle(s[1], s[2]), 0];
 		case "veh_rename": return [GSVehicle.SetName(s[1], s[2]), 0];
@@ -1160,6 +1214,25 @@ function AgentBridge::ExecStep(company, s, dry) {
 		case "lower": return [GSTile.LowerTile(this.T(s[1], s[2]), s[3]), 0];
 	}
 	return [false, 0, "unknown exec op: " + s[0]];
+}
+
+// Send a vehicle to a depot without undoing an earlier send: in OpenTTD a second "go to depot"
+// cancels the first, so a vehicle already heading there (a manual depot order, not one from its
+// order list) is left alone. Failures say why where the API can tell.
+function AgentBridge::DepotStep(v, service) {
+	if (!GSVehicle.IsValidVehicle(v)) return [false, 0, "not_found: vehicle " + v + " does not exist or is not yours"];
+	if (GSVehicle.IsStoppedInDepot(v)) return [true, 3];
+	local state = GSVehicle.GetState(v);
+	if (state == GSVehicle.VS_CRASHED) return [false, 0, "crashed: vehicle " + v + " crashed; the wreck disappears by itself"];
+	if (GSOrder.IsValidVehicleOrder(v, GSOrder.ORDER_CURRENT) && GSOrder.IsGotoDepotOrder(v, GSOrder.ORDER_CURRENT) && !GSOrder.IsCurrentOrderPartOfOrderList(v)) return [true, 2];
+	if (service ? GSVehicle.SendVehicleToDepotForServicing(v) : GSVehicle.SendVehicleToDepot(v)) return [true, 1];
+	local err = this.Str(GSError.GetLastErrorString());
+	if (state == GSVehicle.VS_BROKEN) return [false, 0, "broken_down: vehicle " + v + " is broken down; send it again once it moves (a few days) (" + err + ")"];
+	if (state == GSVehicle.VS_AT_STATION && GSOrder.IsValidVehicleOrder(v, GSOrder.ORDER_CURRENT) && GSOrder.IsGotoStationOrder(v, GSOrder.ORDER_CURRENT)) {
+		local load = GSOrder.GetOrderFlags(v, GSOrder.ORDER_CURRENT) & GSOrder.OF_LOAD_FLAGS;
+		if (load == GSOrder.OF_FULL_LOAD || load == GSOrder.OF_FULL_LOAD_ANY) return [false, 0, "loading_full_load: vehicle " + v + " is waiting for a full load; it leaves when full, or skip the order (order-skip) and send it again (" + err + ")"];
+	}
+	return [false, 0, "no_depot: vehicle " + v + " found no depot it can reach (" + err + "); build one on its route"];
 }
 
 // Runs inside CmdExec's GSCompanyMode, so GetLoanAmount/GetMaxLoanAmount read this company.

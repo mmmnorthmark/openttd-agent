@@ -36,7 +36,7 @@ test('order flags round-trip and reject unknown names', () => {
 
 test('stations: decoded facilities and cargo, filtered by rating', async () => {
   const res = await run('stations', {});
-  assert.deepEqual([res.ok, res.error, res.total, res.matched, res.truncated], [true, null, 3, 3, false]);
+  assert.deepEqual([res.ok, res.error, res.total, res.matched, res.truncated], [true, null, 4, 4, false]);
   const all = res.stations;
   assert.deepEqual(all[1].facilities, ['truck', 'bus']);
   assert.deepEqual(all[0].cargo[0], { cargo: 7, name: 'Wood', waiting: 240, rating_pct: 35 });
@@ -353,5 +353,34 @@ test('status: versions, and a warning when the running AgentBridge is older than
   try {
     const old = await run('status', {});
     assert.match(old.warnings[0], /runs AgentBridge v\d+; this openttd-agent .* ships v\d+/);
-  } finally { fake.state.gsVersion = 10; }
+  } finally { fake.state.gsVersion = 11; }
+});
+
+test('verify-route traces road vehicles and road stops (AgentBridge v11), refuses on older GameScripts', async () => {
+  const ok = await run('verify-route', { vehicle: 12 });
+  assert.deepEqual([ok.type, ok.method, ok.connected], ['road', 'road_tiles', true]);
+  assert.equal(ok.legs.length, 2);
+  const pair = await run('verify-route', { from_station: 4, to_station: 'Smallham Stop' });
+  assert.deepEqual([pair.mode, pair.connected], ['road', true]);
+  fake.state.roadGap = '44,9';
+  try {
+    const gap = await run('verify-route', { from_station: 4, to_station: 7 });
+    assert.equal(gap.connected, false);
+    assert.deepEqual([gap.first_gap.x, gap.first_gap.y, gap.first_gap.reason], [44, 9, 'no_road']);
+    assert.deepEqual(gap.last_reachable, { x: 43, y: 9 });
+  } finally { fake.state.roadGap = null; }
+  fake.state.roadOneWay = '44,9';
+  try {
+    assert.equal((await run('verify-route', { from_station: 4, to_station: 7 })).connected, true, 'with the one-way direction');
+    const back = await run('verify-route', { from_station: 7, to_station: 4 });
+    assert.deepEqual([back.connected, back.first_gap.reason], [false, 'one_way_road']);
+  } finally { fake.state.roadOneWay = null; }
+  const probs = await run('vehicle-problems', {});
+  assert.equal(probs.road_trace, 'road_tiles');
+  assert.ok(!probs.problems.some((p) => p.id === 12 && /path/.test(p.evidence)));
+  fake.state.gsVersion = 10;
+  try {
+    await assert.rejects(run('verify-route', { vehicle: 12 }), /refused: road vehicles .* AgentBridge v11/);
+    assert.match((await run('vehicle-problems', {})).road_trace, /^off: /);
+  } finally { fake.state.gsVersion = 11; }
 });

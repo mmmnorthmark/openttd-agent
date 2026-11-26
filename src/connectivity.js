@@ -198,3 +198,75 @@ export function mirrorStationTiles(map, x, y, limit = 200) {
   }
   return out;
 }
+
+// ---- road (AgentBridge v11 `road_tiles`) ------------------------------------------------------
+
+/** GS `road_tiles` row -> tile object. links: bit d = a road vehicle can drive into the neighbour in direction d. */
+export function roadTileFromRow([x, y, kind, links, station, a, b, owner]) {
+  return { x, y, kind, links, station, a, b, owner, road: true };
+}
+
+const STOP_KINDS = new Set(['s', 't', 'd']);
+
+/** Why a road vehicle on `t` cannot drive into direction d (no link). `n`: the neighbour tile or null. */
+export function roadGapReason(t, d, n) {
+  const front = t.a >= 0 && dirTo(t.x, t.y, t.a, t.b) === d;
+  if (t.kind === 'd' && front) return 'depot_not_joined';
+  if (t.kind === 's' && front) return 'stop_not_joined';
+  if (!n) return 'no_road';
+  if (n.links & (1 << opposite(d))) return 'one_way_road';
+  if (n.kind === 'd') return dirTo(n.x, n.y, n.a, n.b) === opposite(d) ? 'depot_not_joined' : 'depot_entrance_faces_away';
+  if (n.kind === 's') return dirTo(n.x, n.y, n.a, n.b) === opposite(d) ? 'stop_not_joined' : 'stop_entrance_faces_away';
+  return 'road_not_joined';
+}
+
+/**
+ * Walk the road network from `starts` ([{x, y}]) over `links` until isGoal(tile). Directed (one-way
+ * roads count); road vehicles turn round at road ends, so no entry state is kept. Stops and depots of
+ * another company (`company` given) are not entered. Bridges and tunnels join their two heads.
+ * Returns the same shape as traceRail: { connected, reached, tiles_reached, steps, last_reachable, first_gap }.
+ */
+export async function traceRoad({ getTile, starts, isGoal, goal, company, maxSteps = 20000 }) {
+  const seen = new Set();
+  const reached = [];
+  const gaps = [];
+  const queue = [];
+  const dist = (p) => (goal ? Math.abs(p.x - goal.x) + Math.abs(p.y - goal.y) : 0);
+  for (const s of starts) {
+    const t = await getTile(s.x, s.y);
+    if (!t) { gaps.push({ from: s, to: s, reason: 'start_has_no_road' }); continue; }
+    queue.push(t);
+  }
+  let steps = 0, hit = null;
+  while (queue.length && steps < maxSteps) {
+    const t = queue.shift();
+    const k = key(t.x, t.y);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    steps++;
+    reached.push(t);
+    if (isGoal(t)) { hit = { x: t.x, y: t.y }; break; }
+    if ((t.kind === 'b' || t.kind === 'u') && t.a >= 0) {
+      const o = await getTile(t.a, t.b);
+      if (o && !seen.has(key(o.x, o.y))) queue.push(o);
+    }
+    for (let d = 0; d < 4; d++) {
+      const nx = t.x + DIRS[d][0], ny = t.y + DIRS[d][1];
+      const n = await getTile(nx, ny);
+      if (!(t.links & (1 << d))) { gaps.push({ from: t, to: { x: nx, y: ny }, reason: roadGapReason(t, d, n) }); continue; }
+      if (!n) { gaps.push({ from: t, to: { x: nx, y: ny }, reason: 'no_road' }); continue; }
+      if (company !== undefined && company !== null && STOP_KINDS.has(n.kind) && n.owner !== company && !isGoal(n)) {
+        gaps.push({ from: t, to: { x: nx, y: ny }, reason: 'other_owner_road' });
+        continue;
+      }
+      if (!seen.has(key(nx, ny))) queue.push(n);
+    }
+  }
+  const out = { connected: !!hit, ...(hit ? { reached: hit } : {}), tiles_reached: reached.length, steps, exhausted: !hit && steps >= maxSteps };
+  if (hit || !reached.length) return { ...out, ...(gaps.length && !reached.length ? { first_gap: { x: gaps[0].to.x, y: gaps[0].to.y, from: gaps[0].from, reason: gaps[0].reason } } : {}) };
+  const last = reached.reduce((best, p) => (dist(p) < dist(best) ? p : best), reached[0]);
+  const fromLast = gaps.filter((g) => g.from.x === last.x && g.from.y === last.y);
+  const pool = fromLast.length ? fromLast : gaps;
+  const gap = pool.length ? pool.reduce((best, g) => (dist(g.to) < dist(best.to) ? g : best), pool[0]) : null;
+  return { ...out, last_reachable: { x: last.x, y: last.y }, ...(gap ? { first_gap: { x: gap.to.x, y: gap.to.y, from: { x: gap.from.x, y: gap.from.y }, reason: gap.reason } } : {}) };
+}

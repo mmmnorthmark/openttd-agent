@@ -49,16 +49,19 @@ export function vehicleProblems(v, { today, stuckDays = 30, progress = null, rea
   if (v.state === 'in_depot') add('stopped_in_depot', `in depot at ${fmtTile(v)}, not started`, `vehicle-start --vehicles ${v.id}, or vehicle-sell --vehicles ${v.id} if it is not needed`);
   if (v.state === 'stopped') add('stopped', `stopped outside a depot at ${fmtTile(v)}`, `vehicle-start --vehicles ${v.id}`);
 
+  const net = v.type === 'road' ? 'road' : 'rail';
   if (reach && !reach.connected && v.order_count > 0 && v.state !== 'in_depot') {
     const gap = reach.first_gap ? `; first gap at ${fmtTile(reach.first_gap)} (${reach.first_gap.reason})` : '';
-    const where = reach.last_reachable ? `; track from ${fmtTile(v)} ends at ${fmtTile(reach.last_reachable)}` : '';
+    const where = reach.last_reachable ? `; ${v.type === 'road' ? 'road' : 'track'} from ${fmtTile(v)} ends at ${fmtTile(reach.last_reachable)}` : '';
     const coarse = reach.method === 'mirror_adjacency' ? ' [coarse: map mirror without track directions]' : '';
     if (line && line.connected) {
-      add('wrong_network', `no rail path from ${fmtTile(v)} to ${dest}, although its order stations are joined to each other${where}${gap}${coarse}`,
-        `it runs on another line's track (bought or cloned at a depot of another line?): vehicle-depot --vehicles ${v.id}, then vehicle-sell once it is in the depot, and clone a train at a depot of its own line instead`);
+      add('wrong_network', `no ${net} path from ${fmtTile(v)} to ${dest}, although its order stations are joined to each other${where}${gap}${coarse}`,
+        net === 'road' ? `it is on a road network its stops are not on (bought at another depot?): vehicle-depot --vehicles ${v.id}, then vehicle-sell, and buy one at a depot joined to its stops`
+          : `it runs on another line's track (bought or cloned at a depot of another line?): vehicle-depot --vehicles ${v.id}, then vehicle-sell once it is in the depot, and clone a train at a depot of its own line instead`);
     } else {
-      add('unreachable_destination', `no rail path from ${fmtTile(v)} to ${dest}${where}${gap}${coarse}`,
-        `run verify-route --vehicle ${v.id}; join the gap with build-track or build-rail, or give the vehicle orders for stations on its own track`);
+      add('unreachable_destination', `no ${net} path from ${fmtTile(v)} to ${dest}${where}${gap}${coarse}`,
+        net === 'road' ? `run verify-route --vehicle ${v.id}; join the gap with build-road-path (or turn the stop or depot to face the road), or give it orders for stops on its own roads`
+          : `run verify-route --vehicle ${v.id}; join the gap with build-track or build-rail, or give the vehicle orders for stations on its own track`);
     }
   }
 

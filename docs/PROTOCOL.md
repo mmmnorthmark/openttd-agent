@@ -69,8 +69,14 @@ GS commands: `ping`, `info`, `echo`, `companies`, `cargos`, `towns`, `industries
 `test_build_road`, `build_road`, `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`,
 `autorenew`, `events`, `exec`, `rail_types`, `bridge_types`, `goal_set`, `goal_status`, `goal_clear`, `acceptance` (v7),
 `rail_tiles` (v9), `owned_land` (v10: `{company, points: [[x, y], ...]}` -> indices of the points
-that are the company's owned land).
+that are the company's owned land), `road_tiles` (v11: `{company, x0, y0, x1, y1}`, max 32x32 ->
+rows `[x, y, kind, links, station, a, b, owner]`; `links` bit d = a road vehicle can drive into the
+neighbour in direction d, from `GSRoad.AreRoadTilesConnected`, so one-way roads count).
 Row formats are documented in `gamescript/AgentBridge/main.nut`.
+
+The `veh_depot` exec step (v11) never undoes an earlier send (a second "go to depot" cancels the
+first in OpenTTD): value 1 = sent, 2 = already heading to a depot, 3 = already stopped in one;
+failures say why (`not_found:`, `broken_down:`, `loading_full_load:`, `crashed:`, `no_depot:`).
 
 ## exec
 
