@@ -7,7 +7,7 @@
 import os from 'node:os';
 import { randomBytes } from 'node:crypto';
 import * as z from 'zod/v4';
-import { doctor, installGamescript, launch, TERRAIN_TYPES } from './setup.js';
+import { doctor, installGamescript, launch, checkSaveName, TERRAIN_TYPES } from './setup.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
@@ -793,6 +793,20 @@ export const COMMANDS = [
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       return { company, ...(await s.gs.call('goal_clear', { company })) };
+    },
+  },
+
+  {
+    name: 'save', group: 'host', session: true,
+    description: "HOST ONLY: save the running server game over the console (`save <name>`). OpenTTD writes it to the launch profile's save folder (save/<name>.sav next to the profile's openttd.cfg); load it again with launch --load <name>. Name: letters, digits, _ . - only (no paths).",
+    args: z.object({ name: z.string().describe('save name without extension, e.g. game-night-1') }),
+    run: async (ctx, a) => {
+      const name = checkSaveName(a.name);
+      const s = await ctx.session();
+      const out = await s.admin.rcon(`save ${name}`, 30000);
+      if (out.some((l) => /failed|error/i.test(l))) throw new Error(`server could not save '${name}': ${out.join(' ')}`);
+      return { saved: `${name}.sav`, path: `save/${name}.sav`, relative_to: 'the launch profile folder (launch printed it as profile_dir)', console: out,
+        load_with: `openttd-agent launch --mode dedicated --load ${name}` };
     },
   },
 

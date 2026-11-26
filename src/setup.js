@@ -129,6 +129,15 @@ export function patchIni(text, patches) {
   return lines.join('\n');
 }
 
+/** A console save name: 1-64 of A-Z a-z 0-9 _ . -, not starting with '.', no path separators. Returns it or throws. */
+export function checkSaveName(name) {
+  const n = String(name ?? '').trim().replace(/\.sav$/i, '');
+  if (!/^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$/.test(n) || n.includes('..')) {
+    throw new Error(`save name must be 1-64 characters from A-Z a-z 0-9 _ . - (no '/', '\\', '..' or leading '.'), got '${name}'`);
+  }
+  return n;
+}
+
 /**
  * `launch --load` value -> path for OpenTTD's -g (used as given: absolute, or relative to the
  * profile dir, and it needs its extension). A bare save name, as printed by scenario-prepare or

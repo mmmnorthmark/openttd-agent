@@ -290,3 +290,14 @@ test('findExistingRoute: own rail stations at both ends, source handling the car
   assert.equal(findExistingRoute(rev, a, b, 0), null, 'one-way cargo: a route the other way is a different route');
   assert.equal(findExistingRoute(rev, a, b, 0, { bothWays: true })?.from_station.id, 2, 'passengers: any rail stations at both towns, rating or not');
 });
+
+test('save runs the console save with a checked name and never a path', async () => {
+  const r = await run('save', { name: 'game-night_1' });
+  assert.deepEqual([r.saved, r.path], ['game-night_1.sav', 'save/game-night_1.sav']);
+  assert.equal(fake.state.rcons.at(-1), 'save game-night_1');
+  const before = fake.state.rcons.length;
+  for (const bad of ['../x', 'a/b', 'a\\b', '.hidden', '', 'x'.repeat(65), 'a b']) {
+    await assert.rejects(run('save', { name: bad }), /save name must be/, bad);
+  }
+  assert.equal(fake.state.rcons.length, before, 'refused names never reach the console');
+});
