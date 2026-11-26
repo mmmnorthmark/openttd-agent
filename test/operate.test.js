@@ -35,11 +35,14 @@ test('order flags round-trip and reject unknown names', () => {
 });
 
 test('stations: decoded facilities and cargo, filtered by rating', async () => {
-  const all = await run('stations', {});
+  const res = await run('stations', {});
+  assert.deepEqual([res.ok, res.error, res.total, res.matched, res.truncated], [true, null, 3, 3, false]);
+  const all = res.stations;
   assert.deepEqual(all[1].facilities, ['truck', 'bus']);
   assert.deepEqual(all[0].cargo[0], { cargo: 7, name: 'Wood', waiting: 240, rating_pct: 35 });
   const poor = await run('stations', { max_rating_pct: 50, min_waiting: 100 });
-  assert.deepEqual(poor.map((s) => s.id), [3]);
+  assert.deepEqual(poor.stations.map((s) => s.id), [3]);
+  assert.equal((await run('stations', { limit: 1 })).truncated, true);
 });
 
 test('vehicles: loss makers filter; vehicle detail decodes orders', async () => {
@@ -57,18 +60,18 @@ test('vehicles: loss makers filter; vehicle detail decodes orders', async () => 
 test('engines: cargo name resolved, newest first, wagons filter; groups; depots', async () => {
   const engines = await run('engines', { type: 'rail', cargo: 'wood' });
   assert.equal(fake.received.at(-1).args.cargo, 7);
-  assert.deepEqual(engines.map((e) => e.id), [6, 5, 27]);
-  assert.deepEqual((await run('engines', { type: 'rail', wagons: true })).map((e) => e.name), ['Wood Truck']);
+  assert.deepEqual(engines.engines.map((e) => e.id), [6, 5, 27]);
+  assert.deepEqual((await run('engines', { type: 'rail', wagons: true })).engines.map((e) => e.name), ['Wood Truck']);
   await assert.rejects(run('engines', { type: 'rail', cargo: 'unobtainium' }), /no cargo matching/);
-  assert.equal((await run('groups', {}))[0].profit_last_year, -3000);
-  assert.deepEqual((await run('depots', { type: 'rail' }))[0], { x: 13, y: 22, vehicles: 0 });
+  assert.equal((await run('groups', {})).groups[0].profit_last_year, -3000);
+  assert.deepEqual((await run('depots', { type: 'rail' })).depots[0], { x: 13, y: 22, vehicles: 0 });
 });
 
 test('events: since filter and latest_seq', async () => {
   const first = await run('events', {});
   assert.equal(first.latest_seq, 2);
   const next = await run('events', { since: first.latest_seq });
-  assert.deepEqual(next, { latest_seq: 2, my_company: 0, events: [] });
+  assert.deepEqual(next, { ok: true, error: null, latest_seq: 2, my_company: 0, events: [] });
   assert.equal((await run('events', { type: 'crash' })).events.length, 1);
 });
 
@@ -96,7 +99,8 @@ test('a failed step is reported with its error; group-create returns the id', as
   const res = await run('vehicle-sell', { vehicles: '5,404,6' });
   assert.equal(res.ok, false);
   assert.equal(res.steps_done, 2);
-  assert.equal(res.first_error, 'Vehicle not available');
+  assert.equal(res.error, 'step 1 (veh_sell): Vehicle not available');
+  assert.equal(res.first_error, 'failed');
   assert.equal(res.results[1].ok, false);
   const g = await run('group-create', { type: 'rail', name: 'Wood line' });
   assert.equal(g.group, 100);
@@ -107,7 +111,7 @@ test('a failed step is reported with its error; group-create returns the id', as
 });
 
 test('goals: set with cargo labels, status with pct, done and failed, clear', async () => {
-  assert.deepEqual(await run('goal-status', {}), { company: 0, status: 'none', note: 'no goal set for this company (the host sets one with goal-set)' });
+  assert.deepEqual(await run('goal-status', {}), { ok: true, error: null, company: 0, status: 'none', note: 'no goal set for this company (the host sets one with goal-set)' });
   const set = await run('goal-set', { deadline_year: 1954, targets: 'wood:3000, PASS:500,VALUE:100000' });
   assert.deepEqual(fake.received.at(-1).args, { company: 0, deadline_year: 1954, targets: [['WOOD', 3000], ['PASS', 500], ['VALUE', 100000]] });
   assert.equal(set.status, 'active');
@@ -126,7 +130,7 @@ test('goals: set with cargo labels, status with pct, done and failed, clear', as
   await assert.rejects(run('goal-set', { deadline_year: 1954, targets: 'WOOD:lots' }), /whole number above 0/);
   await assert.rejects(run('goal-set', { deadline_year: 1940, targets: 'WOOD:10' }), /in the past/);
   assert.deepEqual(await run('goal-set', { deadline_year: 1951, targets: [{ cargo: 'pass', amount: 5 }], company: 3 }).then((g) => [g.company, g.targets.length]), [3, 1]);
-  assert.deepEqual(await run('goal-clear', {}), { company: 0, removed: true });
+  assert.deepEqual(await run('goal-clear', {}), { ok: true, error: null, company: 0, removed: true });
   assert.equal((await run('goal-status', {})).status, 'none');
   assert.equal((await run('goal-status', { company: 3 })).status, 'active');
 });
@@ -158,7 +162,7 @@ test('turn-advance runs the wanted number of days and leaves the game paused', a
 
 test('loan: show, borrow rounds up, repay, max, dry run', async () => {
   fake.state.money = 100000; fake.state.loan = 300000;
-  assert.deepEqual(await run('loan', {}), { loan: 300000, max_loan: 500000, money: 100000 });
+  assert.deepEqual(await run('loan', {}), { ok: true, error: null, loan: 300000, max_loan: 500000, money: 100000 });
   const dry = await run('loan', { borrow: 15000, dry_run: true });
   assert.deepEqual(lastExec().steps, [['loan', 'add', 15000]]);
   assert.equal(lastExec().dry_run, true);

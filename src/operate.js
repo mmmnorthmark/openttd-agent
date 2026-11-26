@@ -2,6 +2,8 @@
 // and order-flag helpers. Pure functions; row formats are documented next to the
 // GS handlers in gamescript/AgentBridge/main.nut.
 
+import { errorCode } from './envelope.js';
+
 export const VEHICLE_TYPES = ['rail', 'road', 'water', 'air'];
 export const VEHICLE_STATES = ['running', 'stopped', 'in_depot', 'at_station', 'broken', 'crashed'];
 export const FACILITIES = ['rail', 'truck', 'bus', 'airport', 'dock'];
@@ -15,13 +17,20 @@ export function vehicleTypeId(name) {
 
 const cargoName = (cargos, id) => cargos?.get(id)?.name ?? `cargo ${id}`;
 
-/** Resolve a cargo given as id or name/label substring to its id. */
+/** Cargo name/label for matching: case, '_', '-' and spaces do not matter (iron_ore = Iron Ore = iron-ore). */
+export const normCargo = (v) => String(v).toLowerCase().replace(/[\s_-]+/g, ' ').trim();
+
+/** Does a cargo name contain the query (normalised)? */
+export const cargoMatches = (name, query) => normCargo(name).includes(normCargo(query));
+
+/** Resolve a cargo given as id, label (COAL), or name or name substring (any case, _ - or spaces) to its id. */
 export function cargoId(cargos, ref) {
   if (ref === undefined || ref === null || ref === '') return undefined;
   if (/^\d+$/.test(String(ref))) return Number(ref);
-  const lc = String(ref).toLowerCase();
-  const hit = [...cargos.values()].find((c) => c.name.toLowerCase().includes(lc) || c.label.toLowerCase() === lc);
-  if (!hit) throw new Error(`no cargo matching '${ref}'. Run: openttd-agent cargos`);
+  const q = normCargo(ref);
+  const all = [...cargos.values()];
+  const hit = all.find((c) => normCargo(c.label) === q) ?? all.find((c) => normCargo(c.name) === q) ?? all.find((c) => normCargo(c.name).includes(q));
+  if (!hit) throw new Error(`no cargo matching '${ref}'. Known: ${all.map((c) => c.name).join(', ')}`);
   return hit.id;
 }
 
@@ -111,6 +120,34 @@ export function vehicleDetail([info, ...orderRows], cargos) {
   };
 }
 
+/** Tiles an exec `rail` step lays track on: [op, from_x, from_y, x, y, to_x, to_y] covers x,y up to (not including) to. */
+export function railStepTiles([, , , x, y, tx, ty]) {
+  if (x !== tx && y !== ty) return [[x, y]]; // a curve piece: its own tile only
+  const dx = Math.sign(tx - x), dy = Math.sign(ty - y);
+  const out = [];
+  for (let cx = x, cy = y; (cx !== tx || cy !== ty) && out.length < 1000; cx += dx, cy += dy) out.push([cx, cy]);
+  return out.length ? out : [[x, y]];
+}
+
+/**
+ * Dry runs cannot place a signal on track that an earlier step of the same list would lay (the
+ * track is not there in test mode). Such failed signal rows become ok with skipped_in_dry_run.
+ */
+export function markDryRunSkips(steps, results) {
+  const planned = new Set();
+  results.forEach((r, i) => {
+    const st = steps[i];
+    if (st[0] === 'rail') for (const [x, y] of railStepTiles(st)) planned.add(`${x},${y}`);
+    if ((st[0] === 'signal' || st[0] === 'signal_remove') && !r.ok && planned.has(`${st[1]},${st[2]}`)) {
+      r.ok = true;
+      r.skipped_in_dry_run = true;
+      r.dry_run_error = r.error;
+      delete r.error;
+    }
+  });
+  return results;
+}
+
 /** Summarise GS `exec` replies (one per batch) against the steps that were sent. */
 export function execSummary(steps, replies, dryRun) {
   const results = [];
@@ -122,10 +159,17 @@ export function execSummary(steps, replies, dryRun) {
     }
     cost += summary.cost; money = summary.money; stopped = summary.stopped;
   }
+  if (dryRun) markDryRunSkips(steps, results);
   const failed = results.filter((r) => !r.ok);
+  const skipped = results.filter((r) => r.skipped_in_dry_run).length;
+  const ok = failed.length === 0 && results.length === steps.length;
+  // A dry run keeps going after a failure, so its batch "stopped" text is only about real stops.
+  const err = failed.length ? { error: `step ${failed[0].step} (${failed[0].op}): ${failed[0].error ?? 'failed'}`, first_error: errorCode(failed[0].error ?? 'failed') }
+    : !ok ? { error: stopped || `only ${results.length} of ${steps.length} steps ran`, first_error: errorCode(stopped) } : { error: null };
   return {
-    ok: failed.length === 0 && results.length === steps.length, dry_run: !!dryRun, steps_total: steps.length, steps_done: results.length - failed.length,
-    cost, money, ...(stopped ? { stopped } : {}), ...(failed.length ? { first_error: failed[0].error ?? 'failed' } : {}), results,
+    ok, ...err, dry_run: !!dryRun, steps_total: steps.length, steps_done: results.length - failed.length - skipped,
+    ...(skipped ? { skipped_in_dry_run: skipped, note: 'signals on track this list lays are checked only when it is built (a dry run has no track yet)' } : {}),
+    cost, money, ...(stopped ? { stopped } : {}), results,
   };
 }
 

@@ -3,6 +3,28 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
+## Unreleased (next: 0.7.0)
+
+Behaviour changes agents must know:
+
+- **One result envelope.** Every command returns an object with `ok` (bool) and `error` (human
+  text, `null` on success, never `""`). Failures also carry `first_error`, now a short code
+  (`ERR_AREA_NOT_CLEAR`, `refused`, `no_signal_here`, ...; it used to be the error text, which is
+  now in `error` as `step N (op): <text>`). CLI, daemon, batch and MCP errors print
+  `{"ok": false, "error": ..., "first_error": ...}`.
+- **List commands return `{ok, error, total, matched, <items>, truncated}`** instead of a bare
+  array: `stations` (`stations`; was a bare list cut at 100), `companies`, `cargos`,
+  `industry-types`, `towns`, `industries`, `town-gaps` (`towns`), `airport-types`, `engines`,
+  `groups`, `depots`, `rail-types`, `bridge-types`, `relay-list-players` (`players`). `vehicles`
+  keeps its keys, adds `truncated`, and its default `--limit` is now 1000 (was 200, which cut a
+  215-vehicle fleet silently).
+- **Dry runs no longer report false failures**: a signal step on track that an earlier step of
+  the same command lays (build-terminus, build-passing-loop) is marked `skipped_in_dry_run` with
+  its `dry_run_error`, and the top-level `ok` counts only real problems.
+- `build-cargo-route` results carry `cost`, `vehicles[]`, and `complete` on every `built[]` entry.
+- Cargo names match loosely everywhere (`iron_ore`, `Iron Ore`, `iron-ore`); an unknown cargo
+  error lists the known names.
+
 ## 0.6.0 (2026-11-25)
 
 - `purchase-land --x0 --y0 --x1 --y1 [--dry_run true]` (build, your company): buys a rectangle as

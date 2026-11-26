@@ -56,7 +56,8 @@ async function probeGame(ctx) {
   const viaDaemon = await daemonHealthy(port).catch(() => false);
   const call = (name, args = {}) => withTimeout(viaDaemon ? callDaemon(port, name, args) : runCommand(ctx, name, args), GAME_TIMEOUT_MS, name);
   try {
-    const companies = (await call('companies')).map((c) => c.id);
+    const reply = await call('companies');
+    const companies = (Array.isArray(reply) ? reply : reply.companies).map((c) => c.id); // a daemon older than 0.7.0 returns a bare list
     let goals = {};
     for (const id of companies) {
       const g = await call('goal-status', { company: id }).catch(() => null);

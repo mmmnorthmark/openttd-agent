@@ -13,6 +13,7 @@ import { COMMANDS, runCommand } from './commands.js';
 import { makeContext } from './context.js';
 import { log } from './log.js';
 import { VERSION } from './version.js';
+import { errorResult } from './envelope.js';
 
 const INSTRUCTIONS = `openttd-agent: read an OpenTTD world and build for your company.
 Not connected yet, or no company? Run guide first and follow its next step (read-only, no secrets).
@@ -50,7 +51,7 @@ export async function startMcp({ tools, compact = false } = {}) {
           return { content: [{ type: 'text', text: compact ? JSON.stringify(result) : JSON.stringify(result, null, 1) }] };
         } catch (e) {
           log.warn('mcp', 'tool failed', { name: cmd.name, error: e.message });
-          return { content: [{ type: 'text', text: e.message }], isError: true };
+          return { content: [{ type: 'text', text: JSON.stringify(errorResult(e.message)) }], isError: true };
         }
       });
   }

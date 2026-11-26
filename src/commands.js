@@ -13,13 +13,14 @@ import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
 import { guide } from './guide.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
-import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
+import { vehicleTypeId, cargoId, cargoMatches, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
 import { traceRail, adjacencyTrace, mirrorStationTiles, railTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
+import { envelope, errorCode, listResult } from './envelope.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
 
 const int = () => z.coerce.number().int();
@@ -251,7 +252,8 @@ async function stationAt(s, company, site) {
 async function buildCargoRoute(s, company, a) {
   const plan = { dry_run: a.dry_run, company };
   const built = [];
-  const fail = (step, error, extra = {}) => ({ ok: false, failed_step: step, error, built, ...plan, ...extra,
+  const vehiclesBought = () => built.filter((b) => b.step === 'buy_locomotive').map((b) => b.vehicle);
+  const fail = (step, error, extra = {}) => ({ ok: false, failed_step: step, error, first_error: errorCode(error), cost: extra.spent ?? 0, vehicles: vehiclesBought(), built, ...plan, ...extra,
     hint: built.length ? 'nothing was demolished: continue from the failed step by hand (build-rail, build-line-depot, vehicle-buy, order-add, vehicle-start) using the ids and tiles in built' : 'nothing was built' });
   const from = a.from_industry !== undefined ? { industry: a.from_industry } : a.from_town !== undefined ? { town: a.from_town } : null;
   const to = a.to_industry !== undefined ? { industry: a.to_industry } : a.to_town !== undefined ? { town: a.to_town } : null;
@@ -313,7 +315,7 @@ async function buildCargoRoute(s, company, a) {
   const lineSteps = railSteps(line, { bridgeType: -1 });
   const lineCheck = await s.exec(company, lineSteps, { dryRun: true, railType });
   plan.line = { ...line.stats, cost: lineCheck.cost };
-  if (!lineCheck.ok) return fail('rail_line', `rail dry run failed: ${lineCheck.first_error}`, { line_results: lineCheck.results.filter((r) => !r.ok).slice(0, 5) });
+  if (!lineCheck.ok) return fail('rail_line', `rail dry run failed: ${lineCheck.error}`, { line_results: lineCheck.results.filter((r) => !r.ok).slice(0, 5) });
 
   // 3. Depot beside the planned line near the source.
   const near = [src.connect_at.x, src.connect_at.y];
@@ -337,7 +339,7 @@ async function buildCargoRoute(s, company, a) {
   plan.estimated_cost = estimate;
   plan.money = lineCheck.money;
   plan.affordable = lineCheck.money === null || lineCheck.money >= estimate;
-  if (a.dry_run) return { ok: true, ...plan, note: 'dry run: nothing was built. Depot joins and train purchase are estimated, not dry-run.' };
+  if (a.dry_run) return { ok: true, ...plan, cost: estimate, vehicles: [], built: [], note: 'dry run: nothing was built. Depot joins and train purchase are estimated, not dry-run.' };
   if (!plan.affordable) return fail('money', `estimated cost ${estimate} is more than the company has (${lineCheck.money})`);
 
   // ---- build, step by step -------------------------------------------------------------
@@ -353,9 +355,9 @@ async function buildCargoRoute(s, company, a) {
   };
   try {
     const A = await station('source_station', src);
-    if (!A.res.ok) return fail('source_station', A.res.first_error, { spent });
+    if (!A.res.ok) return fail('source_station', A.res.error, { spent });
     const B = await station('dest_station', dst);
-    if (!B.res.ok) return fail('dest_station', B.res.first_error, { spent });
+    if (!B.res.ok) return fail('dest_station', B.res.error, { spent });
     await s.refreshArea(...box);
     const realLine = lineArgs(s.map);
     if (!realLine.reachable) return fail('rail_line', realLine.reason ?? 'no rail path after building the stations', { spent });
@@ -364,7 +366,7 @@ async function buildCargoRoute(s, company, a) {
     built.push({ step: 'rail_line', from: src.connect_at, to: dst.connect_at, tiles: realLine.stats.tiles, steps_done: lineRes.steps_done, steps_total: lineRes.steps_total, complete: lineRes.ok, cost: lineRes.cost });
     if (!lineRes.ok) {
       const bad = lineRes.results.find((r) => !r.ok);
-      return fail('rail_line', lineRes.first_error, { spent, failed_rail_step: bad ? railSteps(realLine, { bridgeType: -1 })[bad.step] : null });
+      return fail('rail_line', lineRes.error, { spent, failed_rail_step: bad ? railSteps(realLine, { bridgeType: -1 })[bad.step] : null });
     }
     await s.refreshArea(...box);
     // The overlay marks what was just built in case the mirror rows lag behind.
@@ -376,21 +378,21 @@ async function buildCargoRoute(s, company, a) {
     const locoRes = await exec([['veh_buy', dep.depot.x, dep.depot.y, train.loco.id, -1, -1]]);
     spent += locoRes.cost;
     const loco = locoRes.ok ? locoRes.results[0].value : null;
-    if (loco === null || loco === undefined) return fail('buy_locomotive', locoRes.first_error, { spent });
-    built.push({ step: 'buy_locomotive', vehicle: loco, engine: train.loco.id, cost: locoRes.cost });
+    if (loco === null || loco === undefined) return fail('buy_locomotive', locoRes.error, { spent });
+    built.push({ step: 'buy_locomotive', vehicle: loco, engine: train.loco.id, complete: true, cost: locoRes.cost });
     const refit = train.wagon.cargo === cargo ? -1 : cargo;
     const wagRes = await exec(Array.from({ length: wagons }, () => ['veh_buy', dep.depot.x, dep.depot.y, train.wagon.id, refit, loco]));
     spent += wagRes.cost;
     built.push({ step: 'buy_wagons', attached_to: loco, wagons: wagRes.steps_done, of: wagons, wagon_ids: wagRes.results.filter((r) => r.ok).map((r) => r.value), complete: wagRes.ok, cost: wagRes.cost });
-    if (!wagRes.ok) return fail('buy_wagons', wagRes.first_error, { spent, vehicle: loco });
+    if (!wagRes.ok) return fail('buy_wagons', wagRes.error, { spent, vehicle: loco });
     const ordRes = await exec([['order_add', loco, src.x, src.y, orders.source, -1], ['order_add', loco, dst.x, dst.y, orders.dest, -1]]);
     built.push({ step: 'orders', vehicle: loco, done: ordRes.steps_done, complete: ordRes.ok });
-    if (!ordRes.ok) return fail('orders', ordRes.first_error, { spent, vehicle: loco });
+    if (!ordRes.ok) return fail('orders', ordRes.error, { spent, vehicle: loco });
     const startRes = await exec([['veh_start_stop', loco, 1]]);
-    if (!startRes.ok) return fail('start', startRes.first_error, { spent, vehicle: loco });
-    built.push({ step: 'start', vehicle: loco });
-    return { ok: true, ...plan, dry_run: false, source_station: A.st?.id ?? null, dest_station: B.st?.id ?? null, depot: dep.depot, vehicle: loco,
-      total_cost: spent, built, next: `vehicle-clone --depot_x ${dep.depot.x} --depot_y ${dep.depot.y} --vehicle ${loco} --start true adds trains with the same orders` };
+    if (!startRes.ok) return fail('start', startRes.error, { spent, vehicle: loco });
+    built.push({ step: 'start', vehicle: loco, complete: true });
+    return { ok: true, ...plan, dry_run: false, source_station: A.st?.id ?? null, dest_station: B.st?.id ?? null, depot: dep.depot, vehicle: loco, vehicles: [loco],
+      cost: spent, total_cost: spent, built, next: `vehicle-clone --depot_x ${dep.depot.x} --depot_y ${dep.depot.y} --vehicle ${loco} --start true adds trains with the same orders` };
   } catch (e) {
     const last = built.at(-1)?.step ?? null;
     return fail(last ? `after ${last}` : 'source_station', e.message, { spent });
@@ -693,7 +695,7 @@ export const COMMANDS = [
     name: 'relay-list-players', group: 'relay', session: false,
     description: 'HOST ONLY: registered relay players and the company each is bound to (no tokens).',
     args: z.object({}),
-    run: () => listPlayers(),
+    run: () => { const players = listPlayers(); return listResult('players', players, players); },
   },
   {
     name: 'relay-set-company', group: 'relay', session: false,
@@ -725,7 +727,7 @@ export const COMMANDS = [
     name: 'companies', group: 'game', session: true,
     description: 'All companies: money, loan, last-quarter income/expenses/value/cargo delivered/performance. Use for competitor assessment.',
     args: z.object({}),
-    run: async (ctx) => (await ctx.session()).gs.call('companies'),
+    run: async (ctx) => { const rows = await (await ctx.session()).gs.call('companies'); return listResult('companies', rows, rows); },
   },
   {
     name: 'chat', group: 'game', session: true,
@@ -843,13 +845,13 @@ export const COMMANDS = [
     name: 'cargos', group: 'world', session: true,
     description: 'Cargo types in this game (ids, names, passenger/mail flags).',
     args: z.object({}),
-    run: async (ctx) => [...(await ctx.session()).cargos.values()],
+    run: async (ctx) => { const rows = [...(await ctx.session()).cargos.values()]; return listResult('cargos', rows, rows); },
   },
   {
     name: 'industry-types', group: 'world', session: true,
     description: 'Industry types with produced and accepted cargo ids.',
     args: z.object({}),
-    run: async (ctx) => [...(await ctx.session()).types.values()],
+    run: async (ctx) => { const rows = [...(await ctx.session()).types.values()]; return listResult('industry_types', rows, rows); },
   },
   {
     name: 'towns', group: 'world', session: true,
@@ -857,8 +859,9 @@ export const COMMANDS = [
     args: z.object({ min_population: int().default(0), limit: int().default(50), name: z.string().optional() }),
     run: async (ctx, a) => {
       const { towns } = await (await ctx.session()).economy();
-      return towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())))
-        .sort((x, y) => y.population - x.population).slice(0, a.limit);
+      const hits = towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())))
+        .sort((x, y) => y.population - x.population);
+      return listResult('towns', towns, hits, a.limit);
     },
   },
   {
@@ -871,12 +874,12 @@ export const COMMANDS = [
     run: async (ctx, a) => {
       const { industries } = await (await ctx.session()).economy();
       const lc = (s) => String(s).toLowerCase();
-      return industries.filter((i) => (!a.type || lc(i.type_name).includes(lc(a.type)))
+      const hits = industries.filter((i) => (!a.type || lc(i.type_name).includes(lc(a.type)))
         && (a.near_x === undefined || manhattan(i, { x: a.near_x, y: a.near_y }) <= (a.radius ?? 50))
         && (!a.cargo && a.max_transported_pct >= 100 && a.min_production <= 0
           ? true
-          : i.produces.some((p) => (!a.cargo || lc(p.cargo_name).includes(lc(a.cargo))) && p.transported_pct <= a.max_transported_pct && (i.secondary || p.last_month >= a.min_production))))
-        .slice(0, a.limit);
+          : i.produces.some((p) => (!a.cargo || cargoMatches(p.cargo_name, a.cargo)) && p.transported_pct <= a.max_transported_pct && (i.secondary || p.last_month >= a.min_production))));
+      return listResult('industries', industries, hits, a.limit);
     },
   },
   {
@@ -925,8 +928,11 @@ export const COMMANDS = [
     name: 'town-gaps', group: 'world', session: true,
     description: 'Towns ranked by passengers produced last month that nobody transported (unexploited passenger base).',
     args: z.object({ min_population: int().default(500), max_transported_pct: int().default(100), limit: int().default(15) }),
-    run: async (ctx, a) => townGaps((await (await ctx.session()).economy()).towns,
-      { minPopulation: a.min_population, maxTransportedPct: a.max_transported_pct, limit: a.limit }),
+    run: async (ctx, a) => {
+      const { towns } = await (await ctx.session()).economy();
+      const hits = townGaps(towns, { minPopulation: a.min_population, maxTransportedPct: a.max_transported_pct, limit: Infinity });
+      return listResult('towns', towns, hits, a.limit);
+    },
   },
   {
     name: 'route-effort', group: 'world', session: true,
@@ -942,7 +948,7 @@ export const COMMANDS = [
     name: 'airport-types', group: 'world', session: true,
     description: 'Airport types available now with size, price, maintenance and catchment radius.',
     args: z.object({}),
-    run: async (ctx) => (await ctx.session()).gs.call('airport_types'),
+    run: async (ctx) => { const rows = await (await ctx.session()).gs.call('airport_types'); return listResult('airport_types', rows, rows); },
   },
   {
     name: 'airport-sites', group: 'world', session: true,
@@ -1017,30 +1023,30 @@ export const COMMANDS = [
   // ---- operate (read) -------------------------------------------------------------
   {
     name: 'stations', group: 'operate', session: true,
-    description: 'Your stations (or --company X): location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving. Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations).',
+    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving. Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations).',
     args: z.object({ ...who, facility: z.enum(FACILITIES).optional(), cargo: z.string().optional(), min_waiting: int().default(0),
       max_rating_pct: int().default(100), name: z.string().optional(), limit: int().default(100) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargoFilter = a.cargo !== undefined || a.min_waiting > 0 || a.max_rating_pct < 100;
-      return stationsFromRows(await s.gs.call('stations', { company }), s.cargos)
-        .filter((st) => (!a.facility || st.facilities.includes(a.facility)) && (!a.name || lc(st.name).includes(lc(a.name)))
-          && (!cargoFilter || st.cargo.some((c) => (!a.cargo || lc(c.name).includes(lc(a.cargo))) && c.waiting >= a.min_waiting && c.rating_pct <= a.max_rating_pct)))
-        .slice(0, a.limit);
+      const all = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const hits = all.filter((st) => (!a.facility || st.facilities.includes(a.facility)) && (!a.name || lc(st.name).includes(lc(a.name)))
+        && (!cargoFilter || st.cargo.some((c) => (!a.cargo || cargoMatches(c.name, a.cargo)) && c.waiting >= a.min_waiting && c.rating_pct <= a.max_rating_pct)));
+      return { company, ...listResult('stations', all, hits, a.limit) };
     },
   },
   {
     name: 'vehicles', group: 'operate', session: true,
     description: 'Your vehicles: type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: type, group, state, max_profit_last_year (e.g. 0 = loss makers), min_age_pct (e.g. 90 = due for replacement), max_reliability_pct, name. Breakdown counts and service intervals are not exposed by the game to scripts.',
     args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
-      max_profit_last_year: int().optional(), min_age_pct: int().default(0), max_reliability_pct: int().default(100), name: z.string().optional(), limit: int().default(200) }),
+      max_profit_last_year: int().optional(), min_age_pct: int().default(0), max_reliability_pct: int().default(100), name: z.string().optional(), limit: int().min(1).default(1000) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
       const vehicles = all.filter((v) => (!a.type || v.type === a.type) && (a.group === undefined || v.group === a.group) && (!a.state || v.state === a.state)
         && (a.max_profit_last_year === undefined || v.profit_last_year <= a.max_profit_last_year) && v.age_pct >= a.min_age_pct
         && v.reliability_pct <= a.max_reliability_pct && (!a.name || lc(v.name).includes(lc(a.name))));
-      return { total: all.length, matched: vehicles.length, vehicles: vehicles.slice(0, a.limit) };
+      return { company, ...listResult('vehicles', all, vehicles, a.limit) };
     },
   },
   {
@@ -1165,15 +1171,16 @@ export const COMMANDS = [
       const { s, company } = await mine(ctx, a);
       const cargo = cargoId(s.cargos, a.cargo);
       const rows = await s.gs.call('engines', { company, type: vehicleTypeId(a.type), ...(cargo !== undefined ? { cargo } : {}), ...(a.rail_type !== undefined ? { rail_type: a.rail_type } : {}) });
-      return enginesFromRows(rows, s.cargos).filter((e) => a.wagons === undefined || e.is_wagon === a.wagons)
-        .sort((x, y) => y.design_year - x.design_year).slice(0, a.limit);
+      const all = enginesFromRows(rows, s.cargos);
+      const hits = all.filter((e) => a.wagons === undefined || e.is_wagon === a.wagons).sort((x, y) => y.design_year - x.design_year);
+      return listResult('engines', all, hits, a.limit);
     },
   },
   {
     name: 'groups', group: 'operate', session: true,
     description: 'Your vehicle groups with vehicle count and profit this/last year. Use one group per strategy to account for it.',
     args: z.object({ ...who }),
-    run: async (ctx, a) => { const { s, company } = await mine(ctx, a); return groupsFromRows(await s.gs.call('groups', { company })); },
+    run: async (ctx, a) => { const { s, company } = await mine(ctx, a); const rows = groupsFromRows(await s.gs.call('groups', { company })); return listResult('groups', rows, rows); },
   },
   {
     name: 'depots', group: 'operate', session: true,
@@ -1181,7 +1188,8 @@ export const COMMANDS = [
     args: z.object({ ...who, type: z.enum(VEHICLE_TYPES) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      return (await s.gs.call('depots', { company, type: vehicleTypeId(a.type) })).map(([x, y, vehicles]) => ({ x, y, vehicles }));
+      const rows = (await s.gs.call('depots', { company, type: vehicleTypeId(a.type) })).map(([x, y, vehicles]) => ({ x, y, vehicles }));
+      return { type: a.type, ...listResult('depots', rows, rows) };
     },
   },
   {
@@ -1381,15 +1389,19 @@ export const COMMANDS = [
     args: z.object({ ...who }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      return (await s.gs.call('rail_types', { company })).map(([id, name, max_speed, track_cost]) => ({ id, name, max_speed, track_cost }));
+      const rows = (await s.gs.call('rail_types', { company })).map(([id, name, max_speed, track_cost]) => ({ id, name, max_speed, track_cost }));
+      return listResult('rail_types', rows, rows);
     },
   },
   {
     name: 'bridge-types', group: 'build', session: true,
     description: 'Bridge types that can span `length` tiles (both ends included): id, name, max speed, price.',
     args: z.object({ length: int().min(2), type: z.enum(['rail', 'road']).default('rail') }),
-    run: async (ctx, a) => (await (await ctx.session()).gs.call('bridge_types', { length: a.length, vehicle_type: transport(a.type) }))
-      .map(([id, name, max_speed, price, min_length, max_length]) => ({ id, name, max_speed, price, min_length, max_length })),
+    run: async (ctx, a) => {
+      const rows = (await (await ctx.session()).gs.call('bridge_types', { length: a.length, vehicle_type: transport(a.type) }))
+        .map(([id, name, max_speed, price, min_length, max_length]) => ({ id, name, max_speed, price, min_length, max_length }));
+      return listResult('bridge_types', rows, rows);
+    },
   },
   {
     name: 'build-rail', group: 'build', session: true,
@@ -1485,7 +1497,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-terminus', group: 'build', session: true,
-    description: 'Template: terminus station (platforms x length, lowest corner at x,y, platforms along axis) with points joining all platforms to one track and a path signal at every platform exit. exit=high puts the points at the high-coordinate end. Needs flat land: the station plus platforms+2 tiles beyond the exit end. Returns connect_at {x,y,dir}: continue with build-rail --x1 <x> --y1 <y> --start_dir <dir>. In a dry run the signal steps fail because the track is not there yet; ignore those.',
+    description: 'Template: terminus station (platforms x length, lowest corner at x,y, platforms along axis) with points joining all platforms to one track and a path signal at every platform exit. exit=high puts the points at the high-coordinate end. Needs flat land: the station plus platforms+2 tiles beyond the exit end. Returns connect_at {x,y,dir}: continue with build-rail --x1 <x> --y1 <y> --start_dir <dir>. In a dry run the signal steps show skipped_in_dry_run (the track is not there yet) and do not count against ok.',
     args: z.object({ ...act, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(8).default(2), length: int().min(1).max(20).default(5),
       exit: z.enum(['high', 'low']).default('high'), ...join, rail_type: int().optional() }),
     run: async (ctx, a) => {
@@ -1668,8 +1680,8 @@ export async function runCommand(ctx, name, rawArgs = {}) {
   const parsed = cmd.args.safeParse(rawArgs);
   if (!parsed.success) throw new Error(`bad arguments for ${name}: ${z.prettifyError(parsed.error)}`);
   // Player with a relay configured: the host's relay runs every game command (it holds the admin connection and the map mirror).
-  if (cmd.session && ctx.cfg.relay) return callRelay(ctx.cfg, name, rawArgs);
-  return cmd.run(ctx, parsed.data);
+  if (cmd.session && ctx.cfg.relay) return envelope(await callRelay(ctx.cfg, name, rawArgs));
+  return envelope(await cmd.run(ctx, parsed.data));
 }
 
 export function describeCommands() {

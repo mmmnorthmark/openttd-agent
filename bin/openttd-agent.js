@@ -8,7 +8,7 @@
 //   openttd-agent mcp [--tools a,b] [--compact true]  run as an MCP server (stdio), optionally only some tools
 //   openttd-agent daemon | daemon-stop       local background connection (auto-started)
 //   openttd-agent relay [--port N] [--bind A] host: serve registered players over the LAN (foreground)
-// Exit code 0 on success, 1 on error (error JSON on stdout: {"error": "..."}).
+// Exit code 0 on success, 1 on error (error JSON on stdout: {"ok": false, "error": "...", "first_error": "<code>"}).
 
 import readline from 'node:readline';
 import { COMMANDS_BY_NAME, describeCommands, runCommand } from '../src/commands.js';
@@ -16,6 +16,7 @@ import { loadConfig } from '../src/config.js';
 import { ensureDaemon, callDaemon, startDaemon, stopDaemon } from '../src/daemon.js';
 import { makeContext } from '../src/context.js';
 import { VERSION } from '../src/version.js';
+import { errorResult } from '../src/envelope.js';
 
 function parseFlags(argv) {
   const args = {};
@@ -113,7 +114,7 @@ async function main() {
       try {
         const { name: n, args = {} } = JSON.parse(line);
         console.log(JSON.stringify({ name: n, result: await execute(n, args, false) }));
-      } catch (e) { failed = true; console.log(JSON.stringify({ error: e.message })); }
+      } catch (e) { failed = true; console.log(JSON.stringify(errorResult(e.message))); }
     }
     process.exitCode = failed ? 1 : 0;
     return;
@@ -124,6 +125,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.log(JSON.stringify({ error: e.message }));
+  console.log(JSON.stringify(errorResult(e.message)));
   process.exitCode = 1;
 });

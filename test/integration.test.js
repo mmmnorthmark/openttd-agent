@@ -42,7 +42,7 @@ test('library: connect, find wood pairs ranked by route effort', async () => {
     assert.equal(res.pairs[0].route.reachable, true);
     assert.ok(res.map_complete);
     const gaps = await game.run('town-gaps', { min_population: 0 });
-    assert.equal(gaps[0].name, 'Bigton');
+    assert.equal(gaps.towns[0].name, 'Bigton');
   } finally { game.close(); }
 });
 

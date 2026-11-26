@@ -220,6 +220,16 @@ refusal: time, player, company, command, arguments, outcome).
 Every command that changes the game takes `--dry_run true` (cost and feasibility only). It acts as
 your company: the one the host bound your token to (a different `--company` is refused).
 
+**Results (0.7.0).** Every command prints one JSON object with `ok` (true/false) and `error`
+(human text; `null` on success). A failure also has `first_error`, a short code: a game code such
+as `ERR_AREA_NOT_CLEAR`, or one of ours such as `no_signal_here` or `refused`. List commands
+(`stations`, `vehicles`, `towns`, `industries`, `engines`, `companies`, `depots`, ...) return
+`{ok, error, total, matched, <items>, truncated}`, where `<items>` is named after the command
+(`stations`, `towns`, ...): `total` before filters, `matched` after, `truncated` when `--limit`
+cut the list. Build results keep their per-step `results[]`; in a dry run, a signal on track the
+same command would lay is marked `skipped_in_dry_run` instead of failing, so a dry run's `ok` is
+trustworthy. Cargo names are matched loosely: `iron_ore`, `Iron Ore` and `iron-ore` are the same.
+
 Examples:
 
 ```sh
@@ -342,7 +352,8 @@ openttd-agent unpause
 ## Building
 
 - **Dry run first.** `--dry_run true` returns the cost and, per step, whether the game would
-  accept it. Nothing is built and no rate limit is used.
+  accept it. Nothing is built and no rate limit is used. Signals on track the same command lays
+  cannot be checked before the track exists: they show `skipped_in_dry_run`, and `ok` ignores them.
 - **Paths are planned by openttd-agent** (on the host's relay) from the map mirror (flat and straight preferred; houses,
   industries and stations avoided; roads crossed on the level; water, rail and roads bridged), then
   built piece by piece. `build-rail` lays track strictly *between* its two anchor tiles (a station

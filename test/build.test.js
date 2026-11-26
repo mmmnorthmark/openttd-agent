@@ -104,8 +104,8 @@ test('terraform and demolish normalise rectangles; demolish passes allow_houses'
 });
 
 test('rail-types and bridge-types decode rows', async () => {
-  assert.deepEqual((await run('rail-types', {}))[1], { id: 1, name: 'Electrified railway construction', max_speed: 0, track_cost: 75 });
-  assert.equal((await run('bridge-types', { length: 5 }))[1].price, 1500);
+  assert.deepEqual((await run('rail-types', {})).rail_types[1], { id: 1, name: 'Electrified railway construction', max_speed: 0, track_cost: 75 });
+  assert.equal((await run('bridge-types', { length: 5 })).bridge_types[1].price, 1500);
 });
 
 test('find-cargo-pairs pairs goods with towns that accept them; acceptance command', async () => {
@@ -194,7 +194,7 @@ test('purchase-land: dry run normalises corners, estimates cost and buys nothing
   assert.deepEqual(lastExec().steps, [['buy_land', 10, 30, 13, 32]]);
   assert.equal(lastExec().dry_run, true);
   assert.equal(lastExec().company, 0);
-  assert.deepEqual(res, { ok: true, dry_run: true, company: 0, area: [10, 30, 13, 32], tiles: 12, estimated_cost: 600, money: 100000, affordable: true });
+  assert.deepEqual(res, { ok: true, error: null, dry_run: true, company: 0, area: [10, 30, 13, 32], tiles: 12, estimated_cost: 600, money: 100000, affordable: true });
   assert.equal(fake.state.land.size, 0);
   await assert.rejects(run('purchase-land', { x0: 0, y0: 0, x1: 20, y1: 19, dry_run: true }), /area too large: 21x20 = 420 tiles; purchase-land buys at most 400/);
   await assert.rejects(run('purchase-land', { x0: 60, y0: 0, x1: 64, y1: 1 }), /outside the map/);
@@ -203,7 +203,7 @@ test('purchase-land: dry run normalises corners, estimates cost and buys nothing
 test('purchase-land buys, refuses the whole rectangle on protected tiles, and owned-land lists the plots', async () => {
   try {
     const res = await run('purchase-land', { x0: 10, y0: 30, x1: 13, y1: 32 });
-    assert.deepEqual(res, { ok: true, dry_run: false, company: 0, area: [10, 30, 13, 32], tiles_bought: 12, cost: 600, money: res.money });
+    assert.deepEqual(res, { ok: true, error: null, dry_run: false, company: 0, area: [10, 30, 13, 32], tiles_bought: 12, cost: 600, money: res.money });
     assert.equal(fake.state.land.size, 12);
     // houses at 40..44,10..14, already-owned tiles and another company's tile: nothing is bought
     fake.state.landOwnedBy['20,30'] = 1;
@@ -224,7 +224,7 @@ test('purchase-land buys, refuses the whole rectangle on protected tiles, and ow
     assert.equal(owned.tiles, 17);
     assert.deepEqual(owned.rects, [[10, 30, 13, 33], [50, 50, 50, 50]]);
     const part = await run('owned-land', { x0: 12, y0: 31, x1: 11, y1: 30 });
-    assert.deepEqual(part, { company: 0, area: [11, 30, 12, 31], tiles: 4, rects: [[11, 30, 12, 31]] });
+    assert.deepEqual(part, { ok: true, error: null, company: 0, area: [11, 30, 12, 31], tiles: 4, rects: [[11, 30, 12, 31]] });
     assert.deepEqual((await run('owned-land', { limit: 1 })).truncated, true);
     await assert.rejects(run('owned-land', { x0: 1, y0: 1 }), /give all of --x0 --y0 --x1 --y1/);
   } finally { fake.state.land.clear(); fake.state.landOwnedBy = {}; }

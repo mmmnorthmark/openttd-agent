@@ -60,7 +60,7 @@ test('mcp --tools lists only those tools; --compact returns single-line JSON', a
   assert.deepEqual(r.get(1).result.tools.map((t) => t.name).sort(), ['companies', 'goal_status']);
   const text = r.get(2).result.content[0].text;
   assert.ok(!text.includes('\n'), text);
-  assert.equal(JSON.parse(text)[0].name, 'Test Transport');
+  assert.equal(JSON.parse(text).companies[0].name, 'Test Transport');
 });
 
 test('mcp without --tools lists every command', async () => {

@@ -214,7 +214,9 @@ export function industriesFromRows(rows, typesById, cargosById) {
   });
 }
 
-const matches = (needle, hay) => !needle || String(hay).toLowerCase().includes(String(needle).toLowerCase());
+// Case, '_', '-' and spaces do not matter: iron_ore, Iron Ore and iron-ore all match "Iron Ore".
+const norm = (v) => String(v).toLowerCase().replace(/[\s_-]+/g, ' ').trim();
+const matches = (needle, hay) => !needle || norm(hay).includes(norm(needle));
 
 /** Acceptance at or above this means a station there accepts the cargo (GSTile.GetCargoAcceptance). */
 export const ACCEPTED = 8;
