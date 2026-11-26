@@ -63,12 +63,19 @@ class AgentBridge extends GSController {
 			goal_status = "CmdGoalStatus",
 			goal_clear = "CmdGoalClear",
 			owned_land = "CmdOwnedLand",
+			company_history = "CmdCompanyHistory",
+			rating_parts = "CmdRatingParts",
+			station_vehicles = "CmdStationVehicles",
+			tile_owners = "CmdTileOwners",
+			vehicle_wagons = "CmdVehicleWagons",
+			signs = "CmdSigns",
+			road_types = "CmdRoadTypes",
 		};
 	}
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v11 started");
+	GSLog.Info("AgentBridge v12 started");
 	this.RestoreGoals();
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
@@ -226,7 +233,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 11,
+		bridge_version = 12,
 		event_seq = this.event_seq,
 		goals = this.goals.len(),
 	};
@@ -237,12 +244,19 @@ function AgentBridge::CmdCompanies(args) {
 	for (local c = GSCompany.COMPANY_FIRST; c <= GSCompany.COMPANY_LAST; c++) {
 		if (GSCompany.ResolveCompanyID(c) == GSCompany.COMPANY_INVALID) continue;
 		local q = GSCompany.CURRENT_QUARTER + 1; // last full quarter
-		local loan = 0, max_loan = 0;
+		local loan = 0, max_loan = 0, stations = 0;
+		local by_type = [0, 0, 0, 0];
 		{
 			// GetLoanAmount/GetMaxLoanAmount take no company arg: they read the current company.
+			// Station and vehicle lists are the current company's too (v12: station_count, vehicles_by_type).
 			local cm = GSCompanyMode(c);
 			loan = GSCompany.GetLoanAmount();
 			max_loan = GSCompany.GetMaxLoanAmount();
+			stations = GSStationList(GSStation.STATION_ANY).Count();
+			foreach (v, _ in GSVehicleList()) {
+				local vt = GSVehicle.GetVehicleType(v);
+				if (vt >= 0 && vt < 4) by_type[vt]++;
+			}
 		}
 		out.append({
 			id = c,
@@ -256,6 +270,8 @@ function AgentBridge::CmdCompanies(args) {
 			cargo_delivered = GSCompany.GetQuarterlyCargoDelivered(c, q),
 			performance = GSCompany.GetQuarterlyPerformanceRating(c, q),
 			hq = GSCompany.GetCompanyHQ(c),
+			station_count = stations,
+			vehicles_by_type = by_type,
 		});
 	}
 	return out;
@@ -705,13 +721,18 @@ function AgentBridge::CmdGroups(args) {
 	return out;
 }
 
-// args: company, type (0 rail, 1 road, 2 water, 3 air). Rows: [x, y, vehicles_inside]
+// args: company, type (0 rail, 1 road, 2 water, 3 air). Rows: [x, y, vehicles_inside, front_x, front_y]
+// front (v12): the tile vehicles leave onto (rail and road depots; -1 for ship depots and hangars).
 function AgentBridge::CmdDepots(args) {
 	local mode = GSCompanyMode(this.CheckCompany(args));
 	local kinds = [GSTile.TRANSPORT_RAIL, GSTile.TRANSPORT_ROAD, GSTile.TRANSPORT_WATER, GSTile.TRANSPORT_AIR];
 	local out = [];
 	foreach (tile, _ in GSDepotList(kinds[args.type])) {
-		out.append([GSMap.GetTileX(tile), GSMap.GetTileY(tile), GSVehicleList_Depot(tile).Count()]);
+		local f = -1;
+		if (args.type == 0) f = GSRail.GetRailDepotFrontTile(tile);
+		else if (args.type == 1) f = GSRoad.GetRoadDepotFrontTile(tile);
+		local ok = f != -1 && GSMap.IsValidTile(f);
+		out.append([GSMap.GetTileX(tile), GSMap.GetTileY(tile), GSVehicleList_Depot(tile).Count(), ok ? GSMap.GetTileX(f) : -1, ok ? GSMap.GetTileY(f) : -1]);
 	}
 	return out;
 }
@@ -1149,6 +1170,23 @@ function AgentBridge::ExecStep(company, s, dry) {
 		// [op, vehicle, service_only] (v11: own refusals; value 1 sent, 2 already heading to a depot, 3 already stopped in one)
 		case "veh_depot": return this.DepotStep(s[1], s[2]);
 		case "veh_sell": return [GSVehicle.SellVehicle(s[1]), 0];
+		// [op, vehicle] (v12): turn a train or road vehicle around
+		case "veh_reverse": {
+			if (!GSVehicle.IsValidVehicle(s[1])) return [false, 0, "not_found: vehicle " + s[1] + " does not exist or is not yours"];
+			return [GSVehicle.ReverseVehicle(s[1]), 0];
+		}
+		// -- signs (v12): [op, x, y, text] value = sign id; [op, sign_id]
+		case "sign": {
+			local id = GSSign.BuildSign(this.T(s[1], s[2]), s[3]);
+			if (dry) return [id == 0, 0];
+			return [GSSign.IsValidSign(id), id];
+		}
+		case "sign_remove": {
+			if (!GSSign.IsValidSign(s[1]) || GSSign.GetOwner(s[1]) != company) return [false, 0, "not_found: sign " + s[1] + " does not exist or is not yours"];
+			return [GSSign.RemoveSign(s[1]), 0];
+		}
+		// -- company HQ (v12): [op, x, y] (north tile of the 2x2 HQ; building again moves it)
+		case "hq": return [GSCompany.BuildCompanyHQ(this.T(s[1], s[2])), 0];
 		case "veh_refit": return [GSVehicle.RefitVehicle(s[1], s[2]), 0];
 		case "veh_rename": return [GSVehicle.SetName(s[1], s[2]), 0];
 		// [op, source_vehicle, source_wagon, dest_vehicle, dest_wagon]
@@ -1402,6 +1440,122 @@ function AgentBridge::CmdBridgeTypes(args) {
 	foreach (b, _ in GSBridgeList_Length(args.length)) {
 		out.append([b, this.Str(GSBridge.GetName(b, args.vehicle_type)), GSBridge.GetMaxSpeed(b), GSBridge.GetPrice(b, args.length),
 			GSBridge.GetMinLength(b), GSBridge.GetMaxLength(b)]);
+	}
+	return out;
+}
+
+// ---- v12 queries ----------------------------------------------------------------
+
+// args: company, quarters (1..24). Rows: [quarter, value, income, expenses, cargo_delivered, performance]
+// quarter 0 = the running quarter, 1 = the last full one. expenses are negative.
+function AgentBridge::CmdCompanyHistory(args) {
+	local c = this.CheckCompany(args);
+	local n = ("quarters" in args) ? min(GSCompany.EARLIEST_QUARTER, max(1, args.quarters)) : 4;
+	local out = [];
+	for (local q = 0; q <= n; q++) {
+		out.append([q, GSCompany.GetQuarterlyCompanyValue(c, q), GSCompany.GetQuarterlyIncome(c, q), GSCompany.GetQuarterlyExpenses(c, q),
+			GSCompany.GetQuarterlyCargoDelivered(c, q), q == 0 ? -1 : GSCompany.GetQuarterlyPerformanceRating(c, q)]);
+	}
+	return out;
+}
+
+// args: company. Raw inputs of the performance rating that scripts can read (see OpenTTD economy.cpp
+// UpdateCompanyRatingAndValue). Stations: facilities of stations that some vehicle has in its orders
+// (the game counts stations loaded or unloaded at in the last 20 days; scripts cannot read that).
+function AgentBridge::CmdRatingParts(args) {
+	local c = this.CheckCompany(args);
+	local mode = GSCompanyMode(c);
+	local profitable = 0, aged = 0, min_profit = 0, first = true;
+	foreach (v, _ in GSVehicleList()) {
+		local p = GSVehicle.GetProfitLastYear(v);
+		if (p > 0) profitable++;
+		if (GSVehicle.GetAge(v) > 730) {
+			aged++;
+			if (first || p < min_profit) { min_profit = p; first = false; }
+		}
+	}
+	local kinds = [GSStation.STATION_TRAIN, GSStation.STATION_TRUCK_STOP, GSStation.STATION_BUS_STOP, GSStation.STATION_AIRPORT, GSStation.STATION_DOCK];
+	local facilities = 0, served = 0;
+	foreach (st, _ in GSStationList(GSStation.STATION_ANY)) {
+		local n = 0;
+		foreach (k in kinds) if (GSStation.HasStationType(st, k)) n++;
+		facilities += n;
+		if (GSVehicleList_Station(st).Count() > 0) served += n;
+	}
+	return { profitable_vehicles = profitable, vehicles_over_2_years = aged, min_profit = first ? 0 : min_profit,
+		station_facilities = facilities, station_facilities_served = served,
+		money = GSCompany.GetBankBalance(c), loan = GSCompany.GetLoanAmount() };
+}
+
+// args: company, optional station. Rows: [station, [vehicle ids]] (a station with many vehicles spans several rows).
+function AgentBridge::CmdStationVehicles(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local out = [];
+	local list = GSStationList(GSStation.STATION_ANY);
+	if ("station" in args) {
+		list = GSList();
+		if (GSStation.IsValidStation(args.station)) list.AddItem(args.station, 0);
+	}
+	foreach (st, _ in list) {
+		local ids = [];
+		foreach (v, _ in GSVehicleList_Station(st)) {
+			ids.append(v);
+			if (ids.len() >= 150) { out.append([st, ids]); ids = []; }
+		}
+		if (ids.len() > 0 || out.len() == 0 || out[out.len() - 1][0] != st) out.append([st, ids]);
+	}
+	return out;
+}
+
+// args: x0, y0, x1, y1 (max 40x40). Rows: [x, y, owner] for tiles a company owns (rail, road, stations, depots, land...).
+function AgentBridge::CmdTileOwners(args) {
+	local x0 = max(0, args.x0), y0 = max(0, args.y0);
+	local x1 = min(GSMap.GetMapSizeX() - 1, args.x1), y1 = min(GSMap.GetMapSizeY() - 1, args.y1);
+	if ((x1 - x0 + 1) * (y1 - y0 + 1) > 1600) throw "area too large; max 40x40 tiles";
+	local out = [];
+	for (local y = y0; y <= y1; y++) {
+		for (local x = x0; x <= x1; x++) {
+			local o = GSTile.GetOwner(GSMap.GetTileIndex(x, y));
+			if (o != GSCompany.COMPANY_INVALID && GSCompany.ResolveCompanyID(o) != GSCompany.COMPANY_INVALID) out.append([x, y, o]);
+		}
+	}
+	return out;
+}
+
+// args: company, vehicle. Rows: [wagon_index, engine, cargo, capacity] for every part of the vehicle (0 = the engine).
+function AgentBridge::CmdVehicleWagons(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local v = args.vehicle;
+	if (!GSVehicle.IsValidVehicle(v)) throw "vehicle " + v + " does not exist or is not owned by company " + args.company + "; run: openttd-agent vehicles";
+	local out = [];
+	local n = GSVehicle.GetVehicleType(v) == GSVehicle.VT_RAIL ? GSVehicle.GetNumWagons(v) : 1;
+	for (local i = 0; i < n; i++) {
+		local e = GSVehicle.GetWagonEngineType(v, i);
+		out.append([i, e, GSEngine.GetCargoType(e), GSEngine.GetCapacity(e)]);
+	}
+	return out;
+}
+
+// args: company. Rows: [id, x, y, owner, text] for the company's own signs.
+function AgentBridge::CmdSigns(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local out = [];
+	foreach (id, _ in GSSignList()) {
+		local t = GSSign.GetLocation(id);
+		out.append([id, GSMap.GetTileX(t), GSMap.GetTileY(t), GSSign.GetOwner(id), this.Str(GSSign.GetName(id))]);
+	}
+	return out;
+}
+
+// args: company. Rows: [id, name, tram, max_speed, build_cost_per_tile, available]
+function AgentBridge::CmdRoadTypes(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local out = [];
+	foreach (rtt in [GSRoad.ROADTRAMTYPES_ROAD, GSRoad.ROADTRAMTYPES_TRAM]) {
+		foreach (rt, _ in GSRoadTypeList(rtt)) {
+			out.append([rt, this.Str(GSRoad.GetName(rt)), rtt == GSRoad.ROADTRAMTYPES_TRAM, GSRoad.GetMaxSpeed(rt),
+				GSRoad.GetBuildCost(rt, GSRoad.BT_ROAD), GSRoad.IsRoadTypeAvailable(rt)]);
+		}
 	}
 	return out;
 }

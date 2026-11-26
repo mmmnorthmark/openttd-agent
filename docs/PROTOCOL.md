@@ -72,6 +72,14 @@ GS commands: `ping`, `info`, `echo`, `companies`, `cargos`, `towns`, `industries
 that are the company's owned land), `road_tiles` (v11: `{company, x0, y0, x1, y1}`, max 32x32 ->
 rows `[x, y, kind, links, station, a, b, owner]`; `links` bit d = a road vehicle can drive into the
 neighbour in direction d, from `GSRoad.AreRoadTilesConnected`, so one-way roads count).
+v12 adds `company_history` (`{company, quarters}` -> `[quarter, value, income, expenses,
+cargo_delivered, performance]`, quarter 0 = running), `rating_parts` (`{company}` -> the rating
+inputs scripts can read), `station_vehicles` (`{company, station?}` -> `[station, [vehicle ids]]`,
+a busy station spans several rows), `tile_owners` (`{x0, y0, x1, y1}`, max 40x40 -> `[x, y, owner]`
+for company-owned tiles), `vehicle_wagons` (`{company, vehicle}` -> `[index, engine, cargo,
+capacity]`), `signs` (`{company}` -> `[id, x, y, owner, text]`) and `road_types` (`{company}` ->
+`[id, name, tram, max_speed, build_cost, available]`); `companies` rows gain `station_count` and
+`vehicles_by_type` ([rail, road, water, air]); `depots` rows gain `front_x, front_y`.
 Row formats are documented in `gamescript/AgentBridge/main.nut`.
 
 The `veh_depot` exec step (v11) never undoes an earlier send (a second "go to depot" cancels the
@@ -102,6 +110,9 @@ Every state change (vehicles, orders, groups, construction) is one **step** in a
   water, objects, or already yours), then estimates in test mode and refuses if the game would
   refuse a tile or the bank balance is short; only then it buys row by row from x0,y0.
   Row value = tiles bought; a failure while buying says how many were bought before it.
+- v12 steps: `["veh_reverse", vehicle]` (`GSVehicle.ReverseVehicle`), `["sign", x, y, text]`
+  (value = sign id; the company owns it), `["sign_remove", sign_id]` (own signs only) and
+  `["hq", x, y]` (`GSCompany.BuildCompanyHQ`; building again moves it).
 - Step formats are listed in `ExecStep` in main.nut. The client keeps a request under ~7 kB and 150 steps.
 
 ## events

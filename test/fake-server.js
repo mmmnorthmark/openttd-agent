@@ -184,7 +184,16 @@ const GS = {
     [3, 3, 5, 60, [[7, 80, 75]], 1],
   ],
   towns: () => [[1, 'Bigton', 42, 12, 5000, false, 800, 10, 200, 0, 6], [2, 'Smallham', 10, 50, 300, false, 40, 0, 10, 0, 2]],
-  companies: (_a, state) => [{ id: 0, name: 'Test Transport', money: state.money, loan: state.loan, max_loan: FAKE_MAX_LOAN }],
+  companies: (_a, state) => [{ id: 0, name: 'Test Transport', money: state.money, loan: state.loan, max_loan: FAKE_MAX_LOAN, value: 50000, income: 9000, expenses: -4000, cargo_delivered: 300, performance: 210, hq: -1,
+    ...(state.gsVersion >= 12 ? { station_count: 4, vehicles_by_type: [state.lostTrain ? 2 : 1, 1, 0, 0] } : {}) }],
+  // v12 queries (see main.nut). Older versions answer "unknown cmd" through v12only.
+  company_history: (a) => Array.from({ length: (a.quarters ?? 4) + 1 }, (_, q) => [q, 50000 - q * 1000, 9000 - q * 500, -4000, 300 - q * 10, q === 0 ? -1 : 210 - q]),
+  rating_parts: (_a, state) => ({ profitable_vehicles: 1, vehicles_over_2_years: 1, min_profit: -3000, station_facilities: 5, station_facilities_served: 5, money: state.money, loan: state.loan }),
+  station_vehicles: (a) => [[3, [11]], [4, [12]], [5, [11]], [7, [12]]].filter(([st]) => a.station === undefined || st === a.station),
+  tile_owners: (a, state) => [...fakeRailRows(state), ...fakeRoadRows(state)].filter(([x, y]) => x >= a.x0 && x <= a.x1 && y >= a.y0 && y <= a.y1).map(([x, y]) => [x, y, 0]),
+  vehicle_wagons: (a) => (a.vehicle === 11 ? [[0, 5, 0xFF, 0], [1, 27, 7, 30], [2, 27, 7, 30], [3, 27, 7, 30], [4, 27, 7, 30]] : [[0, 9, 0, 31]]),
+  signs: (_a, state) => state.signs.map((g) => [g.id, g.x, g.y, 0, g.text]),
+  road_types: () => [[0, 'Road', false, 0, 61, true], [1, 'Tramway', true, 0, 70, true]],
   get_rate: () => ({ command_delay_ticks: 0, max_builds_per_day: 0 }),
   dump_tiles: dumpRows,
   // owned_land (v10): indices of the points that are a.company's owned land.
@@ -260,7 +269,7 @@ const GS = {
     [6, 'SH 8P', 0xFF, 0, 128, 21000, 1800, 80, 7300, 1954, 1000, 85, false, 0],
   ].filter((r) => a.type === 0 && (a.cargo === undefined || a.cargo === 7)),
   groups: () => [[2, 'Wood line', 0, -1, 1, -1200, -3000, 40]],
-  depots: (a) => (a.type === 0 ? [[13, 22, 0], [12, 22, 0], [31, 41, 0]] : []),
+  depots: (a, state) => (a.type === 0 ? [[13, 22, 0, 13, 21], [12, 22, 0, 12, 23], [31, 41, 0, 31, 40]] : a.type === 1 ? [[36, 8, 0, 36, 9]] : []).map((r) => (state.gsVersion >= 12 ? r : r.slice(0, 3))),
   autorenew: () => ({ enabled: false, months: 6, money: 100000 }),
   events: (a) => [
     { seq: 1, date: '1950-1-3', type: 'industry_open', industry: 9, industry_type: 3, x: 5, y: 5 },
@@ -295,6 +304,17 @@ const GS = {
         else rows.push([true, 0, '', 1]);
         continue;
       }
+      if (['veh_reverse', 'sign', 'sign_remove', 'hq'].includes(st[0]) && state.gsVersion < 12) {
+        rows.push([false, 0, `unknown exec op: ${st[0]}`, 0]);
+        if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+        continue;
+      }
+      if (st[0] === 'sign' && !a.dry_run) { const id = 50 + state.signs.length; state.signs.push({ id, x: st[1], y: st[2], text: st[3] }); rows.push([true, 0, '', id]); continue; }
+      if (st[0] === 'sign_remove') {
+        const i = state.signs.findIndex((g) => g.id === st[1]);
+        if (i < 0) rows.push([false, 0, `not_found: sign ${st[1]} does not exist or is not yours`, 0]); else { if (!a.dry_run) state.signs.splice(i, 1); rows.push([true, 0, '', 0]); }
+        continue;
+      }
       if (st[0] === 'veh_buy' && st[5] >= 0 && state.attachFails && !a.dry_run) {
         rows.push([false, 10, `bought vehicle ${100 + rows.length} but could not attach it to train ${st[5]}: ERR_UNKNOWN`, 100 + rows.length]);
         if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
@@ -312,7 +332,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 11, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [] };
   const server = net.createServer((sock) => {
     state.openConnections++;
     sock.on('close', () => { state.openConnections--; });
@@ -330,7 +350,8 @@ export function startFakeServer({ password = 'pw' } = {}) {
         } else if (type === PKT.ADMIN_GAMESCRIPT) {
           const req = JSON.parse(r.str());
           received.push(req);
-          const handler = (req.cmd === 'owned_land' && state.gsVersion < 10) || (req.cmd === 'info' && state.noGs) ? undefined : GS[req.cmd];
+          const v12only = ['company_history', 'rating_parts', 'station_vehicles', 'tile_owners', 'vehicle_wagons', 'signs', 'road_types'];
+          const handler = (req.cmd === 'owned_land' && state.gsVersion < 10) || (v12only.includes(req.cmd) && state.gsVersion < 12) || (req.cmd === 'info' && state.noGs) ? undefined : GS[req.cmd];
           const base = { id: req.id, client: req.client };
           if (!handler) { send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: false, part: 0, last: true, error: `unknown cmd: ${req.cmd}` }))); continue; }
           let data;
