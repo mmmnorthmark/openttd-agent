@@ -67,7 +67,8 @@ Rules:
 GS commands: `ping`, `info`, `echo`, `companies`, `cargos`, `towns`, `industries`,
 `industry_types`, `dump_tiles`, `get_rate`, `set_rate`, `airport_types`, `check_airport`,
 `test_build_road`, `build_road`, `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`,
-`autorenew`, `events`, `exec`, `rail_types`, `bridge_types`, `goal_set`, `goal_status`, `goal_clear`, `acceptance` (v7).
+`autorenew`, `events`, `exec`, `rail_types`, `bridge_types`, `goal_set`, `goal_status`, `goal_clear`, `acceptance` (v7),
+`rail_tiles` (v9).
 Row formats are documented in `gamescript/AgentBridge/main.nut`.
 
 ## exec

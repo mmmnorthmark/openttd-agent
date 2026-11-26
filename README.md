@@ -144,6 +144,7 @@ Security notes, so nobody is surprised:
 | host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance` |
 | world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns; town to town for passengers and mail), `acceptance`, `route-effort`, `airport-types`, `airport-sites`, `tiles` |
 | operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
+| operate: diagnose | `vehicle-problems` (one row per problem: `problem`, `evidence`, `suggested_fix`, with the id and the unit number the game shows as "Train #4"), `verify-route` (`--vehicle ID`, or `--from_station A --to_station B`: is there a rail path, and if not, the last reachable tile and the first gap) |
 | operate: change | `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot`, `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace`, `loan` (`--amount N`, `--borrow N`, `--repay N` or `--max true`; GameScript v8) |
 | build: rail | `build-cargo-route` (stations, line, depot, train, orders in one call), `station-sites`, `build-line-depot`, `rail-types`, `build-rail` (planned path), `build-track` (one piece, for junctions and depot spurs), `build-rail-station`, `build-rail-depot`, `build-signal`, `build-terminus`, `build-passing-loop` |
 | build: road | `build-road-path` (planned path), `build-road-station`, `build-road-depot`, `build-road` / `test-build-road` (straight) |
@@ -293,6 +294,14 @@ openttd-agent unpause
   map mirror. Reading `tiles` to plan by hand is slow and error-prone; use it to look at a failure.
 - **Dry run, check every step's `ok`, then build.** On failure, read the error, change one thing,
   and try once more; repeating the identical command will not help.
+- **Check `vehicle-problems` every turn.** The game window shows "cannot reach" and loss-making
+  trains to a player, but tells scripts nothing. `vehicle-problems` infers it: no rail path to the
+  next order (`wrong_network`, `unreachable_destination`), no progress for 30 game days
+  (`stuck_or_lost`; the daemon keeps the history, so it needs a second call that many days later),
+  money lost last year, no orders, stopped, old or unreliable. Fix what it lists before building
+  more; `verify-route --vehicle ID` shows where the track breaks.
+- **Clone a train only at a depot of its own line.** A clone keeps its orders; in another line's
+  depot it can never reach them (`vehicle-problems` reports `wrong_network`).
 - **Keep notes outside the game** (ids of what you built, the plan, what failed). Long games
   outlast any one context window.
 - Slower or local models: keep each turn to a few composite calls; every call costs real time.
@@ -306,6 +315,7 @@ openttd-agent unpause
 | GS replies stop; log says "The script died unexpectedly" | Look in the launch profile's `openttd.log`; report it with the command you ran. |
 | Can't join from another machine | Launch with `--bind 0.0.0.0` and allow OpenTTD through the firewall (TCP 3979). |
 | Changed the code, behaviour didn't change | `openttd-agent daemon-stop`; the next call starts a fresh daemon. |
+| The game shows "cannot reach" on trains | `vehicle-problems`, then `verify-route --vehicle <id>`: it names the gap, or says the train is on another line's track. |
 | A route builds but earns nothing | `stations`: does the drop station show the cargo? `acceptance --x --y --cargo <c>` at it should be >= 8. |
 
 ## Rate limiting

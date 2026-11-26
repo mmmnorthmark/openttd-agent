@@ -5,6 +5,27 @@ re-run `install-gamescript` when it changes.
 
 ## (unreleased)
 
+- `vehicle-problems [--vehicle ID] [--stuck_days 30]` (player, own company): one row per problem
+  with `problem`, `evidence`, `suggested_fix`, the vehicle id and its `unit_number` (the "Train #4"
+  in the game window). Problems: `wrong_network` (no rail path to the current order's station while
+  the order stations are joined to each other: the train runs on another line's track),
+  `unreachable_destination`, `stuck_or_lost` (same order for `stuck_days` game days without getting
+  closer; the game's vehicle-lost event is AI-only, so this is inferred, and the daemon or relay
+  keeps the history between calls), `no_income` (lost money last year at age over a year),
+  `no_orders`, `stopped_in_depot`, `stopped`, `old`, `broken_down`, `low_reliability`, `crashed`.
+- `verify-route --vehicle ID` or `--from_station A --to_station B` (id or name): is there a rail
+  path; if not, the last reachable tile and the first gap with a reason (`no_track`,
+  `track_not_joined`, `station_platform_side`, `depot_entrance_faces_away`,
+  `one_way_signal_against`, `other_company_track`, `bridge_side`, `tunnel_side`). Exact on
+  GameScript v9; with an older GameScript a coarse trace over the map mirror, marked as such.
+- GameScript v9 (the host re-runs `install-gamescript`; a running game picks it up when it is
+  loaded again): `rail_tiles` (track bits, depot fronts, bridge and tunnel ends, signals);
+  `vehicles` rows add `current_order`, `dest`, `dest_station` and `speed`; `vehicle` adds
+  `unit_number` and `rail_type`.
+- Fix: `build-cargo-route` could put the route's depot, and so its first train, beside another
+  line's track when that ran closer to the source than the new line. The train then never reached
+  the route's stations ("cannot reach" in the game). The depot now goes only beside the route's
+  own line.
 - `mcp --tools a,b,c` serves only those commands as MCP tools (every tool schema is sent with
   each model request; a few tight tools suit small models), with shorter server instructions.
   `mcp --compact true` returns tool results as single-line JSON.
