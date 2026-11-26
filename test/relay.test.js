@@ -83,9 +83,22 @@ test('company is forced to the player\'s; an explicit other company is refused',
   const other = await call(tokens.alice, 'build-road', { x1: 1, y1: 1, x2: 5, y2: 1, company: 1 });
   assert.equal(other.status, 403);
   assert.match(other.error, /bound to company 0 and cannot act as company 1/);
-  const read = await call(tokens.alice, 'vehicles', { company: 1 });
-  assert.equal(read.status, 403);
+  const steal = await call(tokens.alice, 'vehicle', { vehicle: 11, company: 1 });
+  assert.equal(steal.status, 403);
+  assert.match(steal.error, /only be read with: stations, vehicles/);
   assert.equal(fake.received.length, before, 'refused requests never reach the game');
+  // Rival reads: what the game window shows anyone.
+  const rv = await call(tokens.alice, 'vehicles', { company: 1 });
+  assert.equal(rv.ok, true);
+  assert.equal(rv.result.vehicles, undefined, 'no per-vehicle detail of another company');
+  assert.deepEqual([rv.result.company, rv.result.total, rv.result.by_state], [1, 2, undefined]);
+  assert.equal(fake.received.at(-1).args.company, 1);
+  const rs = await call(tokens.alice, 'stations', { company: '1' });
+  assert.equal(rs.result.company, 1);
+  assert.equal(rs.result.stations[0].vehicles, undefined);
+  assert.equal(rs.result.stations[0].cargo[0].rating_pct, 35);
+  const own = await call(tokens.alice, 'stations', {});
+  assert.equal(own.result.stations[0].vehicles, 2);
 });
 
 test('every command that changes the game or reads company data takes a company (so the relay can force it)', () => {
@@ -189,7 +202,7 @@ test('player CLI: configure --relay/--token, then commands go through the relay 
   const dry = await cli('build-road-path', '--x1', '1', '--y1', '1', '--x2', '6', '--y2', '1', '--dry_run', 'true');
   assert.equal(dry.dry_run, true);
   assert.equal(fake.received.at(-1).args.company, 0);
-  await assert.rejects(run(process.execPath, [BIN, 'vehicles', '--company', '1'], { env }), (e) => {
+  await assert.rejects(run(process.execPath, [BIN, 'vehicle', '--vehicle', '11', '--company', '1'], { env }), (e) => {
     assert.match(JSON.parse(e.stdout).error, /relay refused: player 'alice' is bound to company 0/);
     return true;
   });

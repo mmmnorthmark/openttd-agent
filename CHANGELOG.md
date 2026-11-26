@@ -36,6 +36,10 @@ Behaviour changes agents must know:
   `configure`, writes `~/.openttd-agent/players/NAME.json`; `OPENTTD_AGENT_PLAYER_FILE=<path>` uses
   any JSON file (`token` accepted for `relay_token`). Keys override config.json; env vars override
   both. `relay-add-player` also prints the profile form (`or_as_profile`).
+- Relay: `stations --company X` and `vehicles --company X` work for another company, read-only and
+  trimmed to what the game window shows anyone (stations without vehicle counts; vehicles as
+  `total` and `by_type` only). Every other command stays bound to the player's company.
+  `vehicles --summary true` gives the counts for your own company (plus `by_state`).
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

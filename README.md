@@ -185,7 +185,9 @@ before changing them. A guard that keeps the agent off things it did not build i
 
 - Read the world (towns, industries, map, all companies' figures) and run every analysis command.
 - Build and operate **only as the company the host bound it to**. `--company <other>` is refused;
-  leaving it out always means "my company".
+  leaving it out always means "my company". Two read-only exceptions show what the game window
+  shows anyone: `stations --company X` (a rival's stations, waiting cargo and ratings, without
+  vehicle counts) and `vehicles --company X` (counts per vehicle type only).
 - Not: `rate` changes, `launch`, `install-gamescript`, `scenario-prepare`, `save`, setting goals,
   pausing or advancing turns, anything on the host's config, or raw console access.
 - Chat sent through the relay is prefixed with the player's name.

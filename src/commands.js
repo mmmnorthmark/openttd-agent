@@ -35,6 +35,9 @@ const lc = (v) => String(v).toLowerCase();
 /** Non-loopback IPv4 addresses of this machine (what players put in their relay URL). */
 const lanAddresses = () => Object.values(os.networkInterfaces()).flat().filter((i) => i && i.family === 'IPv4' && !i.internal).map((i) => i.address);
 
+/** Is `company` another company than the caller's own (cfg.company; through the relay the player's)? */
+const isRival = (s, company) => s.cfg.company !== null && s.cfg.company !== undefined && company !== s.cfg.company;
+
 /** Session + company for read commands. */
 async function mine(ctx, a) {
   const s = await ctx.session();
@@ -1082,26 +1085,33 @@ export const COMMANDS = [
   // ---- operate (read) -------------------------------------------------------------
   {
     name: 'stations', group: 'operate', session: true,
-    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving. Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations).',
+    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving. Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations). --company X shows another company\'s stations as the game window shows them to anyone (location, facilities, waiting cargo, ratings; no vehicle counts); also through the relay. Returns {total, matched, stations, truncated}.',
     args: z.object({ ...who, facility: z.enum(FACILITIES).optional(), cargo: z.string().optional(), min_waiting: int().default(0),
       max_rating_pct: int().default(100), name: z.string().optional(), limit: int().default(100) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargoFilter = a.cargo !== undefined || a.min_waiting > 0 || a.max_rating_pct < 100;
-      const all = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const rival = isRival(s, company);
+      const all = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).map((st) => (rival ? (({ vehicles, ...rest }) => rest)(st) : st));
       const hits = all.filter((st) => (!a.facility || st.facilities.includes(a.facility)) && (!a.name || lc(st.name).includes(lc(a.name)))
         && (!cargoFilter || st.cargo.some((c) => (!a.cargo || cargoMatches(c.name, a.cargo)) && c.waiting >= a.min_waiting && c.rating_pct <= a.max_rating_pct)));
-      return { company, ...listResult('stations', all, hits, a.limit) };
+      return { company, ...(rival ? { view: 'other company: what the game shows anyone' } : {}), ...listResult('stations', all, hits, a.limit) };
     },
   },
   {
     name: 'vehicles', group: 'operate', session: true,
-    description: 'Your vehicles: type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: type, group, state, max_profit_last_year (e.g. 0 = loss makers), min_age_pct (e.g. 90 = due for replacement), max_reliability_pct, name. Breakdown counts and service intervals are not exposed by the game to scripts.',
+    description: 'Your vehicles (summary=true or another --company: counts per type and state only, as the company window shows anyone): type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: type, group, state, max_profit_last_year (e.g. 0 = loss makers), min_age_pct (e.g. 90 = due for replacement), max_reliability_pct, name. Breakdown counts and service intervals are not exposed by the game to scripts.',
     args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
-      max_profit_last_year: int().optional(), min_age_pct: int().default(0), max_reliability_pct: int().default(100), name: z.string().optional(), limit: int().min(1).default(1000) }),
+      max_profit_last_year: int().optional(), min_age_pct: int().default(0), max_reliability_pct: int().default(100), name: z.string().optional(), limit: int().min(1).default(1000),
+      summary: bool().default(false).describe('counts per type and state only (always so for another company)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
+      if (a.summary || isRival(s, company)) {
+        const count = (key) => all.reduce((m, v) => ({ ...m, [v[key]]: (m[v[key]] ?? 0) + 1 }), {});
+        return { company, ...(isRival(s, company) ? { view: 'other company: counts only, as the company window shows them' } : {}), total: all.length, by_type: count('type'),
+          ...(isRival(s, company) ? {} : { by_state: count('state') }) };
+      }
       const vehicles = all.filter((v) => (!a.type || v.type === a.type) && (a.group === undefined || v.group === a.group) && (!a.state || v.state === a.state)
         && (a.max_profit_last_year === undefined || v.profit_last_year <= a.max_profit_last_year) && v.age_pct >= a.min_age_pct
         && v.reliability_pct <= a.max_reliability_pct && (!a.name || lc(v.name).includes(lc(a.name))));

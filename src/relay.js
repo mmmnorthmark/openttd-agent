@@ -25,6 +25,11 @@ export const AUDIT_FILE = path.join(CONFIG_DIR, 'relay-audit.jsonl');
 const PLAYER_GROUPS = new Set(['game', 'world', 'build', 'operate']); // anything else (setup, relay, future groups) is host-only
 const UNAUDITED_GROUPS = new Set(['world']);                         // read-only map/economy queries, called constantly
 const MAX_BODY_BYTES = 1_000_000;
+// Read-only commands a player may run for another company: what the game window shows anyone
+// (a rival's station list with waiting cargo and ratings; its vehicle counts per type in the
+// company window). The commands themselves trim a rival's view (stations: no vehicle counts;
+// vehicles: counts only). Everything else stays bound to the player's own company.
+export const RIVAL_READS = new Set(['stations', 'vehicles']);
 
 export class Refused extends Error {}
 
@@ -45,10 +50,12 @@ export function authorize(player, name, rawArgs = {}) {
       throw new Refused(`player '${player.name}' is not bound to a company yet. Ask the host to run: openttd-agent relay-set-company --name ${player.name} --company <id>. run: openttd-agent guide`);
     }
     const asked = args.company;
-    if (asked !== undefined && asked !== null && asked !== '' && Number(asked) !== player.company) {
-      throw new Refused(`player '${player.name}' is bound to company ${player.company} and cannot act as company ${asked}`);
+    const other = asked !== undefined && asked !== null && asked !== '' && Number(asked) !== player.company;
+    if (other && !RIVAL_READS.has(name)) {
+      throw new Refused(`player '${player.name}' is bound to company ${player.company} and cannot act as company ${asked}${RIVAL_READS.size ? ` (other companies can only be read with: ${[...RIVAL_READS].join(', ')}; companies lists all)` : ''}`);
     }
-    args.company = player.company;
+    if (other && !/^\d+$/.test(String(asked))) throw new Refused(`company must be a company id, got '${asked}'`);
+    args.company = other ? Number(asked) : player.company;
   }
   if (name === 'chat' && typeof args.message === 'string') args.message = `[${player.name}] ${args.message}`;
   return args;
