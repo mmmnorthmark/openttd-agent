@@ -185,6 +185,8 @@ Behaviour changes agents must know:
   `passing_loop` entries in `built[]`; a loop that does not fit is a warning. `loop-sites` also
   offers several positions on one long straight stretch. Live-tested: a 58-tile line with 2 loops,
   traced connected.
+- Fix: a new vehicle (or sign or group) with id 0 lost its id in exec results, so commands that
+  continue with the new vehicle (orders, start, wagons) could not.
 
 ## 0.6.0 (2026-11-25)
 

@@ -582,3 +582,12 @@ test('vehicle-problems rows carry as_of and days_watched; --fresh restarts the h
     assert.equal(f.problems.find((p) => p.problem === 'stopped_in_depot').days_watched, 0);
   } finally { fake.state.trainInDepot = false; }
 });
+
+test('execSummary keeps id 0 of a new vehicle (real runs only)', async () => {
+  const { execSummary } = await import('../src/operate.js');
+  const steps = [['veh_buy', 1, 1, 5, -1, -1], ['veh_start_stop', 0, 1]];
+  const reply = [{ cost: 10, money: 0, stopped: '' }, [true, 10, '', 0], [true, 0, '', 0]];
+  const real = execSummary(steps, [reply], false);
+  assert.deepEqual([real.results[0].value, real.results[1].value], [0, undefined]);
+  assert.equal(execSummary(steps, [reply], true).results[0].value, undefined);
+});

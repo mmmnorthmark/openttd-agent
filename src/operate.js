@@ -149,13 +149,16 @@ export function markDryRunSkips(steps, results) {
 }
 
 /** Summarise GS `exec` replies (one per batch) against the steps that were sent. */
+const ID_STEPS = new Set(['veh_buy', 'veh_clone', 'sign', 'group_create']);
+
 export function execSummary(steps, replies, dryRun) {
   const results = [];
   let cost = 0, money = null, stopped = '';
   for (const [summary, ...rows] of replies) {
     for (const [ok, c, error, value] of rows) {
       const step = steps[results.length];
-      results.push({ step: results.length, op: step[0], ok, cost: c, ...(error ? { error } : {}), ...(value ? { value } : {}) });
+      // value 0 is a real id for steps that create something (vehicle 0, sign 0, group 0).
+      results.push({ step: results.length, op: step[0], ok, cost: c, ...(error ? { error } : {}), ...(value || (!dryRun && ok && ID_STEPS.has(step[0]) && value === 0) ? { value } : {}) });
     }
     cost += summary.cost; money = summary.money; stopped = summary.stopped;
   }
