@@ -539,3 +539,19 @@ test('companies: period, station_count, vehicles_by_type; --history N quarters n
   const h = await run('companies', { history: 3 });
   assert.deepEqual(h.companies[0].history.map((q) => [q.period, q.value]), [['1949 Q4', 49000], ['1949 Q3', 48000], ['1949 Q2', 47000]]);
 });
+
+test('save --every_months: saves now, schedule shows, 0 stops; pause --save saves once paused', async () => {
+  const r = await run('save', { every_months: 3, prefix: 'night' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.first_save.name, 'night-1950-01.sav');
+  assert.equal(fake.state.rcons.at(-1), 'save night-1950-01');
+  assert.deepEqual((await run('save', {})).periodic.every_months, 3);
+  assert.equal((await run('save', { every_months: 0 })).stopped, true);
+  assert.equal((await run('save', {})).periodic, null);
+  await assert.rejects(run('save', { every_months: 1, prefix: '../x' }), /save name must be/);
+  const p = await run('pause', { save: 'paused-1' });
+  assert.equal(p.save.saved, 'paused-1.sav');
+  assert.equal(fake.state.rcons.at(-1), 'save paused-1');
+  assert.ok(fake.state.rcons.includes('pause'));
+  await run('unpause', {});
+});

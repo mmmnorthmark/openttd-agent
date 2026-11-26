@@ -72,6 +72,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const gameDate = (i) => `${i.year}-${String(i.month).padStart(2, '0')}-${String(i.day).padStart(2, '0')}`;
 
 /** Pause or unpause over the server console and wait until the game reports it. Returns the fresh GS info. */
+/** Console save of the running game (host). Returns the reply for `save`. */
+export async function saveGame(s, name) {
+  const out = await s.admin.rcon(`save ${name}`, 30000);
+  if (out.some((l) => /failed|error/i.test(l))) throw new Error(`server could not save '${name}': ${out.join(' ')}`);
+  return { saved: `${name}.sav`, path: `save/${name}.sav`, relative_to: 'the launch profile folder (launch printed it as profile_dir)', console: out,
+    load_with: `openttd-agent launch --mode dedicated --load ${name}` };
+}
+
 async function setPaused(s, want) {
   let info = await s.gs.call('info');
   if (info.paused === want) return info;
@@ -1191,12 +1199,13 @@ export const COMMANDS = [
   },
   {
     name: 'pause', group: 'host', session: true,
-    description: 'HOST ONLY: pause the game for everyone. The GameScript keeps answering, so agents can look and plan; whether they can also build while paused is `while_paused` in the result (games started or prepared by openttd-agent allow everything).',
-    args: z.object({}),
-    run: async (ctx) => {
+    description: 'HOST ONLY: pause the game for everyone (--save NAME also saves it then). The GameScript keeps answering, so agents can look and plan; whether they can also build while paused is `while_paused` in the result (games started or prepared by openttd-agent allow everything).',
+    args: z.object({ save: z.string().optional().describe('also save the game under this name once paused') }),
+    run: async (ctx, a) => {
       const s = await ctx.session();
+      const name = a.save !== undefined ? checkSaveName(a.save) : null;
       const info = await setPaused(s, true);
-      return { paused: info.paused, date: gameDate(info), ...(await pauseLevel(s)) };
+      return { paused: info.paused, date: gameDate(info), ...(await pauseLevel(s)), ...(name ? { save: await saveGame(s, name) } : {}) };
     },
   },
   {
@@ -1248,15 +1257,19 @@ export const COMMANDS = [
 
   {
     name: 'save', group: 'host', session: true,
-    description: "HOST ONLY: save the running server game over the console (`save <name>`). OpenTTD writes it to the launch profile's save folder (save/<name>.sav next to the profile's openttd.cfg); load it again with launch --load <name>. Name: letters, digits, _ . - only (no paths).",
-    args: z.object({ name: z.string().describe('save name without extension, e.g. game-night-1') }),
+    description: "HOST ONLY: save the running server game over the console (`save <name>`). OpenTTD writes it to the launch profile's save folder (save/<name>.sav next to the profile's openttd.cfg); load it again with launch --load <name>. Name: letters, digits, _ . - only (no paths). Periodic saves: --every_months N --prefix P makes the daemon save P-YYYY-MM every N game months (checked every 20 s while the game runs; also once now); --every_months 0 stops; with neither name nor every_months it shows the schedule. The schedule lives in the daemon (or MCP server) and ends when it restarts.",
+    args: z.object({ name: z.string().optional().describe('save name without extension, e.g. game-night-1'),
+      every_months: int().min(0).max(120).optional().describe('periodic save every N game months (0 = stop)'), prefix: z.string().default('autosave').describe('periodic save name prefix') }),
     run: async (ctx, a) => {
-      const name = checkSaveName(a.name);
       const s = await ctx.session();
-      const out = await s.admin.rcon(`save ${name}`, 30000);
-      if (out.some((l) => /failed|error/i.test(l))) throw new Error(`server could not save '${name}': ${out.join(' ')}`);
-      return { saved: `${name}.sav`, path: `save/${name}.sav`, relative_to: 'the launch profile folder (launch printed it as profile_dir)', console: out,
-        load_with: `openttd-agent launch --mode dedicated --load ${name}` };
+      if (a.every_months !== undefined) {
+        const prefix = checkSaveName(a.prefix);
+        if (a.every_months === 0) { s.stopAutoSave(); return { periodic: null, stopped: true }; }
+        const first = await s.startAutoSave({ everyMonths: a.every_months, prefix });
+        return { periodic: s.autoSaveStatus(), first_save: first };
+      }
+      if (a.name === undefined) return { periodic: s.autoSaveStatus() };
+      return saveGame(s, checkSaveName(a.name));
     },
   },
 

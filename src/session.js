@@ -29,6 +29,7 @@ export class Session {
     this.vehicleHistory = new Map(); // vehicle-problems progress samples
     this.stallHistory = new Map();   // vehicle-problems standstill samples
     this._watchTimers = new Map();   // company -> interval sampling vehicles for stall detection
+    this._autoSave = null;           // { everyMonths, prefix, lastMonth, last, timer } (save --every_months)
   }
 
   async connect() {
@@ -61,6 +62,7 @@ export class Session {
     clearInterval(this._refreshTimer);
     clearInterval(this._salesTimer);
     for (const t of this._watchTimers.values()) clearInterval(t);
+    this.stopAutoSave();
     this.admin?.close();
   }
 
@@ -213,6 +215,49 @@ export class Session {
     }, 15_000);
     t.unref?.();
     this._watchTimers.set(company, t);
+  }
+
+  // ---- periodic saves (host: save --every_months) ----------------------------------------
+
+  async _autoSaveNow(info) {
+    const a = this._autoSave;
+    const name = `${a.prefix}-${info.year}-${String(info.month).padStart(2, '0')}`;
+    const out = await this.admin.rcon(`save ${name}`, 30000);
+    if (out.some((l) => /failed|error/i.test(l))) throw new Error(`server could not save '${name}': ${out.join(' ')}`);
+    a.lastMonth = info.year * 12 + info.month;
+    a.last = { name: `${name}.sav`, at: new Date().toISOString() };
+    log.info('session', 'periodic save', { name });
+    return a.last;
+  }
+
+  /** Save now and then every `everyMonths` game months. Returns the first save. */
+  async startAutoSave({ everyMonths, prefix }) {
+    this.stopAutoSave();
+    this._autoSave = { everyMonths, prefix, lastMonth: 0, last: null, errors: 0, timer: null };
+    const first = await this._autoSaveNow(await this.gs.call('info'));
+    let busy = false;
+    this._autoSave.timer = setInterval(async () => {
+      const a = this._autoSave;
+      if (busy || !a) return;
+      busy = true;
+      try {
+        const info = await this.gs.call('info');
+        if (info.year * 12 + info.month - a.lastMonth >= a.everyMonths) await this._autoSaveNow(info);
+      } catch (e) { a.errors++; log.warn('session', 'periodic save failed', { error: e.message }); }
+      busy = false;
+    }, 20_000);
+    this._autoSave.timer.unref?.();
+    return first;
+  }
+
+  stopAutoSave() {
+    if (this._autoSave?.timer) clearInterval(this._autoSave.timer);
+    this._autoSave = null;
+  }
+
+  autoSaveStatus() {
+    const a = this._autoSave;
+    return a ? { every_months: a.everyMonths, prefix: a.prefix, last: a.last, errors: a.errors } : null;
   }
 
   /** Client-side throttle (max_builds_per_minute, 0 = off). Throws when over the limit. */

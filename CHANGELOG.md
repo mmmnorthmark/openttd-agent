@@ -144,6 +144,9 @@ Behaviour changes agents must know:
   quarter) and has `station_count` and `vehicles_by_type` {rail, road, water, air} (GS v12).
   `--history N` adds the last N quarters per company (`history[]`: period, value, income,
   expenses, delivered, performance; newest first).
+- Periodic saves (host): `save --every_months N --prefix P` saves now and then `P-YYYY-MM` every N
+  game months (the daemon checks every 20 s; `--every_months 0` stops; `save` alone shows the
+  schedule). `pause --save NAME` pauses and saves. Live-tested.
 
 ## 0.6.0 (2026-11-25)
 
