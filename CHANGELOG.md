@@ -26,6 +26,9 @@ Behaviour changes agents must know:
 - `build-signal --remove` on a tile without that signal returns `first_error: no_signal_here`
   (and names the signal the tile does have, if any) instead of a bare ERR_PRECONDITION_FAILED;
   nothing is sent to the game. Needs GameScript v9 to check; older ones run the step as before.
+- `vehicle-buy --attach_to TRAIN` first checks (also in a dry run) that the train is stopped in
+  that depot and refuses with `first_error: train_not_in_depot` and the fix; nothing is bought. If
+  the game still refuses to couple a wagon, the wagon is sold back at once (`sold_back`).
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

@@ -593,6 +593,24 @@ async function signalRemoveRefusal(s, a) {
   return `no_signal_here: no signal on (${a.x},${a.y}) facing trains from (${a.front_x},${a.front_y})${others.length ? `; it has one facing trains from ${others.join(' and ')}: give that as --front_x/--front_y` : '; the tile has no signals'}`;
 }
 
+/**
+ * vehicle-buy --attach_to: the train must be stopped inside the depot the wagon is bought in, or the
+ * game sells the wagon and then refuses to couple it. Returns the refusal text, or null.
+ */
+async function attachRefusal(s, company, a) {
+  const train = vehiclesFromRows(await s.gs.call('vehicles', { company })).find((v) => v.id === a.attach_to);
+  if (!train) return `refused: train ${a.attach_to} does not exist or is not yours (run: openttd-agent vehicles --type rail); nothing was bought`;
+  if (train.type !== 'rail') return `refused: vehicle ${a.attach_to} is a ${train.type} vehicle; only trains take wagons; nothing was bought`;
+  if (train.state !== 'in_depot') {
+    return `refused: train ${a.attach_to} is ${train.state.replace('_', ' ')} at (${train.x},${train.y}), not stopped in a depot, so a wagon cannot be attached; nothing was bought. `
+      + `Fix: vehicle-depot --vehicles ${a.attach_to}, wait until vehicles --state in_depot lists it, then buy the wagons at that depot`;
+  }
+  if (train.x !== a.depot_x || train.y !== a.depot_y) {
+    return `refused: train ${a.attach_to} is stopped in the depot at (${train.x},${train.y}), not at (${a.depot_x},${a.depot_y}); nothing was bought. Fix: vehicle-buy --depot_x ${train.x} --depot_y ${train.y} --attach_to ${a.attach_to} ...`;
+  }
+  return null;
+}
+
 /** Run exec steps as the company (client throttle + GS rate gate apply). */
 async function run(ctx, a, steps, opts = {}) {
   const { s, company } = await mine(ctx, a);
@@ -1335,15 +1353,27 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-buy', group: 'operate', session: true,
-    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>. New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one).',
+    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>; the train must be stopped in that depot (checked first, also in a dry run; a wagon the game will not couple is sold back). New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one).',
     args: z.object({ ...act, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1),
       route_of: int().optional().describe('rail: check the depot is joined to this vehicle\'s order stations first') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargo = cargoId(s.cargos, a.cargo) ?? -1;
       const check = a.route_of !== undefined ? await depotForRoute(s, company, { ...a, check_route: true }, a.route_of, { cmd: 'vehicle-buy' }) : null;
+      if (a.attach_to >= 0) {
+        const why = await attachRefusal(s, company, a);
+        if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: 'train_not_in_depot', vehicles: [], cost: 0, results: [] };
+      }
       const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_buy', a.depot_x, a.depot_y, a.engine, cargo, a.attach_to]));
-      return { ...res, vehicles: res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value), ...(check ? { route_check: check.route_check } : {}) };
+      // A wagon the game sold us but would not couple: sell it back at once (it is stopped in the depot).
+      const stray = res.results.filter((r) => !r.ok && r.value && /^bought vehicle \d+ but could not attach/.test(r.error ?? '')).map((r) => r.value);
+      let soldBack = null;
+      if (stray.length && !a.dry_run) {
+        const sale = await s.exec(company, stray.map((v) => ['veh_sell', v]), { keepGoing: true });
+        soldBack = { vehicles: stray, ok: sale.ok, income: -sale.cost, ...(sale.ok ? {} : { error: sale.error }) };
+      }
+      return { ...res, vehicles: res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value), ...(check ? { route_check: check.route_check } : {}),
+        ...(soldBack ? { sold_back: soldBack, error: `${res.error}; ${soldBack.ok ? `sold the wagon${stray.length > 1 ? 's' : ''} back (${stray.join(', ')})` : `selling ${stray.join(', ')} back failed too: sell ${stray.length > 1 ? 'them' : 'it'} with vehicle-sell`}` } : {}) };
     },
   },
   {

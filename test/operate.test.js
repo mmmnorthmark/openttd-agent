@@ -76,11 +76,24 @@ test('events: since filter and latest_seq', async () => {
 });
 
 test('vehicle-buy sends one step per vehicle and returns new ids; dry_run is passed on', async () => {
+  const refused = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 27, attach_to: 11, dry_run: true });
+  assert.deepEqual([refused.ok, refused.first_error], [false, 'train_not_in_depot']);
+  assert.match(refused.error, /not stopped in a depot.*vehicle-depot --vehicles 11/);
+  fake.state.trainInDepot = true;
   const res = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 27, cargo: 'wood', attach_to: 11, count: 3 });
   assert.equal(res.ok, true);
   assert.deepEqual(res.vehicles, [100, 101, 102]);
   assert.equal(res.cost, 30);
   assert.deepEqual(lastExec().steps[0], ['veh_buy', 13, 22, 27, 7, 11]);
+  assert.match((await run('vehicle-buy', { depot_x: 31, depot_y: 41, engine: 27, attach_to: 11 })).error, /stopped in the depot at \(13,22\), not at \(31,41\)/);
+  fake.state.attachFails = true;
+  try {
+    const back = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 27, attach_to: 11 });
+    assert.equal(back.ok, false);
+    assert.deepEqual(back.sold_back.vehicles, [100]);
+    assert.deepEqual(lastExec().steps, [['veh_sell', 100]]);
+    assert.match(back.error, /could not attach.*sold the wagon back \(100\)/);
+  } finally { fake.state.attachFails = false; fake.state.trainInDepot = false; }
   const dry = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, dry_run: true });
   assert.equal(dry.dry_run, true);
   assert.equal(lastExec().dry_run, true);

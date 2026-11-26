@@ -183,7 +183,8 @@ const GS = {
   ],
   // v9 rows end with [current_order, dest_x, dest_y, dest_station, speed].
   vehicles: (_a, state) => [
-    [11, 'Train 1', 0, 5, 'Kirby Paul Tank', 4000, 7300, 62, -1200, -3000, 9000, 0, 14, 20, 2, 2, 1, 800, false, 1, 13, 22, -1, 60],
+    // state.trainInDepot: train 11 is stopped in the depot at (13,22).
+    [11, 'Train 1', 0, 5, 'Kirby Paul Tank', 4000, 7300, 62, -1200, -3000, 9000, ...(state.trainInDepot ? [2, 13, 22] : [0, 14, 20]), 2, 2, 1, 800, false, 1, 13, 22, -1, state.trainInDepot ? 0 : 60],
     [12, 'Road Vehicle 1', 1, 9, 'MPS Regal Bus', 100, 5475, 98, 400, 2500, 4000, 3, 41, 9, 0xFFFE, 2, 1, 300, true, 0, 41, 9, 4, 0],
     ...(state.lostTrain ? [[13, 'Train 2', 0, 5, 'Kirby Paul Tank', 800, 7300, 90, -200, -900, 9000, 0, 30, 40, 2, 2, 2, 800, false, 0, 12, 20, 3, 40]] : []),
   ].map((r) => (state.gsVersion >= 9 ? r : r.slice(0, 19))),
@@ -242,6 +243,11 @@ const GS = {
         if (!rows.at(-1)[0] && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
         continue;
       }
+      if (st[0] === 'veh_buy' && st[5] >= 0 && state.attachFails && !a.dry_run) {
+        rows.push([false, 10, `bought vehicle ${100 + rows.length} but could not attach it to train ${st[5]}: ERR_UNKNOWN`, 100 + rows.length]);
+        if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+        continue;
+      }
       const bad = st[0] === 'bogus' || (st[0] === 'veh_sell' && st[1] === 404) || (!a.dry_run && state.failOps.includes(st[0]));
       rows.push(bad ? [false, 0, 'Vehicle not available', 0] : [true, 10, '', 100 + rows.length]);
       if (bad && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
@@ -254,7 +260,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], money: 100000, loan: 300000, gsVersion: 10, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, money: 100000, loan: 300000, gsVersion: 10, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null };
   const server = net.createServer((sock) => {
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));
