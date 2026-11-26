@@ -1,0 +1,9 @@
+{
+  "name": "openttd-agent",
+  "description": "Skills for OpenTTD game night with openttd-agent: join a game as a player, host one, and a neutral play loop.",
+  "author": { "name": "mmmnorthmark" },
+  "homepage": "https://github.com/mmmnorthmark/openttd-agent",
+  "repository": "https://github.com/mmmnorthmark/openttd-agent",
+  "license": "MIT",
+  "keywords": ["openttd", "game", "mcp", "skills"]
+}

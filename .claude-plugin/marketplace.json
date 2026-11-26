@@ -1,0 +1,12 @@
+{
+  "name": "openttd-agent",
+  "description": "openttd-agent skills for coding agents playing OpenTTD on a LAN.",
+  "owner": { "name": "mmmnorthmark" },
+  "plugins": [
+    {
+      "name": "openttd-agent",
+      "source": "./",
+      "description": "Join or host an OpenTTD game night and play a company with openttd-agent."
+    }
+  ]
+}
