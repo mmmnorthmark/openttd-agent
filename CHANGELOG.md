@@ -3,7 +3,9 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
-## (unreleased)
+## 0.4.0 (2026-11-25)
+
+Minor, not patch: `build-cargo-route` now refuses a route you already run unless `--allow_existing true`.
 
 - `vehicle-problems` rows carry `severity`: `action` (it cannot earn until fixed) or `info`
   (`broken_down`, `low_reliability`, `old`, `crashed`: leave a running train alone).
