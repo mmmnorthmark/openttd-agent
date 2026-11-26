@@ -337,3 +337,13 @@ test('towns --near_x/--near_y/--radius and --id; industries --id', async () => {
   const ind = await run('industries', { id: 2 });
   assert.deepEqual(ind.industries.map((i) => i.id), [2]);
 });
+
+test('build-cargo-route: town fallbacks; warnings for own stations near a new terminus', async () => {
+  const { siteFallbacks } = await import('../src/commands.js');
+  const f = siteFallbacks({ radius: 8, length: 4, platforms: 2 });
+  assert.deepEqual(f.map((o) => [o.radius, o.length, o.platforms]), [[8, 4, 2], [12, 4, 2], [12, 3, 2], [12, 3, 1], [16, 3, 1]]);
+  assert.equal(siteFallbacks({ radius: 8, length: 2, platforms: 1 }).length, 3);
+  const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true, allow_existing: true });
+  assert.equal(res.ok, true, JSON.stringify(res).slice(0, 400));
+  assert.ok(res.warnings.some((w) => w.near_own_station.id === 3 && w.end === 'source'), JSON.stringify(res.warnings));
+});

@@ -230,6 +230,16 @@ async function stationSites(s, company, end, toward, { platforms = 2, length = 4
     ...(sites.length ? {} : { hint: `no site passed: try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform` }) };
 }
 
+/** Terminus search options to try in order for a town end: as asked, wider, shorter, one platform, all three. */
+export function siteFallbacks(o) {
+  const out = [o, { ...o, radius: o.radius + 4 }, { ...o, radius: o.radius + 4, length: Math.max(2, o.length - 1) },
+    { ...o, radius: o.radius + 4, length: Math.max(2, o.length - 1), platforms: 1 }, { ...o, radius: o.radius + 8, length: Math.max(2, o.length - 1), platforms: 1 }];
+  return out.filter((q, i) => i === 0 || out.slice(0, i).every((p) => p.radius !== q.radius || p.length !== q.length || p.platforms !== q.platforms));
+}
+
+const fallbackNote = (asked, used) => ({ asked: { radius: asked.radius, length: asked.length, platforms: asked.platforms }, used: { radius: used.radius, length: used.length, platforms: used.platforms },
+  note: 'no terminus fitted as asked; this smaller or wider one did' });
+
 /**
  * build-line-depot: depot beside a straight piece of rail near `near` on `map` (default the mirror;
  * build-cargo-route passes a view with its planned line). Dry run checks the depot step only.
@@ -331,19 +341,29 @@ async function buildCargoRoute(s, company, a) {
   }
 
   // 1. Stations: best dry-run-checked site at each end, facing the other end, not overlapping.
+  // A town end that has no site (houses everywhere) is retried wider, shorter and with one platform.
   const opts = { platforms: a.platforms, length: a.length, radius: a.radius, limit: 3, railType };
-  const srcSites = await stationSites(s, company, from, to, opts);
-  const dstSites = await stationSites(s, company, to, from, opts);
-  if (!srcSites.sites.length) return fail('source_station', `no terminus site passed near ${srcSites.target}`, { hint_sites: srcSites.hint });
-  if (!dstSites.sites.length) return fail('dest_station', `no terminus site passed near ${dstSites.target}`, { hint_sites: dstSites.hint });
-  // Destination sites must accept the cargo (AgentBridge v7; null = not checkable, kept with a note).
+  const tries = (end) => (end.town === undefined ? [opts] : siteFallbacks(opts));
   const accepts = new Map();
-  for (const d of dstSites.sites) {
+  const acceptOf = async (d) => {
     const along = d.axis === 'y';
     const lists = await acceptanceAt(s, [[d.x, d.y]], { w: along ? d.platforms : d.length, h: along ? d.length : d.platforms, radius: 4, cargos: [cargo] });
-    accepts.set(d, lists ? (lists[0][0]?.acceptance ?? 0) : null);
+    return lists ? (lists[0][0]?.acceptance ?? 0) : null;
+  };
+  let srcSites = null, dstSites = null, accepting = [];
+  for (const o of tries(from)) {
+    srcSites = await stationSites(s, company, from, to, o);
+    if (srcSites.sites.length) { if (o !== opts) plan.source_fallback = fallbackNote(opts, o); break; }
   }
-  const accepting = dstSites.sites.filter((d) => accepts.get(d) === null || accepts.get(d) >= ACCEPTED);
+  if (!srcSites.sites.length) return fail('source_station', `no terminus site passed near ${srcSites.target}${from.town !== undefined ? ' (also tried wider, shorter and single-platform termini)' : ''}`, { hint_sites: srcSites.hint });
+  for (const o of tries(to)) {
+    dstSites = await stationSites(s, company, to, from, o);
+    // Destination sites must accept the cargo (AgentBridge v7; null = not checkable, kept with a note).
+    for (const d of dstSites.sites) accepts.set(d, await acceptOf(d));
+    accepting = dstSites.sites.filter((d) => accepts.get(d) === null || accepts.get(d) >= ACCEPTED);
+    if (accepting.length) { if (o !== opts) plan.dest_fallback = fallbackNote(opts, o); break; }
+  }
+  if (!dstSites.sites.length) return fail('dest_station', `no terminus site passed near ${dstSites.target}${to.town !== undefined ? ' (also tried wider, shorter and single-platform termini)' : ''}`, { hint_sites: dstSites.hint });
   if (!accepting.length) {
     return fail('dest_station', `no terminus site near ${dstSites.target} accepts ${cargoInfo?.name ?? a.cargo} (acceptance ${[...accepts.values()].join(', ')}; ${ACCEPTED} needed)`);
   }
@@ -352,6 +372,16 @@ async function buildCargoRoute(s, company, a) {
   if (!src) return fail('dest_station', 'every source and destination site overlap: the two ends are too close for two termini');
   plan.source_site = { target: srcSites.target, ...src };
   plan.dest_site = { target: dstSites.target, ...dst, acceptance: accepts.get(dst) };
+  // Warn when a new terminus lands next to one of our stations: often a second line to the same place.
+  const ownStations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+  const warnings = [];
+  for (const [end, site] of [['source', src], ['dest', dst]]) {
+    for (const st of ownStations) {
+      const d = tileDistance(st, site);
+      if (d <= 8) warnings.push({ near_own_station: { id: st.id, name: st.name, x: st.x, y: st.y }, end, tiles: d });
+    }
+  }
+  if (warnings.length) plan.warnings = warnings;
   if (accepts.get(dst) === null) plan.warning = `destination acceptance not checked: ${OLD_GS}`;
 
   // 2. Line between the anchors, planned on a view that already has both termini.
@@ -2106,7 +2136,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-cargo-route', group: 'build', session: true,
-    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. Refused (failed_step existing_route) when your rail stations near both ends are already served by one of your vehicles: clone that train instead, or --allow_existing true. Stations nobody serves (e.g. after selling the fleet) do not block it. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
+    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. A town end with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked). warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). Refused (failed_step existing_route) when your rail stations near both ends are already served by one of your vehicles: clone that train instead, or --allow_existing true. Stations nobody serves (e.g. after selling the fleet) do not block it. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
     args: z.object({
       ...act,
       from_industry: int().optional().describe('source industry id (see industries / find-cargo-pairs)'), from_town: z.string().optional().describe('source town id or name'),

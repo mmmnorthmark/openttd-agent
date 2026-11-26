@@ -160,6 +160,10 @@ Behaviour changes agents must know:
   `--near_x --near_y [--radius 60]` keeps sources near a tile.
 - `towns --near_x --near_y [--radius 50]` (rows gain `distance`, nearest first) and `--id`;
   `industries --id`.
+- `build-cargo-route`: a town end with no room for the terminus is retried with a wider search,
+  a shorter platform and one platform; `source_fallback` / `dest_fallback` say what was asked and
+  what worked (it failed with `no terminus site passed`). `warnings[]` lists your stations within
+  8 tiles of a new terminus (`near_own_station`, `end`, `tiles`). Live-tested (dry runs).
 
 ## 0.6.0 (2026-11-25)
 
