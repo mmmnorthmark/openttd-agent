@@ -458,3 +458,18 @@ test('vehicle-reverse: one veh_reverse step per vehicle; refused on an older Gam
   fake.state.gsVersion = 11;
   try { await assert.rejects(run('vehicle-reverse', { vehicles: '11' }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
 });
+
+test('rail-tiles: decoded pieces, signals, depot fronts, owner; tiles marks owners (v12)', async () => {
+  const res = await run('rail-tiles', { x0: 12, y0: 19, x1: 19, y1: 22 });
+  assert.equal(res.ok, true);
+  const at = (x, y) => res.tiles.find((t) => t.x === x && t.y === y);
+  assert.deepEqual(at(13, 20).tracks, ['x', 's', 'e']);
+  assert.deepEqual(at(18, 20).signals, [{ facing: 'from_sw', one_way: false }]);
+  assert.deepEqual(at(13, 22).front, { x: 13, y: 21 });
+  assert.equal(at(12, 20).kind, 'station');
+  assert.equal(at(14, 20).mine, true);
+  assert.equal((await run('rail-tiles', { x0: 12, y0: 19, x1: 19, y1: 22, mine: false })).tiles.length, 0);
+  const t = await run('tiles', { x0: 12, y0: 20, x1: 14, y1: 20 });
+  assert.match(t.rows[0].tiles, /\*/);
+  assert.match(t.legend, /owned by your company/);
+});

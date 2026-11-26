@@ -701,6 +701,19 @@ async function depotForRoute(s, company, a, id, { cmd }) {
   return { depot, route_check: coarse ? 'coarse_not_refuted' : 'connected', ...note };
 }
 
+const KIND_NAMES = { t: 'track', s: 'station', w: 'waypoint', d: 'depot', x: 'crossing', b: 'bridge', u: 'tunnel' };
+const PIECE_NAMES = [[1, 'x'], [2, 'y'], [4, 'n'], [8, 's'], [16, 'w'], [32, 'e']];
+const FROM_NAMES = ['from_sw', 'from_se', 'from_ne', 'from_nw']; // neighbour d: 0 +x (SW), 1 +y (SE), 2 -x (NE), 3 -y (NW)
+
+/** rail_tiles tile -> readable row for rail-tiles. Pure. */
+export function describeRailTile(t, company) {
+  const signals = [];
+  for (let d = 0; d < 4; d++) if (t.signals & (1 << (4 + d))) signals.push({ facing: FROM_NAMES[d], one_way: !!(t.signals & (1 << d)) });
+  return { x: t.x, y: t.y, kind: KIND_NAMES[t.kind] ?? t.kind, ...(t.tracks ? { tracks: PIECE_NAMES.filter(([b]) => t.tracks & b).map(([, n]) => n) } : {}),
+    ...(signals.length ? { signals } : {}), ...(t.kind === 'd' ? { front: { x: t.a, y: t.b } } : {}), ...(t.kind === 'b' || t.kind === 'u' ? { other_end: { x: t.a, y: t.b } } : {}),
+    ...(t.station >= 0 ? { station: t.station } : {}), rail_type: t.rail_type, owner: t.owner, mine: t.owner === company };
+}
+
 /**
  * Position for the "stop in depot" order of a vehicle being replaced: right after the next order
  * (from its current one) at which it unloads (unload, transfer or no_load flags), else after the
@@ -1321,19 +1334,41 @@ export const COMMANDS = [
   },
   {
     name: 'tiles', group: 'world', session: true,
-    description: 'Raw terrain mirror for a small rectangle: height, slope and class per tile (water, clear, trees, other=houses/objects, rail, road, station, industry...). Max 40x40.',
-    args: z.object({ x0: int(), y0: int(), x1: int(), y1: int(), refresh: bool().default(true) }),
+    description: 'Raw terrain mirror for a small rectangle: height, slope and class per tile (water, clear, trees, other=houses/objects, rail, road, station, industry...), and (AgentBridge v12) who owns it: "*" = your company, "#" = another company (rail rows in an area are not necessarily yours). Max 40x40.',
+    args: z.object({ ...who, x0: int(), y0: int(), x1: int(), y1: int(), refresh: bool().default(true) }),
     run: async (ctx, a) => {
       if ((a.x1 - a.x0 + 1) * (a.y1 - a.y0 + 1) > 1600) throw new Error('area too large; max 40x40 tiles');
       const s = await ctx.session();
+      const me = a.company ?? s.cfg.company;
       if (a.refresh) await s.refreshArea(a.x0, a.y0, a.x1, a.y1); else await s.ensureTiles();
+      let owners = null;
+      try { owners = new Map((await s.gs.call('tile_owners', { x0: a.x0, y0: a.y0, x1: a.x1, y1: a.y1 })).map(([x, y, o]) => [`${x},${y}`, o])); } catch (e) { if (!/unknown cmd/.test(e.message)) throw e; }
+      const mark = (x, y) => { const o = owners?.get(`${x},${y}`); return o === undefined ? '' : o === me ? '*' : '#'; };
       const rows = [];
       for (let y = a.y0; y <= a.y1; y++) {
         const r = [];
-        for (let x = a.x0; x <= a.x1; x++) r.push(`${s.map.classAt(x, y)}${s.map.heightAt(x, y)}${s.map.slopeAt(x, y) ? '/' : ''}`);
+        for (let x = a.x0; x <= a.x1; x++) r.push(`${s.map.classAt(x, y)}${s.map.heightAt(x, y)}${s.map.slopeAt(x, y) ? '/' : ''}${mark(x, y)}`);
         rows.push({ y, tiles: r.join(' ') });
       }
-      return { legend: 'class letter + height, "/" = sloped. w water c coast i industry s station r rail d road t trees f farm k rocks h rough b clear o other(houses/objects)', x0: a.x0, rows };
+      return { legend: `class letter + height, "/" = sloped${owners ? ', "*" = owned by your company, "#" = by another company' : ''}. w water c coast i industry s station r rail d road t trees f farm k rocks h rough b clear o other(houses/objects)`,
+        ...(owners ? {} : { owners: 'not shown: the running AgentBridge is older than v12' }), x0: a.x0, rows };
+    },
+  },
+
+  {
+    name: 'rail-tiles', group: 'world', session: true,
+    description: 'Exact rail on a small rectangle (max 32x32), one row per tile with rail: kind (track, station, waypoint, depot, crossing, bridge, tunnel), track pieces (x = along x, y = along y, n/s/e/w = the corner pieces), signals (facing trains that come from which side: from_sw/from_se/from_ne/from_nw, one_way true for one-way path signals), depot front, bridge/tunnel other end, station id, rail type and owner (mine true/false). --mine true keeps only your tiles. AgentBridge v9.',
+    args: z.object({ ...who, x0: int(), y0: int(), x1: int(), y1: int(), mine: bool().optional().describe('true: only your tiles; false: only other companies\' tiles') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      if ((a.x1 - a.x0 + 1) * (a.y1 - a.y0 + 1) > 1024) throw new Error('area too large; max 32x32 tiles');
+      let rows;
+      try { rows = await s.gs.call('rail_tiles', { x0: a.x0, y0: a.y0, x1: a.x1, y1: a.y1 }); } catch (e) {
+        if (/unknown cmd/.test(e.message)) throw new Error('refused: rail-tiles needs AgentBridge v9; the host re-runs install-gamescript and loads the game again');
+        throw e;
+      }
+      const tiles = rows.map(railTileFromRow).map((t) => describeRailTile(t, company)).filter((t) => a.mine === undefined || t.mine === a.mine);
+      return { company, ...listResult('tiles', tiles, tiles, 1024) };
     },
   },
 

@@ -120,6 +120,11 @@ Behaviour changes agents must know:
   within 16 tiles; fix: reverse one). Once vehicle-problems has run, the daemon samples the
   company's vehicles every 15 s, so one later call sees a stall. `stuck_or_lost` is not reported
   on top of a stall.
+- New `rail-tiles --x0 --y0 --x1 --y1` (max 32x32): per rail tile the kind, track pieces
+  (`x`, `y`, `n`, `s`, `e`, `w`), signals (`facing: from_sw|from_se|from_ne|from_nw`, `one_way`),
+  depot front, bridge/tunnel other end, station, rail type, owner and `mine`; `--mine true|false`
+  filters. `tiles` marks owned tiles (GS v12): `*` = your company, `#` = another company (agents
+  took other companies' rail for their own and dry runs failed with ERR_OWNED_BY_ANOTHER_COMPANY).
 
 ## 0.6.0 (2026-11-25)
 
