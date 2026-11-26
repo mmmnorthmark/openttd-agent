@@ -1535,9 +1535,26 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-depot', group: 'operate', session: true,
-    description: 'Send vehicles (comma-separated ids) to a depot: they stop there (needed before vehicle-sell). service=true = service only and carry on.',
+    description: 'Send vehicles (comma-separated ids) to a depot: they stop there (needed before vehicle-sell). service=true = service only and carry on. Safe to repeat: vehicles already heading to a depot are left alone (already_heading; sending again would cancel their depot order in OpenTTD) and ones already stopped in a depot are reported (already_in_depot). Failures say why (failed[].error: not_found, broken_down, loading_full_load, no_depot). AgentBridge v11; older ones only skip vehicles already in a depot.',
     args: z.object({ ...act, vehicles: ids(), service: bool().default(false) }),
-    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_depot', v, a.service]), { keepGoing: true }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const v11 = ((await s.gs.call('info')).bridge_version ?? 0) >= 11;
+      let send = a.vehicles;
+      const inDepot = [];
+      if (!v11) {
+        const rows = vehiclesFromRows(await s.gs.call('vehicles', { company }));
+        const parked = new Set(rows.filter((v) => v.state === 'in_depot').map((v) => v.id));
+        inDepot.push(...send.filter((v) => parked.has(v)));
+        send = send.filter((v) => !parked.has(v));
+      }
+      const res = send.length ? await run(ctx, a, send.map((v) => ['veh_depot', v, a.service]), { keepGoing: true })
+        : { ok: true, error: null, dry_run: a.dry_run, steps_total: 0, steps_done: 0, cost: 0, results: [] };
+      const by = (code) => res.results.filter((r) => r.ok && (v11 ? (r.value ?? 0) === code : code === 1)).map((r) => send[r.step]);
+      return { ...res, sent: by(1), already_heading: by(2), already_in_depot: [...inDepot, ...by(3)],
+        failed: res.results.filter((r) => !r.ok).map((r) => ({ vehicle: send[r.step], error: r.error ?? 'failed' })),
+        ...(v11 ? {} : { note: 'the running AgentBridge is older than v11: a vehicle already heading to a depot cannot be detected, and sending it again cancels its depot order' }) };
+    },
   },
   {
     name: 'vehicle-sell', group: 'operate', session: true,

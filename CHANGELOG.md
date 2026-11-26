@@ -56,6 +56,19 @@ Behaviour changes agents must know:
   player, when the host's relay runs another openttd-agent version. `doctor` adds
   `gamescript_warning`; `guide` (host) has a `gamescript-running` step. The CLI restarts a
   background daemon that runs another version (it kept serving old code after an update).
+- **GameScript v11** (the host re-runs `install-gamescript`; a running game picks it up when it is
+  loaded again): `road_tiles` query and a decoding `veh_depot` step.
+- `verify-route` traces road vehicles and road stops (GS v11): `--vehicle` picks rail or road by
+  vehicle type, a station pair picks by facilities (`--mode auto|rail|road`). Road gap reasons:
+  `no_road`, `road_not_joined`, `one_way_road`, `depot_not_joined`, `depot_entrance_faces_away`,
+  `stop_not_joined`, `stop_entrance_faces_away`, `other_owner_road`. With an older GameScript it is
+  refused with that reason (it used to give a wrong rail answer: `method: rail_tracks, connected:
+  false, first_gap: null`); ships and aircraft are refused too. `vehicle-problems` checks road
+  vehicles the same way (`road_trace` says whether it could).
+- `vehicle-depot` is safe to repeat (GS v11): vehicles already heading to a depot are left alone
+  (`already_heading`; a second send cancelled the depot order), ones already in a depot are
+  `already_in_depot`; failures are decoded in `failed[]` (`not_found`, `broken_down`,
+  `loading_full_load`, `crashed`, `no_depot`). Older GameScripts only skip vehicles in a depot.
 - Forgiving arguments: `--id` works for `--vehicle`; `--vehicle` and `--vehicles` stand in for
   each other (one id for `--vehicle`); `depots` and `engines` default to `--type rail`; a bad
   number says what it got (`--vehicle: expected number, received NaN (got "abc")`).

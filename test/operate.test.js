@@ -384,3 +384,21 @@ test('verify-route traces road vehicles and road stops (AgentBridge v11), refuse
     assert.match((await run('vehicle-problems', {})).road_trace, /^off: /);
   } finally { fake.state.gsVersion = 11; }
 });
+
+test('vehicle-depot: idempotent (already heading / in depot) and decoded failures', async () => {
+  fake.state.headingDepot = [12];
+  fake.state.brokenDown = [15];
+  fake.state.trainInDepot = true;
+  try {
+    const res = await run('vehicle-depot', { vehicles: '11,12,13,15,404' });
+    assert.deepEqual([res.sent, res.already_heading, res.already_in_depot], [[13], [12], [11]]);
+    assert.deepEqual(res.failed.map((f) => [f.vehicle, f.error.split(':')[0]]), [[15, 'broken_down'], [404, 'not_found']]);
+    assert.equal(res.ok, false);
+    assert.equal(res.first_error, 'broken_down');
+    fake.state.gsVersion = 10;
+    const old = await run('vehicle-depot', { vehicles: '11,13' });
+    assert.deepEqual([old.already_in_depot, old.sent], [[11], [13]]);
+    assert.deepEqual(lastExec().steps, [['veh_depot', 13, false]]);
+    assert.match(old.note, /older than v11/);
+  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 11; }
+});
