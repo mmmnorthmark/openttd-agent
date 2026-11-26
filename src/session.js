@@ -125,7 +125,7 @@ export class Session {
    * Run state-changing steps through the GS `exec` command (see main.nut ExecStep).
    * Steps go in batches that fit one admin packet; a failed batch stops the rest.
    */
-  async exec(company, steps, { dryRun = false, keepGoing, railType, roadType } = {}) {
+  async exec(company, steps, { dryRun = false, keepGoing, railType, roadType, timeoutMs } = {}) {
     const replies = [];
     for (let i = 0; i < steps.length;) {
       let n = 0, bytes = 0;
@@ -135,7 +135,7 @@ export class Session {
         company, steps: steps.slice(i, i + n), dry_run: dryRun,
         ...(keepGoing !== undefined ? { keep_going: keepGoing } : {}),
         ...(railType !== undefined ? { rail_type: railType } : {}), ...(roadType !== undefined ? { road_type: roadType } : {}),
-      }, 30000 + n * 1000);
+      }, timeoutMs ?? 30000 + n * 1000);
       replies.push(reply);
       if (reply[0].stopped) break;
       i += n;

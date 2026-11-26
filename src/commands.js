@@ -1576,7 +1576,8 @@ export const COMMANDS = [
       const { s, company } = await mine(ctx, a);
       checkLandRect(r, { sizeX: s.info.map_x, sizeY: s.info.map_y });
       if (!a.dry_run) s.throttleBuild();
-      const res = await s.exec(company, [['buy_land', r.x0, r.y0, r.x1, r.y1]], { dryRun: a.dry_run });
+      // One DoCommand per tile, each waiting about a tick for the server: allow ~150 ms a tile.
+      const res = await s.exec(company, [['buy_land', r.x0, r.y0, r.x1, r.y1]], { dryRun: a.dry_run, timeoutMs: 30000 + r.tiles * 150 });
       const row = res.results[0];
       if (row?.error?.startsWith('unknown exec op')) throw new Error(OLD_GS_LAND);
       const area = [r.x0, r.y0, r.x1, r.y1];
