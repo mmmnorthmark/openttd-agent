@@ -125,6 +125,10 @@ Behaviour changes agents must know:
   depot front, bridge/tunnel other end, station, rail type, owner and `mine`; `--mine true|false`
   filters. `tiles` marks owned tiles (GS v12): `*` = your company, `#` = another company (agents
   took other companies' rail for their own and dry runs failed with ERR_OWNED_BY_ANOTHER_COMPANY).
+- `vehicle-buy` builds a whole working train in one call: `--wagon W --wagons N` attaches N
+  wagons to each new locomotive, `--orders A,B` (station ids or names) with `--order_flags
+  "full_load_any;unload,no_load"` (one set per order, or one for all) gives the orders (more
+  vehicles share them), `--start true` starts them. Flags and stations are checked before buying.
 
 ## 0.6.0 (2026-11-25)
 

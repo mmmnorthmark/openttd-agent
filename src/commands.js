@@ -701,6 +701,19 @@ async function depotForRoute(s, company, a, id, { cmd }) {
   return { depot, route_check: coarse ? 'coarse_not_refuted' : 'connected', ...note };
 }
 
+/** --orders "A,B" + --order_flags "f1;f2" -> [{ station, name, x, y, flags, flag_names }]. Pure over decoded stations. */
+export function orderPlan(stations, ordersText, flagsText = '') {
+  const refs = String(ordersText).split(',').map((t) => t.trim()).filter(Boolean);
+  if (!refs.length) throw new Error('--orders needs at least one station id or name');
+  const sets = String(flagsText).split(';').map((t) => t.trim());
+  if (sets.length > 1 && sets.length !== refs.length) throw new Error(`--order_flags has ${sets.length} sets for ${refs.length} orders; give one set per order separated by ";", or one set for all`);
+  return refs.map((ref, i) => {
+    const st = findStation(stations, ref);
+    const names = sets.length > 1 ? sets[i] : sets[0];
+    return { station: st.id, name: st.name, x: st.x, y: st.y, flags: encodeOrderFlags(names), flag_names: names.split(',').map((t) => t.trim()).filter(Boolean) };
+  });
+}
+
 const KIND_NAMES = { t: 'track', s: 'station', w: 'waypoint', d: 'depot', x: 'crossing', b: 'bridge', u: 'tunnel' };
 const PIECE_NAMES = [[1, 'x'], [2, 'y'], [4, 'n'], [8, 's'], [16, 'w'], [32, 'e']];
 const FROM_NAMES = ['from_sw', 'from_se', 'from_ne', 'from_nw']; // neighbour d: 0 +x (SW), 1 +y (SE), 2 -x (NE), 3 -y (NW)
@@ -1711,12 +1724,17 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-buy', group: 'operate', session: true,
-    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>; the train must be stopped in that depot (checked first, also in a dry run; a wagon the game will not couple is sold back). New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one).',
+    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>; the train must be stopped in that depot (checked first, also in a dry run; a wagon the game will not couple is sold back). New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one). One call for a whole train: --wagon W --wagons N attaches N wagons of engine W to each new locomotive (refitted to cargo); --orders A,B (station ids or names) gives the new vehicles those orders (the first gets them, the others share them; with attach_to, the train attach_to gets them), --order_flags sets flags per order separated by ";" (e.g. "full_load_any;unload,no_load"; one set applies to every order), --start true starts them.',
     args: z.object({ ...act, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1),
-      route_of: int().optional().describe('rail: check the depot is joined to this vehicle\'s order stations first') }),
+      route_of: int().optional().describe('rail: check the depot is joined to this vehicle\'s order stations first'),
+      wagon: int().optional().describe('wagon engine id to attach to each new locomotive'), wagons: int().min(0).max(60).default(0),
+      orders: z.string().optional().describe('comma-separated station ids or names, in order'), order_flags: z.string().default('').describe('flags per order separated by ";", or one set for all'),
+      start: bool().default(false) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargo = cargoId(s.cargos, a.cargo) ?? -1;
+      if (a.wagons > 0 && a.wagon === undefined) throw new Error('give --wagon ENGINE_ID with --wagons N (see engines --wagons true)');
+      const plan = a.orders ? orderPlan(stationsFromRows(await s.gs.call('stations', { company }), s.cargos), a.orders, a.order_flags) : null;
       const check = a.route_of !== undefined ? await depotForRoute(s, company, { ...a, check_route: true }, a.route_of, { cmd: 'vehicle-buy' }) : null;
       if (a.attach_to >= 0) {
         const why = await attachRefusal(s, company, a);
@@ -1730,7 +1748,22 @@ export const COMMANDS = [
         const sale = await s.exec(company, stray.map((v) => ['veh_sell', v]), { keepGoing: true });
         soldBack = { vehicles: stray, ok: sale.ok, income: -sale.cost, ...(sale.ok ? {} : { error: sale.error }) };
       }
-      return { ...res, vehicles: res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value), ...(check ? { route_check: check.route_check } : {}),
+      const bought = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
+      let setup = null;
+      if (res.ok && !a.dry_run && (plan || a.start || a.wagons > 0)) {
+        const heads = a.attach_to >= 0 ? [a.attach_to] : bought;
+        const steps = [];
+        if (a.attach_to < 0) for (const v of heads) for (let i = 0; i < a.wagons; i++) steps.push(['veh_buy', a.depot_x, a.depot_y, a.wagon, cargo, v]);
+        if (plan && heads.length) {
+          for (const o of plan) steps.push(['order_add', heads[0], o.x, o.y, o.flags, -1]);
+          for (const v of heads.slice(1)) steps.push(['orders_copy', v, heads[0], true]);
+        }
+        if (a.start) for (const v of heads) steps.push(['veh_start_stop', v, 1]);
+        setup = await s.exec(company, steps);
+        Object.assign(res, { cost: res.cost + setup.cost, ok: setup.ok, error: setup.ok ? res.error : `bought ${bought.join(', ')}; then: ${setup.error} (the vehicles are stopped in the depot)`, ...(setup.ok ? {} : { first_error: setup.first_error }) });
+      }
+      return { ...res, vehicles: bought, ...(check ? { route_check: check.route_check } : {}),
+        ...(plan ? { orders: plan.map((o) => ({ station: o.station, name: o.name, flags: o.flag_names })) } : {}), ...(setup ? { setup: { ok: setup.ok, steps: setup.steps_total ?? setup.results?.length } , started: a.start && setup.ok } : {}),
         ...(soldBack ? { sold_back: soldBack, error: `${res.error}; ${soldBack.ok ? `sold the wagon${stray.length > 1 ? 's' : ''} back (${stray.join(', ')})` : `selling ${stray.join(', ')} back failed too: sell ${stray.length > 1 ? 'them' : 'it'} with vehicle-sell`}` } : {}) };
     },
   },

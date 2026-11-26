@@ -473,3 +473,16 @@ test('rail-tiles: decoded pieces, signals, depot fronts, owner; tiles marks owne
   assert.match(t.rows[0].tiles, /\*/);
   assert.match(t.legend, /owned by your company/);
 });
+
+test('vehicle-buy: wagons, orders and start in one call', async () => {
+  const res = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, wagon: 27, wagons: 2, cargo: 'wood', orders: '3,Sawmill Halt', order_flags: 'full_load_any;unload,no_load', start: true });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const steps = lastExec().steps;
+  const v = res.vehicles[0];
+  assert.deepEqual(steps.filter((x) => x[0] === 'veh_buy').map((x) => x.slice(3)), [[27, 7, v], [27, 7, v]]);
+  assert.deepEqual(steps.filter((x) => x[0] === 'order_add').map((x) => x.slice(1)), [[v, 12, 20, 96, -1], [v, 24, 20, 4 | 128, -1]]);
+  assert.deepEqual(steps.at(-1), ['veh_start_stop', v, 1]);
+  assert.deepEqual(res.orders.map((o) => o.station), [3, 5]);
+  assert.equal(res.started, true);
+  await assert.rejects(run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, orders: '3,5', order_flags: 'a;b;c' }), /3 sets for 2 orders/);
+});
