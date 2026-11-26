@@ -63,7 +63,19 @@ function printHelp() {
   process.stdout.write(lines.join('\n') + '\n');
 }
 
+// Built-ins handled in main(), not in the command registry.
+const BUILTIN_HELP = {
+  mcp: 'mcp [--tools a,b,c] [--compact true]: MCP server on stdio. --tools serves only those commands; --compact returns single-line JSON.',
+  daemon: 'daemon: run the local background connection in the foreground (normally auto-started by the first command).',
+  'daemon-stop': 'daemon-stop: stop the local background connection. Run it after updating openttd-agent; the next command starts a fresh one.',
+  relay: 'relay [--port 47978] [--bind ADDR]: HOST ONLY. The only admin-port client; players connect with tokens (relay-add-player).',
+  batch: 'batch: run JSON lines from stdin, one {"name": ..., "args": {...}} per line; one JSON result per line, carries on after a failure and exits 1 if any failed.',
+  commands: 'commands: every command with its JSON argument schema.',
+  version: 'version: print the package version.',
+};
+
 function printCommandHelp(name) {
+  if (BUILTIN_HELP[name]) return void process.stdout.write(BUILTIN_HELP[name] + '\n');
   const c = describeCommands().find((x) => x.name === name);
   if (!c) throw new Error(`unknown command '${name}'. Run: openttd-agent help`);
   const props = c.args.properties ?? {};

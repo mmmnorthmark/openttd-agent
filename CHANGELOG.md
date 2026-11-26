@@ -10,6 +10,8 @@ re-run `install-gamescript` when it changes.
   `--severity action|info` filters; the reply adds `vehicles_needing_action`. The fixes for
   breakdowns and low reliability no longer suggest a plain `vehicle-depot`, which stopped working
   trains in the depot (an agent then restarted them, over and over, in a live game).
+- Fix: `--help` on the built-ins (`daemon-stop`, `daemon`, `mcp`, `relay`, `batch`, `commands`,
+  `version`) said "unknown command".
 
 ## 0.3.0 (2026-11-25)
 
