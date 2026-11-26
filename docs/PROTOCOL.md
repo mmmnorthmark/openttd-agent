@@ -68,7 +68,8 @@ GS commands: `ping`, `info`, `echo`, `companies`, `cargos`, `towns`, `industries
 `industry_types`, `dump_tiles`, `get_rate`, `set_rate`, `airport_types`, `check_airport`,
 `test_build_road`, `build_road`, `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`,
 `autorenew`, `events`, `exec`, `rail_types`, `bridge_types`, `goal_set`, `goal_status`, `goal_clear`, `acceptance` (v7),
-`rail_tiles` (v9).
+`rail_tiles` (v9), `owned_land` (v10: `{company, points: [[x, y], ...]}` -> indices of the points
+that are the company's owned land).
 Row formats are documented in `gamescript/AgentBridge/main.nut`.
 
 ## exec
@@ -89,6 +90,12 @@ Every state change (vehicles, orders, groups, construction) is one **step** in a
 - `loan` (v8): `["loan", "set", loan]`, `["loan", "add", delta]` (negative = repay) or
   `["loan", "max", 0]`. The target loan is rounded up to the loan interval; refused below 0, over
   `max_loan`, or when the bank balance would go below 0. Row value = the target loan.
+- `buy_land` (v10): `["buy_land", x0, y0, x1, y1]` with x0 <= x1, y0 <= y1 buys every tile as
+  owned land (`GSObjectType.BuildObject(3, 0, tile)`, one tile per call). It checks every tile
+  first and refuses the whole rectangle (other company, industry, town building, infrastructure,
+  water, objects, or already yours), then estimates in test mode and refuses if the game would
+  refuse a tile or the bank balance is short; only then it buys row by row from x0,y0.
+  Row value = tiles bought; a failure while buying says how many were bought before it.
 - Step formats are listed in `ExecStep` in main.nut. The client keeps a request under ~7 kB and 150 steps.
 
 ## events

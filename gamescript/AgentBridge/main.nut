@@ -61,12 +61,13 @@ class AgentBridge extends GSController {
 			goal_set = "CmdGoalSet",
 			goal_status = "CmdGoalStatus",
 			goal_clear = "CmdGoalClear",
+			owned_land = "CmdOwnedLand",
 		};
 	}
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v9 started");
+	GSLog.Info("AgentBridge v10 started");
 	this.RestoreGoals();
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
@@ -224,7 +225,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 9,
+		bridge_version = 10,
 		event_seq = this.event_seq,
 		goals = this.goals.len(),
 	};
@@ -1150,6 +1151,8 @@ function AgentBridge::ExecStep(company, s, dry) {
 			}
 			return [true, done];
 		}
+		// [op, x0, y0, x1, y1] (v10), x0 <= x1, y0 <= y1: buy every tile as owned land; refuses the whole rectangle first
+		case "buy_land": return this.BuyLandStep(company, s[1], s[2], s[3], s[4], dry);
 		// [op, x0, y0, x1, y1]: corner points; everything is levelled to the height of the north corner of x0,y0
 		case "level": return [GSTile.LevelTiles(this.T(s[1], s[2]), this.T(s[3], s[4])), 0];
 		// [op, x, y, corners]: bitmask 1 west, 2 south, 4 east, 8 north (15 = whole tile)
@@ -1219,6 +1222,94 @@ function AgentBridge::DemolishRefusal(company, tile, allow_houses) {
 	if (owner != GSCompany.COMPANY_INVALID && owner != company) return "belongs to company " + owner;
 	if (owner == GSCompany.COMPANY_INVALID && (GSRoad.IsRoadTile(tile) || GSTile.IsStationTile(tile) || GSBridge.IsBridgeTile(tile) || GSTunnel.IsTunnelTile(tile))) return "is town or public infrastructure";
 	return null;
+}
+
+// ---- Owned land (v10) -------------------------------------------------------------
+// The GS API has no "object type at tile". Owned land of `company` is detected as: owned by the
+// company, no rail/road/water transport, not a station, not buildable (so an object tile), and a
+// test-mode demolish succeeds with a cost <= 0 (owned land is the only base object that is both
+// removable and pays back when cleared: ObjectFlag::ClearIncome; HQ and statues cannot be removed).
+// Needs GSCompanyMode(company) on the stack. A removable NewGRF object with clear income would also match.
+function AgentBridge::IsOwnLand(company, tile) {
+	if (GSTile.GetOwner(tile) != company) return false;
+	if (GSTile.IsStationTile(tile) || GSTile.IsBuildable(tile) || GSTile.IsWaterTile(tile)) return false;
+	if (GSTile.HasTransportType(tile, GSTile.TRANSPORT_RAIL) || GSTile.HasTransportType(tile, GSTile.TRANSPORT_ROAD) || GSTile.HasTransportType(tile, GSTile.TRANSPORT_WATER)) return false;
+	local test = GSTestMode();
+	local acc = GSAccounting(); // nested: restores the caller's running cost when it goes out of scope
+	local ok = GSTile.DemolishTile(tile);
+	return ok && acc.GetCosts() <= 0;
+}
+
+// Why the company may not buy this tile as owned land, or null if it may.
+function AgentBridge::BuyLandRefusal(company, tile) {
+	if (!GSMap.IsValidTile(tile)) return "is outside the map";
+	if (GSIndustry.IsValidIndustry(GSIndustry.GetIndustryID(tile))) return "is part of an industry";
+	if (GSTile.IsHouseTile(tile)) return "is a town building";
+	local owner = GSTile.GetOwner(tile);
+	if (owner == company) return this.IsOwnLand(company, tile) ? "is already your owned land" : "is already your property";
+	if (owner != GSCompany.COMPANY_INVALID) return "belongs to company " + owner;
+	if (GSTile.HasTransportType(tile, GSTile.TRANSPORT_RAIL) || GSTile.HasTransportType(tile, GSTile.TRANSPORT_ROAD) || GSTile.IsStationTile(tile) || GSBridge.IsBridgeTile(tile) || GSTunnel.IsTunnelTile(tile)) return "is town or public infrastructure";
+	if (GSTile.IsWaterTile(tile)) return "is water";
+	if (!GSTile.IsBuildable(tile)) return "is not clear land (an object or structure)";
+	return null;
+}
+
+// Test-mode cost of buying every tile; error = first tile the game would refuse, or null.
+function AgentBridge::BuyLandEstimate(x0, y0, x1, y1) {
+	local test = GSTestMode();
+	local acc = GSAccounting();
+	for (local y = y0; y <= y1; y++) {
+		for (local x = x0; x <= x1; x++) {
+			if (!GSObjectType.BuildObject(3, 0, this.T(x, y))) return { cost = 0, error = "tile " + x + "," + y + ": " + this.Str(GSError.GetLastErrorString()) };
+		}
+	}
+	return { cost = acc.GetCosts(), error = null };
+}
+
+// Object type 3 = OBJECT_OWNED_LAND ("Purchase land for future use"), one tile per BuildObject.
+// Order: check every tile (refuse all, buy nothing), then a test-mode estimate (refuse all if the
+// game would refuse a tile or the cash is short), then buy row by row from x0,y0.
+// value: tiles bought. A failure while buying reports how many were bought before it.
+function AgentBridge::BuyLandStep(company, x0, y0, x1, y1, dry) {
+	local total = (x1 - x0 + 1) * (y1 - y0 + 1);
+	local bad = "";
+	local n_bad = 0;
+	for (local y = y0; y <= y1; y++) {
+		for (local x = x0; x <= x1; x++) {
+			local why = this.BuyLandRefusal(company, this.T(x, y));
+			if (why == null) continue;
+			n_bad++;
+			if (n_bad <= 6) bad += (n_bad > 1 ? "; " : "") + x + "," + y + " " + why;
+		}
+	}
+	if (n_bad > 0) return [false, 0, "refused: " + n_bad + " of " + total + " tiles cannot be bought, nothing was bought: " + bad + (n_bad > 6 ? "; ..." : "")];
+	local est = this.BuyLandEstimate(x0, y0, x1, y1);
+	if (est.error != null) return [false, 0, "refused: " + est.error + "; nothing was bought"];
+	if (!dry) {
+		local cash = GSCompany.GetBankBalance(company);
+		if (est.cost > cash) return [false, 0, "refused: " + total + " tiles cost about " + est.cost + ", bank balance is " + cash + "; nothing was bought"];
+	}
+	local done = 0;
+	for (local y = y0; y <= y1; y++) {
+		for (local x = x0; x <= x1; x++) {
+			if (!GSObjectType.BuildObject(3, 0, this.T(x, y))) return [false, done, "tile " + x + "," + y + ": " + this.Str(GSError.GetLastErrorString()) + " (" + done + " tiles bought before it)"];
+			done++;
+		}
+	}
+	return [true, done];
+}
+
+// args: company, points = [[x, y], ...]. Returns the indices of the points that are the company's owned land.
+function AgentBridge::CmdOwnedLand(args) {
+	local company = this.CheckCompany(args);
+	local mode = GSCompanyMode(company);
+	local out = [];
+	for (local i = 0; i < args.points.len(); i++) {
+		local p = args.points[i];
+		local tile = GSMap.GetTileIndex(p[0], p[1]);
+		if (GSMap.IsValidTile(tile) && this.IsOwnLand(company, tile)) out.append(i);
+	}
+	return out;
 }
 
 // args: company. Rail types the company can build. Rows: [id, name, max_speed (0 = no limit), track_cost_per_tile]
