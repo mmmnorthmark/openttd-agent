@@ -3,6 +3,24 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
+## (unreleased)
+
+- `guide [--role host|player]`: read-only setup checklist as JSON: `role`, ordered `steps`
+  (`done` true, false, or null when it cannot tell; `command`; `why`) and `next`, the first step
+  still to do. The role defaults to player when a relay is configured, host when an admin password
+  or launch profile exists, else both. It checks the config, `doctor`, whether the server answers
+  (`companies`, through the running daemon if there is one), the local relay, registered players
+  and their bindings, goals, and for a player the relay, its version and `status`. Every probe has
+  a short timeout; it starts and stops nothing and prints no tokens or passwords. Also an MCP tool.
+- `save --name <name>` (host only, refused through the relay): saves the running server game over
+  the console into the launch profile's `save/<name>.sav`; load it with `launch --load <name>`.
+  Names with path separators, `..` or a leading `.` are refused.
+- MCP instructions and the `help` header tell agents to run `guide` first when not connected or
+  without a company; errors for no server, no admin password, no company, an unreachable relay,
+  a bad token and an unbound player now end with "run: openttd-agent guide".
+- README: Game night rewritten as numbered Host and Each player checklists, with prerequisites,
+  firewall ports, finding the LAN IP, a note on sharing a company with an agent, and troubleshooting.
+
 ## 0.4.0 (2026-11-25)
 
 Minor, not patch: `build-cargo-route` now refuses a route you already run unless `--allow_existing true`.
