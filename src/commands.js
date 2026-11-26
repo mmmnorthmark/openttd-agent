@@ -11,6 +11,7 @@ import { doctor, installGamescript, launch, checkSaveName, TERRAIN_TYPES } from 
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
+import { guide } from './guide.js';
 import { addPlayer, listPlayers, removePlayer, updatePlayer, PLAYERS_FILE } from './relay-players.js';
 import { vehicleTypeId, cargoId, stationsFromRows, vehiclesFromRows, enginesFromRows, groupsFromRows, vehicleDetail,
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
@@ -567,6 +568,12 @@ export const COMMANDS = [
     description: 'Check this machine: OpenTTD install, personal dir, original graphics/music, GameScript version. Run first.',
     args: z.object({}),
     run: () => doctor(),
+  },
+  {
+    name: 'guide', group: 'setup', session: false,
+    description: "Read-only checklist for game night: role, ordered steps (done true/false/null = can't tell), and next = the first step still to do. Run it first when you are not connected or have no company yet, and follow next. Probes are quick and change nothing; no secrets in the output.",
+    args: z.object({ role: z.enum(['host', 'player']).optional().describe('default: player if a relay is configured, host if an admin password or launch profile exists, else both') }),
+    run: (ctx, a) => guide(ctx, a.role),
   },
   {
     name: 'install-gamescript', group: 'setup', session: false,
