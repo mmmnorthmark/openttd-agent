@@ -30,6 +30,7 @@ export class Session {
     this.jobLog = [];               // finished pending jobs, last 50
     this.vehicleHistory = new Map(); // vehicle-problems progress samples
     this.stallHistory = new Map();   // vehicle-problems standstill samples
+    this.depotHistory = new Map();   // vehicle-problems: since when a vehicle stands in a depot
     this._watchTimers = new Map();   // company -> interval sampling vehicles for stall detection
     this._autoSave = null;           // { everyMonths, prefix, lastMonth, last, timer } (save --every_months)
   }
@@ -177,29 +178,29 @@ export class Session {
       const where = new Map(rows.map((r) => [r[0], { x: r[12], y: r[13] }]));
       for (const [k, p] of this.pendingSales) {
         if (p.company !== company) continue;
-        if (!state.has(p.vehicle)) { this.pendingSales.delete(k); out.gone.push(p.vehicle); continue; }
-        if (state.get(p.vehicle) !== 2) { out.waiting.push(p.vehicle); continue; }
+        if (!state.has(p.vehicle)) { this.pendingSales.delete(k); out.gone.push({ company, vehicle: p.vehicle }); continue; }
+        if (state.get(p.vehicle) !== 2) { out.waiting.push({ company, vehicle: p.vehicle }); continue; }
         const res = await this.exec(company, [['veh_sell', p.vehicle]]);
-        if (res.ok) { this.pendingSales.delete(k); out.sold.push({ vehicle: p.vehicle, income: -res.cost, replaced_by: p.replaced_by }); log.info('session', 'sold replaced vehicle', { company, vehicle: p.vehicle, income: -res.cost }); } else out.waiting.push(p.vehicle);
+        if (res.ok) { this.pendingSales.delete(k); out.sold.push({ company, vehicle: p.vehicle, income: -res.cost, replaced_by: p.replaced_by }); log.info('session', 'sold replaced vehicle', { company, vehicle: p.vehicle, income: -res.cost }); } else out.waiting.push({ company, vehicle: p.vehicle });
       }
       for (const [k, p] of this.pendingWagons) {
         if (p.company !== company) continue;
-        if (!state.has(p.vehicle)) { this.pendingWagons.delete(k); out.gone.push(p.vehicle); continue; }
+        if (!state.has(p.vehicle)) { this.pendingWagons.delete(k); out.gone.push({ company, vehicle: p.vehicle }); continue; }
         if (state.get(p.vehicle) !== 2) {
           if (!p.sent) { const r = await this.exec(company, [['veh_depot', p.vehicle, false]]); if (r.ok) p.sent = true; }
-          out.waiting.push(p.vehicle);
+          out.waiting.push({ company, vehicle: p.vehicle });
           continue;
         }
-        this.pendingWagons.delete(k);
         const depot = p.depot ?? where.get(p.vehicle); // a vehicle in a depot is on the depot tile
         const res = await this.exec(company, [...Array.from({ length: p.count }, () => ['veh_buy', depot.x, depot.y, p.wagon, p.cargo, p.vehicle]), ['veh_start_stop', p.vehicle, 1]], { keepGoing: true });
+        this.pendingWagons.delete(k); // only once the request answered: a timeout keeps the job for the next check
         const added = res.results.filter((r) => r.op === 'veh_buy' && r.ok).length;
         // A wagon the game sold but would not couple (the train was not stopped there after all): sell it back.
         const stray = res.results.filter((r) => r.op === 'veh_buy' && !r.ok && r.value && /could not attach/.test(r.error ?? '')).map((r) => r.value);
         const soldBack = stray.length ? await this.exec(company, stray.map((v) => ['veh_sell', v]), { keepGoing: true }) : null;
         const entry = { vehicle: p.vehicle, wagons_added: added, of: p.count, cost: res.cost + (soldBack?.cost ?? 0), restarted: res.results.at(-1)?.ok ?? false,
           ...(res.ok ? {} : { error: res.error }), ...(stray.length ? { sold_back: stray, sold_back_ok: soldBack.ok } : {}) };
-        out.wagons_added.push(entry);
+        out.wagons_added.push({ company, ...entry });
         this.jobLog.push({ t: new Date().toISOString(), company, kind: 'add_wagons', ...entry });
         log.info('session', 'added wagons', { company, ...entry });
       }

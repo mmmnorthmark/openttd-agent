@@ -407,14 +407,14 @@ export function loopSites(path, railAt, classAt, { length = 6, minGap = 8 } = {}
 /**
  * Pick n loop sites spread along a line: for target positions (i+1)/(n+1) of the path, the free
  * candidate (loopSites, no problem) nearest to it, keeping chosen loops at least length + 6 path
- * tiles apart. Returns the chosen candidates (may be fewer than n).
+ * tiles apart (footprints of length + 4 never overlap). Returns the chosen candidates (may be fewer than n).
  */
 export function spreadLoops(cands, n, pathLen, length) {
   const free = cands.filter((c) => !c.problem);
   const chosen = [];
   for (let i = 0; i < n; i++) {
     const target = ((i + 1) * pathLen) / (n + 1);
-    const pick = free.filter((c) => chosen.every((q) => Math.abs(q.path_index - c.path_index) > length + 6))
+    const pick = free.filter((c) => chosen.every((q) => Math.abs(q.path_index - c.path_index) >= length + 6))
       .sort((p, q) => Math.abs(p.path_index - target) - Math.abs(q.path_index - target))[0];
     if (pick) chosen.push(pick);
   }

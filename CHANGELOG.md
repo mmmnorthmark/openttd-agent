@@ -203,6 +203,12 @@ Behaviour changes agents must know:
   ways (`verify`). Every placement is dry-run first; `--dry_run true` returns `estimated_cost`.
   Live-tested: coal mine to power station, 25 road tiles, 2 trucks, verify connected both ways,
   the first truck loaded coal and left.
+- Review fixes in this batch: build-cargo-route sizes the default train for the shorter platform
+  (a fallback can shorten one end); vehicle-replace points the old vehicle back at the order it was
+  heading for after its orders are copied; parked days and `--finish` results work per company
+  through the relay; `deadlock` ignores trains queued within 4 tiles of their destination;
+  `signs` / `sign-remove` list only your own signs; a wagon job survives a timed-out request;
+  `--passing_loops` can use neighbouring sites on one long straight.
 
 ## 0.6.0 (2026-11-25)
 

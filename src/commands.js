@@ -312,6 +312,9 @@ async function countLoops(tracer, path) {
   return Math.floor(points / 2);
 }
 
+/** finishSales() result trimmed to one company (the relay serves several players from one session). */
+const forCompany = (r, company) => Object.fromEntries(Object.entries(r).map(([k, list]) => [k, list.filter((e) => e.company === company).map(({ company: _c, ...rest }) => rest)]));
+
 /** Terminus search options to try in order for a town end: as asked, wider, shorter, one platform, all three. */
 export function siteFallbacks(o) {
   const out = [o, { ...o, radius: o.radius + 4 }, { ...o, radius: o.radius + 4, length: Math.max(2, o.length - 1) },
@@ -492,7 +495,7 @@ async function buildCargoRoute(s, company, a) {
   const engines = enginesFromRows(await s.gs.call('engines', { company, type: 0, cargo, rail_type: railType }), s.cargos);
   let train;
   try { train = pickTrain(engines, { cargoId: cargo, engine: a.engine, wagon: a.wagon }); } catch (e) { return fail('engine', e.message); }
-  const wagons = a.wagons ?? defaultWagons(src.length);
+  const wagons = a.wagons ?? defaultWagons(Math.min(src.length, dst.length)); // a fallback can shorten one end
   plan.train = { locomotive: { id: train.loco.id, name: train.loco.name, price: train.loco.price, running_cost: train.loco.running_cost },
     wagon: { id: train.wagon.id, name: train.wagon.name, price: train.wagon.price, capacity: train.wagon.capacity }, wagons,
     cost: train.loco.price + wagons * train.wagon.price };
@@ -512,6 +515,7 @@ async function buildCargoRoute(s, company, a) {
       plan.passing_loops.push({ x: c.x, y: c.y, dir: c.dir, side: c.side, length: loopLength, position_pct: Math.round((100 * c.path_index) / planned.path.length), cost: dry.cost, ...(dry.ok ? {} : { dry_run_error: dry.error }) });
       loopCost += dry.cost;
     }
+    plan.passing_loops_note = 'sites on the planned line; the real build picks them again on the built track (positions can move a few tiles); cost counts the loop track only';
     if (picks.length < a.passing_loops) (plan.warnings ??= []).push({ passing_loops: `only ${picks.length} of ${a.passing_loops} loops fit on straight stretches of the planned line (each needs ${loopLength + 4} straight tiles)` });
   }
   const estimate = src.cost + dst.cost + lineCheck.cost + depotCheck.cost + plan.train.cost + loopCost;
@@ -1105,6 +1109,8 @@ async function replaceOne(s, company, a, id, v12) {
       oldSteps.push(['order_flags', id, pos - 1, encodeOrderFlags([...keep, 'no_load'].join(','))]);
     }
     oldSteps.push(['order_add', id, depot.x, depot.y, 8, pos]);
+    // A copied order list may restart at order 0: point it back at the order it was heading for.
+    if (d.current_order >= 0) oldSteps.push(['order_skip', id, d.current_order < pos ? d.current_order : d.current_order + 1]);
   }
   let oldRes = { ok: true };
   if (d.state !== 'in_depot') oldRes = await s.exec(company, oldSteps);
@@ -1780,7 +1786,7 @@ export const COMMANDS = [
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       await needV12(s, 'sign-remove');
-      const mineSigns = (await s.gs.call('signs', { company })).map(([id, x, y, owner, text]) => ({ id, x, y, owner, text }));
+      const mineSigns = (await s.gs.call('signs', { company })).map(([id, x, y, owner, text]) => ({ id, x, y, owner, text })).filter((g) => g.owner === company);
       let pick;
       if (a.ids) pick = a.ids;
       else if (a.x !== undefined && a.y !== undefined) pick = mineSigns.filter((g) => g.x === a.x && g.y === a.y).map((g) => g.id);
@@ -1798,7 +1804,7 @@ export const COMMANDS = [
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       await needV12(s, 'signs');
-      const all = (await s.gs.call('signs', { company })).map(([id, x, y, , text]) => ({ id, x, y, text }));
+      const all = (await s.gs.call('signs', { company })).filter((r) => r[3] === company).map(([id, x, y, , text]) => ({ id, x, y, text }));
       return listResult('signs', all, all.filter((g) => !a.text || lc(g.text).includes(lc(a.text))), a.limit);
     },
   },
@@ -1935,14 +1941,15 @@ export const COMMANDS = [
       const stationById = new Map(stations.map((st) => [st.id, st]));
       s.vehicleHistory ??= new Map();
       s.stallHistory ??= new Map();
-      s.depotHistory ??= new Map();
       if (a.fresh) for (const h of [s.vehicleHistory, s.stallHistory, s.depotHistory]) for (const k of [...h.keys()]) if (k.startsWith(`${company}:`)) h.delete(k);
       for (const v of vehicles) {
         const k = `${company}:${v.id}`;
         if (v.state !== 'in_depot') s.depotHistory.delete(k); else if (!s.depotHistory.has(k)) s.depotHistory.set(k, info.date);
       }
       const stalls = new Map(vehicles.map((v) => [v.id, recordStall(s.stallHistory, `${company}:${v.id}`, { date: info.date, x: v.x, y: v.y, speed: v.speed, state: v.state })]));
-      const longStalled = vehicles.filter((v) => { const e = stalls.get(v.id); return e && info.date - e.since >= a.stall_days && e.samples >= 2; });
+      // Trains queued just before their destination (behind one loading) are not a deadlock.
+      const nearDest = (v) => v.dest && tileDistance(v, v.dest) <= 4;
+      const longStalled = vehicles.filter((v) => { const e = stalls.get(v.id); return e && info.date - e.since >= a.stall_days && e.samples >= 2 && !nearDest(v); });
       const partners = deadlockPartners(longStalled);
       s.watchVehicles?.(company);
       const railTracer = a.trace ? await makeTracer(s, company, info) : null;
@@ -2266,7 +2273,7 @@ export const COMMANDS = [
       finish: bool().default(false).describe('only sell replaced vehicles that have stopped in a depot; no new replacements') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      if (a.finish) return { ...(await s.finishSales()), pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
+      if (a.finish) return { ...forCompany(await s.finishSales(), company), pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
       if (!a.vehicles) throw new Error('give --vehicles A,B (or --finish true)');
       const v12 = ((await s.gs.call('info')).bridge_version ?? 0) >= 12;
       const replaced = [];
@@ -2326,7 +2333,7 @@ export const COMMANDS = [
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       if (a.finish) {
-        const done = await s.finishSales();
+        const done = forCompany(await s.finishSales(), company);
         return { wagons_added: done.wagons_added, pending: [...s.pendingWagons.values()].filter((p) => p.company === company), recent: s.jobLog.filter((j) => j.company === company && j.kind === 'add_wagons').slice(-10) };
       }
       if (a.vehicle === undefined || a.wagons === undefined) throw new Error('give --vehicle ID and --wagons N (or --finish true)');

@@ -1500,7 +1500,7 @@ function AgentBridge::CmdStationVehicles(args) {
 		local ids = [];
 		foreach (v, _ in GSVehicleList_Station(st)) {
 			ids.append(v);
-			if (ids.len() >= 150) { out.append([st, ids]); ids = []; }
+			if (ids.len() >= 120) { out.append([st, ids]); ids = []; }
 		}
 		if (ids.len() > 0 || out.len() == 0 || out[out.len() - 1][0] != st) out.append([st, ids]);
 	}
