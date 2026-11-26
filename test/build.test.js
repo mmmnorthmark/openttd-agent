@@ -188,3 +188,66 @@ test('find-cargo-pairs pairs passengers town with town; names feed build-cargo-r
   const withEffort = await run('find-cargo-pairs', { cargo: 'passengers', limit: 1 });
   assert.equal(typeof withEffort.pairs[0].route.reachable, 'boolean');
 });
+
+test('purchase-land: dry run normalises corners, estimates cost and buys nothing', async () => {
+  const res = await run('purchase-land', { x0: 13, y0: 32, x1: 10, y1: 30, dry_run: true });
+  assert.deepEqual(lastExec().steps, [['buy_land', 10, 30, 13, 32]]);
+  assert.equal(lastExec().dry_run, true);
+  assert.equal(lastExec().company, 0);
+  assert.deepEqual(res, { ok: true, dry_run: true, company: 0, area: [10, 30, 13, 32], tiles: 12, estimated_cost: 600, money: 100000, affordable: true });
+  assert.equal(fake.state.land.size, 0);
+  await assert.rejects(run('purchase-land', { x0: 0, y0: 0, x1: 20, y1: 19, dry_run: true }), /area too large: 21x20 = 420 tiles; purchase-land buys at most 400/);
+  await assert.rejects(run('purchase-land', { x0: 60, y0: 0, x1: 64, y1: 1 }), /outside the map/);
+});
+
+test('purchase-land buys, refuses the whole rectangle on protected tiles, and owned-land lists the plots', async () => {
+  try {
+    const res = await run('purchase-land', { x0: 10, y0: 30, x1: 13, y1: 32 });
+    assert.deepEqual(res, { ok: true, dry_run: false, company: 0, area: [10, 30, 13, 32], tiles_bought: 12, cost: 600, money: res.money });
+    assert.equal(fake.state.land.size, 12);
+    // houses at 40..44,10..14, already-owned tiles and another company's tile: nothing is bought
+    fake.state.landOwnedBy['20,30'] = 1;
+    const refused = await run('purchase-land', { x0: 38, y0: 9, x1: 41, y1: 10 });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.tiles_bought, 0);
+    assert.match(refused.error, /^refused: 2 of 8 tiles cannot be bought, nothing was bought: 40,10 is a town building; 41,10 is a town building/);
+    const again = await run('purchase-land', { x0: 13, y0: 32, x1: 14, y1: 32, dry_run: true });
+    assert.match(again.error, /13,32 is already your owned land/);
+    assert.match((await run('purchase-land', { x0: 20, y0: 30, x1: 20, y1: 30 })).error, /20,30 belongs to company 1/);
+    assert.match((await run('purchase-land', { x0: 30, y0: 5, x1: 30, y1: 5 })).error, /30,5 is water/);
+    assert.equal(fake.state.land.size, 12);
+    // a later plot touching the first one, then the listing merges rows into rectangles
+    await run('purchase-land', { x0: 10, y0: 33, x1: 13, y1: 33 });
+    await run('purchase-land', { x0: 50, y0: 50, x1: 50, y1: 50 });
+    const owned = await run('owned-land', {});
+    assert.equal(owned.company, 0);
+    assert.equal(owned.tiles, 17);
+    assert.deepEqual(owned.rects, [[10, 30, 13, 33], [50, 50, 50, 50]]);
+    const part = await run('owned-land', { x0: 12, y0: 31, x1: 11, y1: 30 });
+    assert.deepEqual(part, { company: 0, area: [11, 30, 12, 31], tiles: 4, rects: [[11, 30, 12, 31]] });
+    assert.deepEqual((await run('owned-land', { limit: 1 })).truncated, true);
+    await assert.rejects(run('owned-land', { x0: 1, y0: 1 }), /give all of --x0 --y0 --x1 --y1/);
+  } finally { fake.state.land.clear(); fake.state.landOwnedBy = {}; }
+});
+
+test('purchase-land reports a failure while buying: what was bought and the failed tile', async () => {
+  fake.state.landFailAt = '12,41';
+  try {
+    const res = await run('purchase-land', { x0: 10, y0: 40, x1: 13, y1: 42 });
+    assert.equal(res.ok, false);
+    assert.equal(res.tiles_bought, 6);
+    assert.deepEqual(res.bought, [[10, 40, 13, 40], [10, 41, 11, 41]]);
+    assert.deepEqual(res.failed_tile, { x: 12, y: 41 });
+    assert.equal(res.not_bought, 6);
+    assert.match(res.error, /tile 12,41: .*\(6 tiles bought before it\)/);
+    assert.equal(fake.state.land.size, 6);
+  } finally { fake.state.landFailAt = null; fake.state.land.clear(); }
+});
+
+test('owned land commands explain an older AgentBridge', async () => {
+  fake.state.gsVersion = 9;
+  try {
+    await assert.rejects(run('purchase-land', { x0: 1, y0: 1, x1: 2, y1: 2, dry_run: true }), /older than v10/);
+    await assert.rejects(run('owned-land', {}), /older than v10/);
+  } finally { fake.state.gsVersion = 10; }
+});

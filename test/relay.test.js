@@ -106,6 +106,19 @@ test('host-only commands are refused for players', async () => {
   assert.equal(players.listPlayers().some((p) => p.name === 'eve'), false);
 });
 
+test('owned land through the relay: purchase-land and owned-land act as the player\'s company', async () => {
+  const buy = await call(tokens.carol, 'purchase-land', { x0: 3, y0: 3, x1: 2, y1: 2, dry_run: true });
+  assert.equal(buy.ok, true);
+  assert.equal(buy.result.company, 1);
+  assert.deepEqual(fake.received.at(-1).args.steps, [['buy_land', 2, 2, 3, 3]]);
+  assert.equal(fake.received.at(-1).args.company, 1);
+  assert.equal((await call(tokens.alice, 'purchase-land', { x0: 2, y0: 2, x1: 3, y1: 3, company: 1 })).status, 403);
+  const owned = await call(tokens.carol, 'owned-land', {});
+  assert.equal(owned.ok, true);
+  assert.equal(owned.result.company, 1);
+  assert.equal((await call(tokens.alice, 'owned-land', { company: 1 })).status, 403);
+});
+
 test('goal-status is served, as the player\'s own company only', async () => {
   const mine = await call(tokens.alice, 'goal-status');
   assert.equal(mine.ok, true);

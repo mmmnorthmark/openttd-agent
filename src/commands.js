@@ -20,6 +20,7 @@ import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOr
 import { traceRail, adjacencyTrace, mirrorStationTiles, railTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
+import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
 
 const int = () => z.coerce.number().int();
 const num = () => z.coerce.number();
@@ -123,6 +124,26 @@ async function acceptanceAt(s, points, { w = 1, h = 1, radius = 4, cargos } = {}
 const OLD_GS = 'the running AgentBridge is older than v7 and has no acceptance query; the host runs install-gamescript and reloads the game';
 
 const OLD_GS_LOAN = 'the running AgentBridge is older than v8 and has no loan step; the host re-runs install-gamescript and loads the game again';
+
+const OLD_GS_LAND = 'the running AgentBridge is older than v10 and has no owned-land support; the host re-runs install-gamescript and loads the game again';
+
+/**
+ * Which of these tiles are the company's owned land (GS `owned_land`, AgentBridge v10), as a Set of
+ * "x,y". Returns null when the running GameScript is older and lacks the command.
+ */
+async function ownedLandAt(s, company, points) {
+  const owned = new Set();
+  try {
+    for (let i = 0; i === 0 || i < points.length; i += 400) { // at least one call, so an older GS is noticed
+      const part = points.slice(i, i + 400);
+      for (const k of await s.gs.call('owned_land', { company, points: part })) owned.add(`${part[k][0]},${part[k][1]}`);
+    }
+  } catch (e) {
+    if (/unknown cmd/.test(e.message)) return null;
+    throw e;
+  }
+  return owned;
+}
 
 /** Loan, max_loan and bank balance of one company (GS `companies`). */
 async function loanState(s, company) {
@@ -1537,6 +1558,59 @@ export const COMMANDS = [
       if ((xs[1] - xs[0] + 1) * (ys[1] - ys[0] + 1) > 400) throw new Error('area too large; max 400 tiles per call');
       const res = await run(ctx, a, [['demolish', xs[0], ys[0], xs[1], ys[1], a.allow_houses]]);
       return { ...res, tiles_cleared: res.results[0]?.value ?? 0 };
+    },
+  },
+
+  {
+    name: 'purchase-land', group: 'build', session: true,
+    description: `Buy the rectangle x0,y0..x1,y1 (any two opposite corners) as owned land ("Purchase land for future use"), so nobody else builds there; your own airports, stations and track can still be built on it. At most ${MAX_LAND_TILES} tiles per call. Refuses the whole rectangle, buying nothing, if any tile belongs to another company, is an industry, a town building, road/rail/station, water or an object, is already yours, or the money is short; the error lists the tiles and why. dry_run=true returns the tile count and estimated_cost and changes nothing. A failure while buying reports bought (rectangles) and failed_tile. Needs AgentBridge v10. Example: --x0 10 --y0 20 --x1 13 --y1 22 --dry_run true`,
+    args: z.object({ ...act, x0: int(), y0: int(), x1: int(), y1: int() }),
+    run: async (ctx, a) => {
+      const r = normaliseRect(a);
+      checkLandRect(r);
+      const { s, company } = await mine(ctx, a);
+      checkLandRect(r, { sizeX: s.info.map_x, sizeY: s.info.map_y });
+      if (!a.dry_run) s.throttleBuild();
+      const res = await s.exec(company, [['buy_land', r.x0, r.y0, r.x1, r.y1]], { dryRun: a.dry_run });
+      const row = res.results[0];
+      if (row?.error?.startsWith('unknown exec op')) throw new Error(OLD_GS_LAND);
+      const area = [r.x0, r.y0, r.x1, r.y1];
+      const error = row?.error ?? res.stopped ?? (res.ok ? undefined : 'failed');
+      if (a.dry_run) {
+        return res.ok ? { ok: true, dry_run: true, company, area, tiles: r.tiles, estimated_cost: res.cost, money: res.money, affordable: res.cost <= res.money }
+          : { ok: false, dry_run: true, company, area, tiles: r.tiles, error };
+      }
+      const n = row?.value ?? 0;
+      if (n > 0) await s.refreshArea(r.x0, r.y0, r.x1, r.y1);
+      if (res.ok) return { ok: true, dry_run: false, company, area, tiles_bought: n, cost: res.cost, money: res.money };
+      if (n === 0) return { ok: false, dry_run: false, company, area, tiles: r.tiles, tiles_bought: 0, error };
+      const { bought, next } = boughtRects(r, n);
+      return { ok: false, dry_run: false, company, area, tiles: r.tiles, tiles_bought: n, bought, failed_tile: next, not_bought: r.tiles - n, cost: res.cost, money: res.money, error,
+        hint: 'the bought tiles stay yours; fix the cause and run purchase-land again on the rest (already-owned tiles are refused, so give only the unbought part)' };
+    },
+  },
+  {
+    name: 'owned-land', group: 'world', session: true,
+    description: 'Your owned land (bought with purchase-land or in the game window): count and rectangles [x0,y0,x1,y1]. Whole map by default (from the map mirror, which can lag a few seconds behind the game); give x0,y0,x1,y1 to check a rectangle fresh. Needs AgentBridge v10.',
+    args: z.object({ ...who, x0: int().optional(), y0: int().optional(), x1: int().optional(), y1: int().optional(),
+      limit: int().min(1).default(50).describe('most rectangles to return') }),
+    run: async (ctx, a) => {
+      const corners = ['x0', 'y0', 'x1', 'y1'].filter((k) => a[k] !== undefined);
+      if (corners.length && corners.length < 4) throw new Error('give all of --x0 --y0 --x1 --y1, or none for the whole map');
+      const { s, company } = await mine(ctx, a);
+      let r;
+      if (corners.length) {
+        r = normaliseRect(a);
+        await s.refreshArea(r.x0, r.y0, r.x1, r.y1);
+      } else {
+        await s.ensureTiles();
+        r = normaliseRect({ x0: 0, y0: 0, x1: s.map.sizeX - 1, y1: s.map.sizeY - 1 });
+      }
+      const owned = await ownedLandAt(s, company, ownedLandCandidates(s.map, r));
+      if (!owned) throw new Error(OLD_GS_LAND);
+      const rects = mergeTiles([...owned].map((k) => k.split(',').map(Number)));
+      return { company, area: [r.x0, r.y0, r.x1, r.y1], tiles: owned.size, rects: rects.slice(0, a.limit),
+        ...(rects.length > a.limit ? { rects_total: rects.length, truncated: true } : {}) };
     },
   },
 
