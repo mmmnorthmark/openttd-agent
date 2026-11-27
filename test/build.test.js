@@ -168,6 +168,21 @@ test('build-cargo-route traces the built line both ways: route_broken when it do
   } finally { fake.state.newStations = null; }
 });
 
+test('build-cargo-route: no terminus site says what was tried and why (C8, L4)', async () => {
+  fake.state.stationError = 'ERR_FLAT_LAND_REQUIRED';
+  try {
+    const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true });
+    assert.deepEqual([res.ok, res.failed_step, res.first_error], [false, 'source_station', 'no_terminus_site']);
+    assert.equal(res.no_site.tried.length, 5, 'an industry end gets the fallbacks too');
+    assert.deepEqual(res.no_site.tried.at(-1), { radius: 16, length: 3, platforms: 1 });
+    assert.ok(res.no_site.rejected.ERR_FLAT_LAND_REQUIRED > 0);
+    assert.ok(res.no_site.candidates_on_map > 0);
+    assert.deepEqual(res.no_site.own_station_near.map((st) => st.id), [3, 5], 'Bigton Woods is next to the forest');
+    assert.match(res.no_site.hint, /not tried yet: --radius 20, --length 2; your station Bigton Woods \(3\).*--reuse_stations auto/);
+    assert.match(res.error, /candidate spots on the map, \d+ dry runs over 5 size\/radius options \(rejected: ERR_FLAT_LAND_REQUIRED \d+\)/);
+  } finally { fake.state.stationError = null; }
+});
+
 test('build-cargo-route stops at a failed step and reports what was built', async () => {
   fake.state.failOps = ['veh_buy'];
   const before = execs().length;
