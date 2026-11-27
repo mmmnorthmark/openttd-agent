@@ -130,3 +130,31 @@ test('money_after on every game action, also in brief; reads have none', async (
   assert.equal(road.money_after, road.money, 'a GS reply with money is used as is');
   assert.equal((await run('stations', {})).money_after, undefined);
 });
+
+test('overview: one small snapshot with events since a seq', async () => {
+  const o = await run('overview', {});
+  assert.equal(o.ok, true, JSON.stringify(o));
+  assert.match(o.date, /^\d{4}-\d\d-\d\d$/);
+  assert.equal(o.money, fake.state.money);
+  assert.equal(o.max_loan, 500000);
+  assert.match(o.fleet, /^2 \(rail 1, road 1\)/);
+  assert.equal(o.vehicle_lines.length, 2);
+  assert.match(o.vehicle_lines[0], /^11 #\d+ rail -1.2k\/-3k/);
+  assert.equal(o.stations_total, 4);
+  assert.match(o.depots, /rail 3, road 1/);
+  assert.ok(Array.isArray(o.problems));
+  assert.equal(o.latest_seq, 2);
+  assert.equal(o.events_new, 2);
+  assert.equal(o.goal, null);
+  assert.ok(JSON.stringify(o).length < 2048, `overview is ${JSON.stringify(o).length} bytes`);
+  const next = await run('overview', { since: 2, problems: false });
+  assert.equal(next.events_new, 0);
+  assert.equal(next.problems, undefined);
+});
+
+test('overview shows the goal in one line', async () => {
+  await run('goal-set', { deadline_year: 1954, targets: 'wood:3000,VALUE:100000' });
+  try {
+    assert.match((await run('overview', { problems: false })).goal, /^active: WOOD 0\/3k \(0%\), VALUE .*deadline 1954/);
+  } finally { await run('goal-clear', {}); }
+});

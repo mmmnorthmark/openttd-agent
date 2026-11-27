@@ -2264,6 +2264,51 @@ export const COMMANDS = [
     },
   },
 
+  {
+    name: 'overview', group: 'operate', session: true,
+    description: 'One small per-turn snapshot instead of status + goal-status + companies + stations + vehicles + depots + events + vehicle-problems: date, paused, money/loan/max_loan/value/profit (last quarter), goal (one line), fleet (one line: counts per type and state, profit, loss makers), vehicle_lines (worst by profit last year), station_lines (lowest rating first), depots, problems (vehicle-problems rows with severity action, one line each), rivals (one line per other company), events since --since (yours, world news and company news; one line each) and latest_seq (pass it as --since next turn). Lines are capped (*_total says how many there are); use the full commands for detail.',
+    args: z.object({ ...who, since: int().min(0).default(0).describe('events after this seq (latest_seq of the last overview); 0 = the newest only'),
+      vehicle_lines: int().min(0).default(6), station_lines: int().min(0).default(10), event_lines: int().min(0).default(8),
+      problems: bool().default(true).describe('run the vehicle-problems checks (rail/road traces; about 1 s on a mid-size company)') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const [info, companyRows, goalRows, stationRows, vehicleRows, events, ...depotRows] = await Promise.all([
+        s.gs.call('info'), s.gs.call('companies'), s.gs.call('goal_status', { company }), s.gs.call('stations', { company }), s.gs.call('vehicles', { company }),
+        s.gs.call('events', { since: a.since }), ...VEHICLE_TYPES.map((t) => s.gs.call('depots', { company, type: vehicleTypeId(t) })),
+      ]);
+      const me = meFromCompanies(companyRows, company);
+      const stations = stationsFromRows(stationRows, s.cargos);
+      const names = new Map(stations.map((st) => [st.id, st.name]));
+      const vehicles = vehiclesFromRows(vehicleRows);
+      const minRating = (st) => Math.min(101, ...st.cargo.map((c) => c.rating_pct));
+      const depots = VEHICLE_TYPES.map((t, i) => [t, depotRows[i]]).filter(([, rows]) => rows.length)
+        .map(([t, rows]) => `${t} ${rows.length}${rows.some((r) => r[2] > 0) ? ` (${rows.reduce((n, r) => n + r[2], 0)} vehicles inside)` : ''}`).join(', ') || 'none';
+      let problems = null;
+      if (a.problems) {
+        const vp = COMMANDS_BY_NAME.get('vehicle-problems');
+        problems = (await vp.run(ctx, vp.args.parse({ company, severity: 'action' }))).problems;
+      }
+      const COMPANY_NEWS = /^company_/;
+      const seen = events.filter((e) => e.company === undefined || e.company === company || COMPANY_NEWS.test(e.type));
+      const cap = (list, n) => list.slice(Math.max(0, list.length - n));
+      return {
+        company, date: dateString(info), paused: info.paused,
+        ...(me ? { money: me.money, loan: me.loan, max_loan: me.max_loan, value: me.value, profit_last_quarter: me.profit, performance: me.performance } : {}),
+        goal: goalRows.length ? goalLine(goalFromRow(goalRows[0])) : null,
+        fleet: fleetLine(vehicles),
+        vehicles_total: vehicles.length,
+        vehicle_lines: [...vehicles].sort((p, q) => p.profit_last_year - q.profit_last_year).slice(0, a.vehicle_lines).map((v) => shortVehicleLine(v, names)),
+        stations_total: stations.length,
+        station_lines: [...stations].sort((p, q) => minRating(p) - minRating(q)).slice(0, a.station_lines).map(shortStationLine),
+        depots,
+        ...(problems ? { problems_total: problems.length, problems: problems.slice(0, 8).map((p) => problemLine(p)) } : {}),
+        rivals: companyRows.filter((c) => c.id !== company).slice(0, 8).map(rivalLine),
+        events_new: seen.length, events: cap(seen, a.since === 0 ? Math.min(3, a.event_lines) : a.event_lines).map(eventLine),
+        latest_seq: events.length ? events.at(-1).seq : a.since,
+      };
+    },
+  },
+
   // ---- operate (change; rate limited like builds) ----------------------------------
   {
     name: 'group-create', group: 'operate', session: true,

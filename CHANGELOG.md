@@ -101,6 +101,13 @@ Observation and output (batch 6):
   `money_after`: the bank balance after the call, from the call's last exec reply (no extra game
   call), else the result's own `money`, else one GS `companies` read. `--brief` keeps it. Set
   once in `executeCommand`, so new actions get it too.
+- New `overview [--since SEQ]`: one small per-turn snapshot in place of status, goal-status,
+  companies, stations, vehicles, depots, events and vehicle-problems: date, paused, money, loan,
+  max_loan, value, profit of the last quarter, the goal in one line, a fleet line, the worst
+  vehicles, the lowest-rated stations, depots, action problems, rivals, new events (yours, world
+  and company news) and `latest_seq` for the next call. Lines are capped (`--vehicle_lines`,
+  `--station_lines`, `--event_lines`; `*_total` gives the full counts); `--problems false` skips
+  the vehicle-problems traces. Not named `brief`: that is a reserved output argument.
 
 ## 0.7.0 (2026-11-26)
 
