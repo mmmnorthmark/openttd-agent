@@ -5,6 +5,50 @@ re-run `install-gamescript` when it changes.
 
 ## 0.8.0 (unreleased)
 
+Road and fleet operations (batch 5; AgentBridge v13):
+
+- **AgentBridge v13** (host: `install-gamescript`, then load the game again): `town_rating` and
+  `vehicle_loads` queries; `depots` counts the vehicles standing in each depot (it showed 0 for
+  trains stopped there). On an older GameScript the features below that need v13 say so.
+- **Breaking:** `vehicle-sell` sells the vehicles stopped in a depot and sends the others to a
+  depot and queues them (`queued`); the daemon sells each on arrival. `--send false` gives the old
+  refusal (`not_in_depot`). Unknown ids are `not_found` before anything is sent.
+- Sold-vehicle ledger (kept in the jobs file): a sold id answers `already_sold` (ok in
+  `vehicle-sell`) with the sale date and the vehicles now serving its stations, in `vehicle`,
+  `vehicle-clone`, `vehicle-problems --vehicle` and every command that looks a vehicle up.
+- Vehicles queued for sale: `vehicle-problems` shows only `pending_sale`; `vehicle-start` refuses
+  them (`queued_for_sale`) unless `--cancel_sale true`.
+- New `wait`: `--vehicles A,B --until in_depot|at_station|loaded|moving|stopped|sold [--any
+  --load_pct --timeout_s]` or `--days N`; `wait_timeout`, and `paused` at once on a paused game.
+- New `road-stop-sites --town | --industry | --x --y [--kind --cargo --count --spacing --radius
+  --with_depot]`: dry-run-checked stop sites with the build command, `rejected` by reason, and the
+  town's rating when the local authority refuses them all.
+- `build-rail-station` / `build-road-station` return `station {id, name}`; `build-rail-depot` /
+  `build-road-depot` return `depot {x, y}` and a `next` hint.
+- `vehicle-buy --routes "A,B;C,D"`: one vehicle per route, each with its own orders, started
+  (`start` now defaults to true with `--routes`, false otherwise).
+- `vehicle-clone --station ID [--cargo C]` clones the best-earning vehicle serving that station
+  (`source`); `--vehicle` is now optional (one of the two).
+- `vehicles --ids --min_age_days --max_profit_this_year --engine --sort [-]key`;
+  `vehicle-replace --select FILTER --max N` and `vehicle-depot --select FILTER --max N` (filter keys
+  as `vehicles`; vehicles queued for sale are left out).
+- `summary` vehicle lines add `spd`, `load now/capacity` (v13) and `order i/n`, plus
+  `age_buckets`, `reliability_buckets` and `low_reliability`; `vehicle` gains `load {load,
+  capacity, pct}`.
+- `vehicle-problems --vehicles A,B --type T --problem a,b`; `stuck_or_lost` on a route that
+  traces connected says "not lost" and points at trains vs loops, never at a depot.
+- Money: a failure with `ERR_NOT_ENOUGH_CASH` carries `needed`, `loan`, `max_loan`,
+  `loan_headroom` and `next` (`loan --borrow N`); a dry run that costs more than the bank warns
+  `not_enough_money` with the same fields. `--borrow_if_needed true` (simple builds, `build-rail`,
+  `build-road-path`, `vehicle-buy`, `vehicle-clone`) borrows what the rest costs and finishes.
+- **Breaking:** `loan --amount/--borrow` over `max_loan` borrows up to `max_loan` (`clamped`)
+  instead of refusing.
+- `ERR_LOCAL_AUTHORITY_REFUSES` carries `local_authority {town, town_name, rating, rating_value,
+  needed, needed_text, hint}`; `towns` rows gain `my_rating {rating, value, rated}` and take
+  `--company` (v13).
+- A road, stop or depot refused on a slope: `first_error: sloped_tile`, `at` (the first sloped
+  tile of the step) and a hint.
+
 Host tools (batch 3):
 
 - **Breaking:** `launch --mode dedicated` now waits until the admin port and AgentBridge answer
