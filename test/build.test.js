@@ -158,6 +158,16 @@ test('build-cargo-route builds in order, buys and orders the train, starts it', 
   assert.deepEqual(res.built.map((b) => b.step), ['source_station', 'dest_station', 'rail_line', 'depot', 'buy_locomotive', 'buy_wagons', 'orders', 'start']);
 });
 
+test('build-cargo-route traces the built line both ways: route_broken when it does not join (C1)', async () => {
+  fake.state.newStations = []; // the new stations exist, but no track joins them in rail_tiles
+  try {
+    const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', wagons: 3 });
+    assert.deepEqual([res.ok, res.failed_step, res.first_error, res.verify.connected, res.verify.there, res.verify.back], [false, 'verify', 'route_broken', false, false, false]);
+    assert.equal(res.built.at(-1).step, 'start', 'the train was built and started');
+    assert.match(res.error, /route_broken: the new line does not trace from New 0 to New 1.*verify-route --vehicle/);
+  } finally { fake.state.newStations = null; }
+});
+
 test('build-cargo-route stops at a failed step and reports what was built', async () => {
   fake.state.failOps = ['veh_buy'];
   const before = execs().length;

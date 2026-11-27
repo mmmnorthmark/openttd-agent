@@ -233,11 +233,13 @@ const GS = {
   build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 98766, echoed_company: a.company }),
   test_build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 100000, echoed_company: a.company }),
   // operate (row formats: see main.nut)
-  stations: () => [
+  // state.newStations (an array, tests set it): real rail_station steps add a station there (no track in rail_tiles).
+  stations: (_a, state) => [
     [3, 'Bigton Woods', 12, 20, 1, [[7, 240, 35]], 2],
     [4, 'Bigton Central', 41, 9, 4 | 2, [[0, 15, 80]], 5],
     [5, 'Sawmill Halt', 24, 20, 1, [], 1],
     [7, 'Smallham Stop', 47, 9, 2, [[0, 5, 60]], 1],
+    ...(state.newStations ?? []),
   ],
   // v9 rows end with [current_order, dest_x, dest_y, dest_station, speed].
   vehicles: (_a, state) => [
@@ -348,6 +350,7 @@ const GS = {
         if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
         continue;
       }
+      if (st[0] === 'rail_station' && !a.dry_run && state.newStations) state.newStations.push([20 + state.newStations.length, `New ${state.newStations.length}`, st[1], st[2], 1, [], 0]);
       const bad = st[0] === 'bogus' || (st[0] === 'veh_sell' && st[1] === 404) || (!a.dry_run && state.failOps.includes(st[0]));
       rows.push(bad ? [false, 0, 'Vehicle not available', 0] : [true, 10, '', 100 + rows.length]);
       if (bad && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }

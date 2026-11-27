@@ -617,8 +617,19 @@ async function buildCargoRoute(s, company, a) {
     const startRes = await exec([['veh_start_stop', loco, 1]]);
     if (!startRes.ok) return fail('start', startRes.error, { spent, vehicle: loco });
     built.push({ step: 'start', vehicle: loco, complete: true });
-    return { ok: true, ...plan, dry_run: false, source_station: A.st?.id ?? null, dest_station: B.st?.id ?? null, depot: dep.depot, vehicle: loco, vehicles: [loco],
-      cost: spent, total_cost: spent, built, next: `vehicle-clone --depot_x ${dep.depot.x} --depot_y ${dep.depot.y} --vehicle ${loco} --start true adds trains with the same orders` };
+    // C1: trace the built line both ways (and the depot's first leg) instead of leaving it to the caller.
+    let verify = { connected: null, note: 'not traced: a new station id was not found on its site' };
+    if (A.st && B.st) {
+      try { verify = await lineVerify(s, company, A.st, B.st, dep.depot); } catch (e) { verify = { connected: null, error: e.message }; }
+    }
+    if (verify.first_leg?.warning) (plan.warnings ??= []).push({ depot_exit_detour: verify.first_leg.warning });
+    const done = { ...plan, dry_run: false, source_station: A.st?.id ?? null, dest_station: B.st?.id ?? null, depot: dep.depot, vehicle: loco, vehicles: [loco],
+      cost: spent, total_cost: spent, built, verify, next: `add-train --vehicle ${loco} adds a train with the same orders (checks passing loops)` };
+    if (verify.connected === false) {
+      return { ok: false, ...done, failed_step: 'verify', first_error: 'route_broken',
+        error: `route_broken: the new line does not trace ${verify.there ? `back from ${B.st.name} to ${A.st.name}` : `from ${A.st.name} to ${B.st.name}`}${verify.first_gap ? ` (first gap at (${verify.first_gap.x},${verify.first_gap.y}): ${verify.first_gap.reason})` : ''}; train ${loco} is running. Fix the gap with build-track, then verify-route --vehicle ${loco}` };
+    }
+    return { ok: true, ...done };
   } catch (e) {
     const last = built.at(-1)?.step ?? null;
     return fail(last ? `after ${last}` : 'source_station', e.message, { spent });
@@ -949,6 +960,37 @@ async function longestTrainAt(s, company, x, y) {
     if (veh?.type === 'rail') return { ...(await longestTrainOnLine(s, company, v)), stations: [{ id: a }, { id: b }] };
   }
   return { reason: `no train of yours has orders at both stations ${a} and ${b} of this line` };
+}
+
+/**
+ * First leg of a new train (C9): trace from the depot to its first station. detour_ratio = path tiles
+ * / straight-line tiles; a big one means the depot exit faces away and every new or serviced train
+ * runs to the far end first (warning depot_exit_detour). null when the tracer is not exact (< v9).
+ */
+async function firstLeg(tracer, depot, station) {
+  if (!tracer || tracer.method !== 'rail_tracks' || !depot || !station) return null;
+  const r = await tracer.trace([{ x: depot.x, y: depot.y }], station);
+  if (!r.connected) return { connected: false, to: station.name ?? station.id, first_gap: r.first_gap ?? null };
+  const direct = Math.max(1, tileDistance(depot, station));
+  const ratio = Math.round((10 * r.path.length) / direct) / 10;
+  const detour = ratio >= 2.5 && r.path.length - direct >= 12;
+  return { connected: true, to: station.name ?? station.id, tiles: r.path.length, direct_tiles: direct, detour_ratio: ratio,
+    ...(detour ? { warning: `depot_exit_detour: a train leaving the depot at (${depot.x},${depot.y}) runs ${r.path.length} tiles to reach ${station.name ?? `station ${station.id}`} (${direct} tiles away): the depot exit leads away from it, so every new or serviced train goes the long way first. Join the depot front toward the station (build-track) or build the depot on the other side` } : {}) };
+}
+
+/**
+ * Trace a built two-station line both ways and its depot's first leg (build-cargo-route, C1).
+ * Returns { connected (null when only a coarse trace was possible), there, back, first_gap, first_leg?, method, note? }.
+ */
+async function lineVerify(s, company, from, to, depot) {
+  const tracer = await makeTracer(s, company, await s.gs.call('info'));
+  const there = await tracer.trace(await tracer.stationStarts(from), to);
+  const back = await tracer.trace(await tracer.stationStarts(to), from);
+  const coarse = tracer.method !== 'rail_tracks';
+  const bad = !there.connected ? there : !back.connected ? back : null;
+  const leg = await firstLeg(tracer, depot, from);
+  return { connected: coarse && !bad ? null : !bad, there: there.connected, back: back.connected, first_gap: bad?.first_gap ?? null, method: tracer.method,
+    ...(leg ? { first_leg: leg } : {}), ...(coarse ? { note: OLD_GS_TRACE } : {}) };
 }
 
 // ---- depot guard (vehicle-clone, vehicle-buy --route_of) ---------------------------------
@@ -2586,7 +2628,7 @@ export const COMMANDS = [
   },
   {
     name: 'add-train', group: 'operate', session: true,
-    description: 'Add a train to a running line safely, in one call: counts the trains on the line of --vehicle (same order stations) and the usable passing loops on its track between its first two stations (a second track that leaves the line at points and rejoins it, with a signal on each side and room for the longest train: check.loops / check.unusable_loops), refuses when the trains would outnumber the loops + 1 (single track: each loop lets one more train run; first_error needs_loop with the loop-sites command), refuses to copy a train that lost money last year and this year (source_unprofitable), then clones the train at a depot on its own route (sharing orders), starts it and traces the new train\'s route (verify). --force true skips both checks. AgentBridge v12 (counts) and v9 (trace).',
+    description: 'Add a train to a running line safely, in one call: counts the trains on the line of --vehicle (same order stations) and the usable passing loops on its track between its first two stations (a second track that leaves the line at points and rejoins it, with a signal on each side and room for the longest train: check.loops / check.unusable_loops), refuses when the trains would outnumber the loops + 1 (single track: each loop lets one more train run; first_error needs_loop with the loop-sites command), refuses to copy a train that lost money last year and this year (source_unprofitable), then clones the train at a depot on its own route (sharing orders), starts it and traces the new train\'s route (verify; first_leg.detour_ratio = depot-to-first-station tiles / straight distance, warning depot_exit_detour when the depot exit leads the long way). --force true skips both checks. AgentBridge v12 (counts) and v9 (trace).',
     args: z.object({ ...act, vehicle: int(), count: int().min(1).max(10).default(1), force: bool().default(false) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
@@ -2604,12 +2646,15 @@ export const COMMANDS = [
       const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
       out.started = started.ok;
       if (tracer) {
+        let leg = null;
+        try { leg = await firstLeg(tracer, depot, cap.stops[0]); } catch { leg = null; }
+        if (leg?.warning) out.warnings = [...(out.warnings ?? []), { depot_exit_detour: leg.warning }];
         try {
           const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
           const legs = await routeLegs(s, company, tracer, stations, await vehicleOf(s, company, vehicles[0]));
-          out.verify = { connected: legs.connected, ...(legs.connected ? {} : { legs: legs.legs.filter((l) => !l.connected) }) };
+          out.verify = { connected: legs.connected, ...(legs.connected ? {} : { legs: legs.legs.filter((l) => !l.connected) }), ...(leg ? { first_leg: leg } : {}) };
           if (!legs.connected) { out.ok = false; out.error = `route_broken: the new train ${vehicles[0]} has no path to all its stations; see verify`; out.first_error = 'route_broken'; }
-        } catch (e) { out.verify = { connected: null, error: e.message }; }
+        } catch (e) { out.verify = { connected: null, error: e.message, ...(leg ? { first_leg: leg } : {}) }; }
       }
       return out;
     },
@@ -2804,7 +2849,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-cargo-route', group: 'build', session: true,
-    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. --passing_loops N lays N passing loops on straight stretches spread along the line, each sized for the train (length = train tiles + 2), so more trains can run on the single track (passing_loops in the result; a loop that does not fit is a warning, not a failure). A town end with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked). warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). Refused (failed_step existing_route) when your rail stations near both ends are already served by one of your vehicles: clone that train instead, or --allow_existing true. Stations nobody serves (e.g. after selling the fleet) do not block it. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
+    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. --passing_loops N lays N passing loops on straight stretches spread along the line, each sized for the train (length = train tiles + 2), so more trains can run on the single track (passing_loops in the result; a loop that does not fit is a warning, not a failure). A town end with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked). warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). Refused (failed_step existing_route) when your rail stations near both ends are already served by one of your vehicles: clone that train instead, or --allow_existing true. Stations nobody serves (e.g. after selling the fleet) do not block it. A real build ends by tracing the line both ways: verify {connected, there, back, first_gap, first_leg (depot to source: detour_ratio, warning depot_exit_detour)}; failed_step verify with first_error route_broken when it does not trace (the train is already running). A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
     args: z.object({
       ...act,
       from_industry: int().optional().describe('source industry id (see industries / find-cargo-pairs)'), from_town: z.string().optional().describe('source town id or name'),

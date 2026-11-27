@@ -641,6 +641,7 @@ async function addTrainChecks() {
   assert.deepEqual(fake.received.filter((q) => q.cmd === 'exec').slice(-2).map((q) => q.args.steps[0][0]), ['veh_clone', 'veh_start_stop']);
   assert.equal(yes.started, true);
   assert.ok('verify' in yes);
+  assert.deepEqual([yes.verify.first_leg.connected, yes.verify.first_leg.tiles, yes.verify.first_leg.detour_ratio, yes.verify.first_leg.warning], [true, 4, 1.3, undefined]);
   // A real loop that is too short for the 5-tile trains does not count (S2): listed in unusable_loops.
   fake.state.railLoop = true;
   try {
