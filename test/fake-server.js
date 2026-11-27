@@ -438,6 +438,7 @@ export function startFakeServer({ password = 'pw' } = {}) {
           if (/^load \d+$/.test(cmd) && Number(cmd.slice(5)) - 2 in state.saves) {
             state.loads++;
             if (state.versionAfterLoad !== null) state.gsVersion = state.versionAfterLoad;
+            state.onLoad?.(); // tests: e.g. write the server log line of a refused load
             send(PKT.SERVER_NEWGAME);
             welcome();
           }

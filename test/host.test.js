@@ -202,3 +202,15 @@ test('serverPids matches only an OpenTTD executable, never a shell that mentions
   await new Promise((r) => setTimeout(r, 200));
   try { assert.deepEqual(host.serverPids(cfg), []); } finally { decoy.kill(); }
 });
+
+test('load: a refused load that starts a new game instead is an error (save_too_new from the log)', () => withFake(async (fake) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ottd-load-'));
+  fs.writeFileSync(path.join(dir, 'openttd.log'), 'old line: Savegame is made with newer version (an earlier load)\n');
+  fake.state.saves.push('from15');
+  fake.state.onLoad = () => fs.appendFileSync(path.join(dir, 'openttd.log'), 'Game Load FailedSavegame is made with newer version\n');
+  const target = { server: 't', dir, host: '127.0.0.1', admin_port: fake.port, password: 'pw', local: false };
+  await assert.rejects(host.withAdmin(target, (admin, gs) => host.loadSave(admin, gs, 'from15', { dir })), /^Error: save_too_new: .*NEW game instead/);
+  fake.state.onLoad = null;
+  const ok = await host.withAdmin(target, (admin, gs) => host.loadSave(admin, gs, 'from15', { dir }));
+  assert.equal(ok.loaded, 'from15', 'an old log line does not count');
+}));

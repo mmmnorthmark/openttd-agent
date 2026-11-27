@@ -295,6 +295,7 @@ export async function loadSave(admin, gs, name, { pause, timeoutMs = 60000, minV
   }
   const loaded = nextWelcome(admin, timeoutMs);
   loaded.catch(() => {});
+  const logFrom = dir ? logSize(dir) : null;
   const out = await admin.rcon(`load ${entry.index}`, 30000);
   const problem = loadProblem(out.join(' '));
   if (problem) throw new Error(`${loadProblemText(problem)} (console: ${out.join(' ').slice(0, 300)})`);
@@ -302,8 +303,15 @@ export async function loadSave(admin, gs, name, { pause, timeoutMs = 60000, minV
   let welcome;
   try { welcome = await loaded; } catch (e) {
     // A refused load shows only in the server log (the console stays quiet): name the cause when it is known.
-    const why = dir ? loadProblem(logTail(dir, { lines: 30 }).lines.join(' ')) : null;
+    const why = dir ? loadProblem(logSince(dir, logFrom)) : null;
     throw why ? new Error(`${loadProblemText(why)} (${entry.name})`) : e;
+  }
+  // A load the server refuses ("Game Load Failed", verified on 14.1 with a 15.3 save) still ends in a
+  // welcome: the server starts a NEW random game instead. Only its log says so.
+  if (dir) {
+    const text = logSince(dir, logFrom);
+    const why = loadProblem(text) ?? (/Game Load Failed/i.test(text) ? 'load_failed' : null);
+    if (why) throw new Error(`${loadProblemText(why) ?? `load_failed: the server could not load ${entry.name}`}; the server is now running a NEW game instead (log: ${text.split(/\r?\n/).filter((l) => /fail|newer|error/i.test(l)).slice(-3).join(' | ').slice(0, 300)}). Load another save, or launch --load with the right OpenTTD version`);
   }
   const info = await waitGs(gs, 30000, minVersion);
   if (!info) throw new Error(`gs_timeout: loaded ${entry.name} but AgentBridge did not answer within 30 s (the save may run another GameScript or none; see server-log --errors true)`);
@@ -312,6 +320,17 @@ export async function loadSave(admin, gs, name, { pause, timeoutMs = 60000, minV
   return { loaded: entry.name, map: [welcome.mapX, welcome.mapY], date: `${now.year}-${String(now.month).padStart(2, '0')}-${String(now.day).padStart(2, '0')}`,
     paused: now.paused, bridge_version: now.bridge_version ?? null, seconds: Math.round((Date.now() - started) / 100) / 10,
     ...(bundled !== null && (now.bridge_version ?? 0) < bundled ? { warning: `this save runs AgentBridge v${now.bridge_version}; v${bundled} is bundled: openttd-agent install-gamescript --reload true` } : {}) };
+}
+
+/** Byte size of a profile's openttd.log (0 when missing). */
+export function logSize(dir) { try { return fs.statSync(path.join(dir, 'openttd.log')).size; } catch { return 0; } }
+
+/** Log text written after byte offset `from` (all of it when the log was rotated or shrank). */
+export function logSince(dir, from) {
+  try {
+    const buf = fs.readFileSync(path.join(dir, 'openttd.log'));
+    return buf.subarray(from !== null && from !== undefined && from <= buf.length ? from : 0).toString('utf8');
+  } catch { return ''; }
 }
 
 /** Saves in a profile's save folder, newest first. */

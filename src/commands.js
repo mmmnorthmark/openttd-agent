@@ -12,7 +12,7 @@ import { doctor, installGamescript, launch, findExecutable, findPersonalDir, che
 import { serverTarget, serverStates, profilePorts, serverPids, waitReady, notReadyDetail, stopServer, withAdmin, loadSave, listSaves, companyNew, reloadGamescript, logTail, portOpen } from './host.js';
 import { VERSION } from './version.js';
 import { connectionHint, diagnoseAddress, hostCheck, playerCheck, listeners } from './netcheck.js';
-import { installOpenGfx, findBasesets, freeBytes, diskWarning, keepAwakeHint, portHolderText } from './preflight.js';
+import { installOpenGfx, findBasesets, freeBytes, diskWarning, keepAwakeHint, portHolderText, loadProblem, loadProblemText } from './preflight.js';
 import { classifyVersion, versionRefusal, acceptUntested, detectInstalledVersion, compareHostClient, installHint } from './versions.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
@@ -2065,8 +2065,12 @@ export const COMMANDS = [
       if (!(a.wait ?? a.mode === 'dedicated')) return out;
       const ready = await waitReady(target, { timeoutMs: a.wait_s * 1000, exited: () => exitCode });
       if (ready.ready) return { ...out, ...ready };
+      const detail = notReadyDetail(target, { pid: result.pid, exitCode });
+      // launch --load with a save it cannot read: the server logs why and exits (verified on 14.1 with a 15.3 save).
+      const why = a.load ? loadProblem(detail.log_tail.join('\n')) : null;
+      if (why) return { ...out, ok: false, error: `${loadProblemText(why)} (${a.load}); the server exited`, ...ready, ...detail };
       return { ...out, ok: false, error: `not_ready: server '${server}' was not ready within ${a.wait_s}s (stage: ${ready.stage}${ready.last_error ? `: ${ready.last_error}` : ''}). See process and log_tail; server-log${a.server ? ` --server ${server}` : ''} shows more`,
-        ...ready, ...notReadyDetail(target, { pid: result.pid, exitCode }) };
+        ...ready, ...detail };
     },
   },
   {
