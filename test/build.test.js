@@ -522,3 +522,45 @@ test('build-cargo-route --trains: only as many trains as passing loops + 1 (C13)
   assert.deepEqual(real.vehicles, [real.vehicle], 'no clone without a traced line');
   assert.ok(real.warnings.some((w) => /only 1 of 2 trains/.test(w.trains ?? '')));
 });
+
+test('find-cargo-pairs: --source_id/--dest_id, region box, --sort, excluded counts with a hint (G17, C7, R13, L17)', async () => {
+  const base = { cargo: 'wood', with_effort: false, min_distance: 0 };
+  const all = await run('find-cargo-pairs', base);
+  assert.ok(all.pairs.length >= 2);
+  assert.ok(all.pairs.every((p) => /^build-cargo-route --from_industry \d+ --to_industry \d+ --cargo Wood$/.test(p.build)), all.pairs[0].build);
+  assert.ok((await run('find-cargo-pairs', { ...base, source_id: 3 })).pairs.every((p) => p.source.id === 3));
+  assert.ok((await run('find-cargo-pairs', { ...base, dest_id: 2 })).pairs.every((p) => p.dest.id === 2));
+  const near = await run('find-cargo-pairs', { ...base, sort: 'distance' });
+  assert.deepEqual(near.pairs.map((p) => p.distance), [...near.pairs.map((p) => p.distance)].sort((x, y) => x - y));
+  const box = await run('find-cargo-pairs', { ...base, x0: 0, y0: 0, x1: 63, y1: 30 });
+  assert.ok(box.pairs.length && box.pairs.every((p) => p.source.y <= 30 && p.dest.y <= 30));
+  const none = await run('find-cargo-pairs', { ...base, x0: 0, y0: 0, x1: 20, y1: 30, max_transported_pct: 50 });
+  assert.equal(none.pairs.length, 0);
+  assert.ok(none.excluded.region >= 1 && none.excluded.transported_pct >= 1, JSON.stringify(none.excluded));
+  assert.match(none.hint, /^no pair left: .*by region \(a bigger --x0/);
+  await assert.rejects(run('find-cargo-pairs', { ...base, x0: 1 }), /all four of --x0 --y0 --x1 --y1/);
+});
+
+test('find-cargo-pairs: yours and --exclude_yours, --dry_run_top, --format lines (L1, R14)', async () => {
+  fake.state.lostTrain = true; // train 13 runs Bigton Woods (3) -> Sawmill Yard (21): forest 1 -> sawmill 2 is yours
+  fake.state.newStations = [[21, 'Sawmill Yard', 50, 22, 1, [], 1]];
+  fake.state.train13To = { id: 21, x: 50, y: 22, name: 'Sawmill Yard' };
+  const base = { cargo: 'wood', with_effort: false, min_distance: 0 };
+  try {
+    const def = await run('find-cargo-pairs', base);
+    assert.ok(!def.pairs.some((p) => p.source.id === 1 && p.dest.id === 2), 'served by you: left out');
+    const mine = await run('find-cargo-pairs', { ...base, exclude_yours: false, source_id: 1, dest_id: 2 });
+    assert.deepEqual([mine.pairs[0].yours.from_station.id, mine.pairs[0].yours.to_station.id, mine.pairs[0].yours.served_by], [3, 21, 13]);
+    const gone = await run('find-cargo-pairs', { ...base, source_id: 1, dest_id: 2 });
+    assert.deepEqual([gone.pairs.length, gone.excluded.yours], [0, 1]);
+    assert.match(gone.hint, /--exclude_yours false/);
+  } finally { fake.state.lostTrain = false; fake.state.newStations = null; fake.state.train13To = null; }
+  const before = execs().length;
+  const dry = await run('find-cargo-pairs', { ...base, source_id: 1, dest_id: 2, dry_run_top: 1 });
+  assert.ok(execs().slice(before).every((e) => e.args.dry_run === true), 'dry runs only');
+  assert.deepEqual([dry.pairs[0].dry_run.ok, dry.pairs[0].dry_run.failed_step], [true, null]);
+  assert.ok(dry.pairs[0].dry_run.estimated_cost > 0 && dry.pairs[0].dry_run.line_tiles > 20);
+  const lines = await run('find-cargo-pairs', { ...base, source_id: 1, dry_run_top: 1, format: 'lines' });
+  assert.equal(lines.pairs, undefined);
+  assert.match(lines.lines[0], /^Wood: Forest 1 \(10,20\) -> .* tiles, 120\/month 0% moved; dry run ok, cost \d+, \d+ tiles of track \| build-cargo-route --from_industry 1/);
+});

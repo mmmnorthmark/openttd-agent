@@ -23,7 +23,7 @@ import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, term
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
 import { traceRail, traceRoad, trackExits, trackEdges, findLoops, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
-import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
+import { routeEffort, findCargoPairs, pairKey, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
 import { takeOutputArgs, shapeResult } from './output.js';
 import { commandClass, readOnlyGate } from './readonly.js';
@@ -1592,6 +1592,99 @@ async function addTrain(ctx, s, company, a) {
   return out;
 }
 
+/** "Wood: Forest 1 (10,20) -> Sawmill 2 (50,20) ..." for find-cargo-pairs --format lines. */
+function pairLine(pr) {
+  const end = (e) => `${e.kind === 'town' ? e.name : e.type} ${e.id} (${e.x},${e.y})`;
+  const dry = pr.dry_run ? (pr.dry_run.ok ? `; dry run ok, cost ${pr.dry_run.estimated_cost}, ${pr.dry_run.line_tiles} tiles of track` : `; dry run failed at ${pr.dry_run.failed_step}: ${pr.dry_run.error}`) : '';
+  const yours = pr.yours ? `; yours: ${pr.yours.from_station.name} -> ${pr.yours.to_station.name}${pr.yours.served_by !== null ? ` served by ${pr.yours.served_by}` : ' (unserved)'}` : '';
+  const effort = pr.route?.reachable ? `, effort ${pr.route.effort_per_tile}/tile` : pr.route ? ', no route' : '';
+  return `${pr.cargo}: ${end(pr.source)} -> ${end(pr.dest)}, ${pr.distance} tiles, ${pr.source_last_month}/month ${pr.source_transported_pct}% moved${effort}${yours}${dry} | ${pr.build}`;
+}
+
+/** build-cargo-route arguments for a find-cargo-pairs pair. */
+const pairRouteArgs = (pr) => ({ ...(pr.source.kind === 'town' ? { from_town: pr.source.name } : { from_industry: pr.source.id }),
+  ...(pr.dest.kind === 'town' ? { to_town: pr.dest.name } : { to_industry: pr.dest.id }), cargo: pr.cargo });
+
+const quoteArg = (v) => (typeof v === 'string' && /\s/.test(v) ? `"${v}"` : String(v));
+
+/** Why an empty find-cargo-pairs found nothing (L17): the biggest exclusion first, with the flag that loosens it. */
+function pairsHint(excluded, a) {
+  const fix = { distance: `--min_distance / --max_distance (now ${a.min_distance ?? PAIR_MIN_DIST}..${a.max_distance ?? PAIR_MAX_DIST})`, transported_pct: `--max_transported_pct (now ${a.max_transported_pct})`,
+    min_production: `--min_production (now ${a.min_production})`, town_acceptance: '--dest_kind industry, or bigger towns', near: `--radius (now ${a.radius})`, region: 'a bigger --x0 --y0 --x1 --y1 box',
+    yours: '--exclude_yours false (you already serve them)' };
+  const parts = Object.entries(excluded).sort((p, q) => q[1] - p[1]).map(([k, n]) => `${n} by ${k} (${fix[k] ?? k})`);
+  return parts.length ? `no pair left: ${parts.join('; ')}` : 'no producer of that cargo matched (check --cargo / --source_type / --source_id against industries)';
+}
+
+/**
+ * find-cargo-pairs: findCargoPairs over the economy, plus your stations (yours / --exclude_yours),
+ * --dry_run_top (build-cargo-route dry runs) and --format lines.
+ */
+async function findCargoPairsCommand(ctx, a) {
+  const s = await ctx.session();
+  const economy = await s.economy();
+  const { industries, towns } = economy;
+  if (a.with_effort) await s.ensureTiles();
+  let townAcceptance = new Map();
+  if (a.dest_kind !== 'industry' && towns.length) {
+    const lists = await acceptanceAt(s, towns.map((t) => [t.x, t.y]), { radius: 4 });
+    townAcceptance = lists && new Map(towns.map((t, i) => [t.id, Object.fromEntries(lists[i].map((c) => [c.cargo, c.acceptance]))]));
+  }
+  const townCargoFallback = new Set([...s.cargos.values()].filter((c) => c.town_effect > 0).map((c) => c.id));
+  if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
+  const box = [a.x0, a.y0, a.x1, a.y1];
+  if (box.some((v) => v !== undefined) && box.some((v) => v === undefined)) throw new Error('a region needs all four of --x0 --y0 --x1 --y1');
+  const region = a.x0 !== undefined ? { x0: Math.min(a.x0, a.x1), y0: Math.min(a.y0, a.y1), x1: Math.max(a.x0, a.x1), y1: Math.max(a.y0, a.y1) } : null;
+  const minDist = a.min_distance ?? PAIR_MIN_DIST, maxDist = a.max_distance ?? PAIR_MAX_DIST;
+  const query = { industries, types: s.types, towns, cargos: s.cargos, townAcceptance, townCargoFallback, map: s.map, cargo: a.cargo, sourceType: a.source_type,
+    destType: a.dest_type, destKind: a.dest_kind, minDist, maxDist, maxTransportedPct: a.max_transported_pct, minProduction: a.min_production,
+    near: a.near_x !== undefined ? { x: a.near_x, y: a.near_y, radius: a.radius } : null, sourceId: a.source_id, destId: a.dest_id, region, sort: a.sort };
+  // L1: pairs where your rail stations already sit at both ends, and whether a vehicle serves them.
+  // No company arg: this stays a world query; the configured company is "you" (the relay sets it per player).
+  const company = s.cfg.company ?? null;
+  const yours = new Map();
+  if (company !== null) {
+    const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).filter((st) => st.facilities.includes('rail'));
+    if (stations.length) {
+      const ends = new Map();
+      const endOf = (e) => { const k = `${e.kind ?? 'industry'}:${e.id}`; if (!ends.has(k)) ends.set(k, lineEnd(s, economy, e.kind === 'town' ? { town: String(e.id) } : { industry: e.id })); return ends.get(k); };
+      const served = new Map();
+      for (const pr of findCargoPairs({ ...query, limit: 1e6, withEffort: false }).pairs) {
+        const c = [...s.cargos.values()].find((q) => q.name === pr.cargo);
+        const existing = findExistingRoute(stations, endOf(pr.source), endOf(pr.dest), c?.id, { radius: 10, bothWays: !!(c?.passengers || c?.mail) });
+        if (!existing) continue;
+        const sk = `${existing.from_station.id}>${existing.to_station.id}`;
+        if (!served.has(sk)) served.set(sk, await vehicleServing(s, company, stations, existing.from_station.id, existing.to_station.id));
+        yours.set(pairKey(pr), { ...existing, served_by: served.get(sk) });
+      }
+    }
+  }
+  const exclude = a.exclude_yours ? new Set([...yours].filter(([, y]) => y.served_by !== null).map(([k]) => k)) : null;
+  const res = findCargoPairs({ ...query, limit: a.limit, withEffort: a.with_effort, exclude });
+  for (const pr of res.pairs) {
+    const y = yours.get(pairKey(pr));
+    if (y) pr.yours = y;
+    pr.build = `build-cargo-route ${Object.entries(pairRouteArgs(pr)).map(([k, v]) => `--${k} ${quoteArg(v)}`).join(' ')}`;
+  }
+  if (a.dry_run_top > 0) {
+    const me = s.companyOrThrow();
+    const schema = COMMANDS_BY_NAME.get('build-cargo-route').args;
+    for (const pr of res.pairs.slice(0, a.dry_run_top)) {
+      try {
+        const r = await buildCargoRoute(s, me, schema.parse({ ...pairRouteArgs(pr), company: me, dry_run: true }), ctx);
+        pr.dry_run = { ok: r.ok, estimated_cost: r.estimated_cost ?? null, line_tiles: r.line?.tiles ?? null, failed_step: r.failed_step ?? null,
+          ...(r.ok ? { affordable: r.affordable } : { error: r.first_error ?? errorCode(r.error ?? 'failed') ?? r.error }) };
+      } catch (e) { pr.dry_run = { ok: false, estimated_cost: null, line_tiles: null, failed_step: 'arguments', error: e.message }; }
+    }
+  }
+  const head = { distance_bounds: { min: minDist, max: maxDist, ...(a.min_distance === undefined || a.max_distance === undefined ? { defaulted: 'pass --min_distance / --max_distance to change' } : {}) },
+    ...(a.near_x !== undefined ? { near: { x: a.near_x, y: a.near_y, radius: a.radius } } : {}), ...(region ? { region } : {}),
+    ...(yours.size ? { yours_found: yours.size } : {}), ...(company === null ? { yours_note: 'no company set, so your own routes are not marked or excluded' } : {}) };
+  const out = { ...head, ...res, ...(res.excluded ? { hint: pairsHint(res.excluded, a) } : {}) };
+  if (a.format === 'lines') { const { pairs, ...rest } = out; return { ...rest, lines: pairs.map(pairLine) }; }
+  return out;
+}
+
 export const COMMANDS = [
   // ---- setup ------------------------------------------------------------------
   {
@@ -2078,32 +2171,21 @@ export const COMMANDS = [
   },
   {
     name: 'find-cargo-pairs', group: 'world', session: true,
-    description: `Opportunity finder: under-served producers of a cargo paired with destinations min_distance..max_distance tiles away: industries that accept it, and towns whose centre area accepts it (acceptance >= ${ACCEPTED} within radius 4; goods, passengers, mail, food...). Ranked by terrain effort of the route (water, hills, towns, existing track). Each dest has kind industry|town. Passengers and mail pair town with town (source kind town, source_last_month = the town's last-month production); feed both names to build-cargo-route --from_town --to_town. Secondary producers (sawmill, factory, refinery...) are marked secondary: true; they show last_month 0 until supplied. Distance defaults to ${PAIR_MIN_DIST}..${PAIR_MAX_DIST} tiles (distance_bounds says which applied); --near_x/--near_y/--radius keeps sources near a tile (e.g. your network). Example: cargo=goods, dest_kind=town, min_distance=20.`,
+    description: `Opportunity finder: under-served producers of a cargo paired with destinations min_distance..max_distance tiles away: industries that accept it, and towns whose centre area accepts it (acceptance >= ${ACCEPTED} within radius 4; goods, passengers, mail, food...). Ranked by terrain effort of the route (water, hills, towns, existing track). Each dest has kind industry|town. Passengers and mail pair town with town (source kind town, source_last_month = the town's last-month production); feed both names to build-cargo-route --from_town --to_town. Secondary producers (sawmill, factory, refinery...) are marked secondary: true; they show last_month 0 until supplied. Distance defaults to ${PAIR_MIN_DIST}..${PAIR_MAX_DIST} tiles (distance_bounds says which applied); --near_x/--near_y/--radius keeps sources near a tile (e.g. your network). Example: cargo=goods, dest_kind=town, min_distance=20. Filters: --source_id / --dest_id (industry or town id), a region box --x0 --y0 --x1 --y1 (both ends inside), --sort effort|revenue|distance|production. yours {from_station, to_station, served_by} marks pairs where your rail stations already sit at both ends; --exclude_yours true (default) drops the ones a vehicle of yours serves. When nothing is left, excluded counts each reason (distance, transported_pct, min_production, town_acceptance, near, region, yours) with a hint. --dry_run_top N dry-runs build-cargo-route for the first N pairs (dry_run {ok, estimated_cost, line_tiles, failed_step, error}). --format lines gives one line per pair (lines[]) instead of pairs[]. Each pair has build (the build-cargo-route command).`,
     args: z.object({
       cargo: z.string().optional(), source_type: z.string().optional(), dest_type: z.string().optional().describe("industry type name, or 'town' / a town name"),
       dest_kind: z.enum(['any', 'industry', 'town']).default('any'),
       min_distance: int().optional().describe(`default ${PAIR_MIN_DIST}`), max_distance: int().optional().describe(`default ${PAIR_MAX_DIST} (a train route of 900 tiles takes years per trip)`), max_transported_pct: int().default(100),
       near_x: int().optional(), near_y: int().optional(), radius: int().min(1).default(60).describe('with near_x/near_y: sources within this many tiles'),
       min_production: int().default(0).describe('primary sources only; secondary ones are kept'), limit: int().default(10), with_effort: bool().default(true),
+      source_id: int().optional().describe('only this source (industry id; town id for passengers/mail)'), dest_id: int().optional().describe('only this destination (industry or town id)'),
+      x0: int().optional(), y0: int().optional(), x1: int().optional(), y1: int().optional().describe('region box x0,y0..x1,y1: both ends inside'),
+      sort: z.enum(['effort', 'revenue', 'distance', 'production']).default('effort').describe('effort: easiest terrain per tile (default); revenue: unserved volume x distance; distance: shortest first; production: biggest source first'),
+      exclude_yours: bool().default(true).describe('drop pairs one of your vehicles already serves (your rail stations at both ends)'),
+      dry_run_top: int().min(0).max(5).default(0).describe('dry-run build-cargo-route for the first N pairs: dry_run {ok, estimated_cost, line_tiles, failed_step}'),
+      format: z.enum(['json', 'lines']).default('json').describe('lines: one text line per pair instead of pairs[]'),
     }),
-    run: async (ctx, a) => {
-      const s = await ctx.session();
-      const { industries, towns } = await s.economy();
-      if (a.with_effort) await s.ensureTiles();
-      let townAcceptance = new Map();
-      if (a.dest_kind !== 'industry' && towns.length) {
-        const lists = await acceptanceAt(s, towns.map((t) => [t.x, t.y]), { radius: 4 });
-        townAcceptance = lists && new Map(towns.map((t, i) => [t.id, Object.fromEntries(lists[i].map((c) => [c.cargo, c.acceptance]))]));
-      }
-      const townCargoFallback = new Set([...s.cargos.values()].filter((c) => c.town_effect > 0).map((c) => c.id));
-      if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
-      const minDist = a.min_distance ?? PAIR_MIN_DIST, maxDist = a.max_distance ?? PAIR_MAX_DIST;
-      const res = findCargoPairs({ industries, types: s.types, towns, cargos: s.cargos, townAcceptance, townCargoFallback, map: s.map, cargo: a.cargo, sourceType: a.source_type,
-        destType: a.dest_type, destKind: a.dest_kind, minDist, maxDist, maxTransportedPct: a.max_transported_pct,
-        minProduction: a.min_production, limit: a.limit, withEffort: a.with_effort, near: a.near_x !== undefined ? { x: a.near_x, y: a.near_y, radius: a.radius } : null });
-      return { distance_bounds: { min: minDist, max: maxDist, ...(a.min_distance === undefined || a.max_distance === undefined ? { defaulted: 'pass --min_distance / --max_distance to change' } : {}) },
-        ...(a.near_x !== undefined ? { near: { x: a.near_x, y: a.near_y, radius: a.radius } } : {}), ...res };
-    },
+    run: (ctx, a) => findCargoPairsCommand(ctx, a),
   },
   {
     name: 'acceptance', group: 'world', session: true,
