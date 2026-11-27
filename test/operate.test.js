@@ -176,7 +176,7 @@ test('turn-advance runs the wanted number of days and leaves the game paused', a
 
 test('loan: show, borrow rounds up, repay, max, dry run', async () => {
   fake.state.money = 100000; fake.state.loan = 300000;
-  assert.deepEqual(await run('loan', {}), { ok: true, error: null, loan: 300000, max_loan: 500000, money: 100000 });
+  assert.deepEqual(await run('loan', {}), { ok: true, error: null, loan: 300000, max_loan: 500000, money: 100000, money_after: 100000 });
   const dry = await run('loan', { borrow: 15000, dry_run: true });
   assert.deepEqual(lastExec().steps, [['loan', 'add', 15000]]);
   assert.equal(lastExec().dry_run, true);

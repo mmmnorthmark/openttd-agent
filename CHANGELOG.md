@@ -79,6 +79,37 @@ CLI/MCP parity and the output contract (batches 1 and 2):
   timeouts off); one overall timeout `OPENTTD_AGENT_CALL_TIMEOUT_S` (default 3600 s).
 - `test/parity.test.js`: every command through the CLI and MCP against identical fake servers.
 
+Observation and output (batch 6):
+
+- `status` gains `date` ("YYYY-MM-DD") and `me` (your company's row: money, loan, max_loan, value,
+  cargo_delivered, performance, profit of the last full quarter). Read `me`, never `companies[0]`:
+  the list holds every company and ids need not start at your company. `summary` gets the same
+  `date` and `me` header.
+- `companies` gains `date`; every row and `history` row gains `profit` (income + expenses).
+- `tiles --format text` (up to 80x80): one character per tile (class letter, upper case = owned by
+  your company), an x ruler and rows `"y|chars"`. `tiles --x --y --radius R` instead of the corners
+  (both formats). The box is clipped to the map.
+- `stations --ids A,B`, `--near_x X --near_y Y [--radius R]` (nearest first, each with `distance`),
+  `--unserved true` and `--max_vehicles N`. **Breaking:** the default `--limit` for your own
+  company rises from 100 to 1000 (another company's stay at 100).
+- `events --type a,b` takes a list (any matches), `--exclude a,b` leaves types out, and
+  `--companies A,B` (alias `--company N`) keeps events about those companies. The argument is
+  not `company` on purpose: the relay forces `company` to the player's own, and news is public.
+- `airport-sites --towns A,B`: several towns in one call (`towns[{town, sites}]`; a town that is
+  not found gets `error`). `--town` alone keeps the old result.
+- Every game action (every session command with `--dry_run`, also in a dry run) has a top-level
+  `money_after`: the bank balance after the call, from the call's last exec reply (no extra game
+  call), else the result's own `money`, else one GS `companies` read. `--brief` keeps it. Set
+  once in `executeCommand`, so new actions get it too.
+- New `overview [--since SEQ]`: one small per-turn snapshot in place of status, goal-status,
+  companies, stations, vehicles, depots, events and vehicle-problems: date, paused, money, loan,
+  max_loan, value, profit of the last quarter, the goal in one line, a fleet line, the worst
+  vehicles, the lowest-rated stations, depots, action problems, rivals, new events (yours, world
+  and company news) and `latest_seq` for the next call. Lines are capped (`--vehicle_lines`,
+  `--station_lines`, `--event_lines`, `--problem_lines`; `*_total` gives the full counts);
+  problems come one line per kind with the vehicle ids; `--problems false` skips the
+  vehicle-problems traces. Live (6 trains, 4 stations, 2 companies): 0.9-1.3 KB, 0.6 s. Not named `brief`: that is a reserved output argument.
+
 ## 0.7.0 (2026-11-26)
 
 AgentBridge GameScript v12: hosts must run `install-gamescript` and reload the game. Older GameScripts get clear refusals or fallbacks. List outputs and `first_error` changed shape (below), so scripts that parse them need updating.

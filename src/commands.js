@@ -26,6 +26,8 @@ import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhatt
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
 import { takeOutputArgs, shapeResult } from './output.js';
+import { dateString, meFromCompanies, companyProfit, tilesText, splitBox, tileBox, filterStations, wordList, filterEvents, eventLine,
+  shortStationLine, shortVehicleLine, fleetLine, goalLine, problemGroups, depotsLine, rivalLine } from './observe.js';
 import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
@@ -1003,6 +1005,26 @@ async function depotForRoute(s, company, a, id, { cmd }) {
 }
 
 /** "1951 Q2" for the quarter `back` quarters before the running one (GS quarter numbering: 0 = running). */
+/** airport-sites for one town name: flat, noise-checked and (with your company) dry-run checked sites. */
+async function airportSitesNear(s, towns, name, at, a) {
+  const town = towns.find((t) => t.name.toLowerCase().includes(name.toLowerCase()));
+  if (!town) throw new Error(`no town matching '${name}'`);
+  const company = s.cfg.company;
+  const hasCompany = company !== null && company !== undefined;
+  // Own owned land counts as buildable (airports clear it); company from the config, so the relay binds it.
+  const pad = Math.max(at.width, at.height);
+  const box = { x0: town.x - a.radius, y0: town.y - a.radius, x1: town.x + a.radius + pad, y1: town.y + a.radius + pad };
+  const owned = hasCompany ? await ownedLandAt(s, company, ownedLandCandidates(s.map, box)) : null;
+  const sites = findFlatSites(s.map, { cx: town.x, cy: town.y, width: at.width, height: at.height, radius: a.radius, maxHeightSpread: a.max_height_spread, limit: a.limit * 3, owned });
+  const checked = [];
+  for (const site of sites) {
+    const chk = await s.gs.call('check_airport', { x: site.x, y: site.y, type: at.type, ...(hasCompany ? { company } : {}) });
+    checked.push({ ...site, ...chk, noise_ok: chk.noise_increase <= chk.town_allowed_noise });
+    if (checked.filter((c) => c.noise_ok && c.buildable !== false).length >= a.limit) break;
+  }
+  return { town: { name: town.name, x: town.x, y: town.y, population: town.population, pax_unserved: town.pax_unserved, allowed_noise: town.allowed_noise }, sites: checked };
+}
+
 export function quarterLabel(info, back) {
   const idx = info.year * 4 + Math.floor((info.month - 1) / 3) - back;
   return `${Math.floor(idx / 4)} Q${(idx % 4) + 1}`;
@@ -1516,7 +1538,7 @@ export const COMMANDS = [
   // ---- game -------------------------------------------------------------------
   {
     name: 'status', group: 'game', session: true,
-    description: 'Game date, map size, pause state, your company, rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge), background_jobs (queued vehicle sales and wagon jobs, the periodic save; kept in ~/.openttd-agent/jobs-<host>-<port>.json per game, so they survive a daemon restart) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
+    description: 'Game date (`date` "YYYY-MM-DD"; raw in info), map size, pause state, your company (`me`: money, loan, max_loan, value, cargo_delivered, performance, profit of the last full quarter; never read companies[0], it is not necessarily you), rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge), background_jobs (queued vehicle sales and wagon jobs, the periodic save; kept in ~/.openttd-agent/jobs-<host>-<port>.json per game, so they survive a daemon restart) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
     args: z.object({}),
     run: async (ctx) => {
       const s = await ctx.session();
@@ -1528,14 +1550,14 @@ export const COMMANDS = [
       if (bundled !== null && running !== null && running < bundled) {
         warnings.push(`the game runs AgentBridge v${running}; this openttd-agent ${VERSION} ships v${bundled}. Host: openttd-agent install-gamescript, then load or launch the game again (a running game keeps its GameScript); until then newer features say so or fall back`);
       }
-      return { info, my_company: s.cfg.company, companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
+      return { date: dateString(info), info, my_company: s.cfg.company, me: meFromCompanies(companies, s.cfg.company), companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
         tile_mirror: { rows_loaded: loaded, rows_total: s.map.sizeY, load_ms: s.tileLoadMs ?? null },
         versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, background_jobs: s.backgroundJobs(), warnings };
     },
   },
   {
     name: 'companies', group: 'game', session: true,
-    description: 'All companies: money, loan, and for the last full quarter (`period`, e.g. "1951 Q2") income, expenses (negative), company value, cargo delivered and performance rating; station_count and vehicles_by_type {rail, road, water, air} (AgentBridge v12; the company window shows both to anyone). --history N adds the last N quarters per company (`history`: period, value, income, expenses, delivered, performance; newest first; AgentBridge v12). Use for competitor assessment.',
+    description: 'All companies (and the game `date`): money, loan, and for the last full quarter (`period`, e.g. "1951 Q2") income, expenses (negative), profit (income + expenses), company value, cargo delivered and performance rating; station_count and vehicles_by_type {rail, road, water, air} (AgentBridge v12; the company window shows both to anyone). --history N adds the last N quarters per company (`history`: period, value, income, expenses, profit, delivered, performance; newest first; AgentBridge v12). Use for competitor assessment.',
     args: z.object({ history: int().min(0).max(24).default(0).describe('quarters of history per company (0 = none)') }),
     run: async (ctx, a) => {
       const s = await ctx.session();
@@ -1543,12 +1565,12 @@ export const COMMANDS = [
       const out = [];
       for (const c of rows) {
         const { vehicles_by_type: vt, ...rest } = c;
-        const row = { ...rest, period: quarterLabel(info, 1), ...(vt ? { vehicles_by_type: { rail: vt[0], road: vt[1], water: vt[2], air: vt[3] } } : {}) };
+        const row = { ...rest, profit: companyProfit(c), period: quarterLabel(info, 1), ...(vt ? { vehicles_by_type: { rail: vt[0], road: vt[1], water: vt[2], air: vt[3] } } : {}) };
         if (a.history > 0) {
           try {
             const h = await s.gs.call('company_history', { company: c.id, quarters: a.history });
             row.history = h.filter((r) => r[0] >= 1).sort((p, q) => p[0] - q[0])
-              .map(([q, value, income, expenses, delivered, performance]) => ({ period: quarterLabel(info, q), value, income, expenses, delivered, performance }));
+              .map(([q, value, income, expenses, delivered, performance]) => ({ period: quarterLabel(info, q), value, income, expenses, profit: income + expenses, delivered, performance }));
           } catch (e) {
             if (!/unknown cmd/.test(e.message)) throw e;
             row.history = null;
@@ -1557,7 +1579,7 @@ export const COMMANDS = [
         }
         out.push(row);
       }
-      return listResult('companies', out, out);
+      return { date: dateString(info), ...listResult('companies', out, out) };
     },
   },
   {
@@ -1815,58 +1837,65 @@ export const COMMANDS = [
   },
   {
     name: 'airport-sites', group: 'world', session: true,
-    description: 'Find places to build an airport near a town: flat buildable rectangles of the airport size within radius, each checked for town noise limit and (with your company) a dry-run build with cost. With your company (AgentBridge v10), your owned land counts as buildable and each site has owned: true when its whole footprint is your owned land; those sites come first.',
+    description: 'Find places to build an airport near a town: flat buildable rectangles of the airport size within radius, each checked for town noise limit and (with your company) a dry-run build with cost. With your company (AgentBridge v10), your owned land counts as buildable and each site has owned: true when its whole footprint is your owned land; those sites come first. --towns A,B checks several towns in one call.',
     args: z.object({
-      town: z.string().describe('town name (substring)'), airport: z.string().default('small').describe('airport type name, see airport-types'),
-      radius: int().default(20), max_height_spread: int().default(0), limit: int().default(5),
+      town: z.string().optional().describe('town name (substring)'),
+      towns: z.string().optional().describe('comma-separated town names: one call checks several towns (result: towns[{town, sites}])'),
+      airport: z.string().default('small').describe('airport type name, see airport-types'),
+      radius: int().default(20), max_height_spread: int().default(0), limit: int().default(5).describe('sites per town'),
     }),
     run: async (ctx, a) => {
       const s = await ctx.session();
+      const names = a.towns !== undefined ? a.towns.split(',').map((t) => t.trim()).filter(Boolean) : a.town !== undefined ? [a.town] : [];
+      if (!names.length) throw new Error('bad_arguments: give --town NAME or --towns A,B');
       const [{ towns }, types] = await Promise.all([s.economy(), s.gs.call('airport_types'), s.ensureTiles()]);
-      const town = towns.find((t) => t.name.toLowerCase().includes(a.town.toLowerCase()));
-      if (!town) throw new Error(`no town matching '${a.town}'`);
       const at = types.find((t) => t.name === a.airport.toLowerCase());
       if (!at) throw new Error(`unknown airport '${a.airport}'. Available: ${types.map((t) => t.name).join(', ')}`);
-      const company = s.cfg.company;
-      const hasCompany = company !== null && company !== undefined;
-      // Own owned land counts as buildable (airports clear it); company from the config, so the relay binds it.
-      const pad = Math.max(at.width, at.height);
-      const box = { x0: town.x - a.radius, y0: town.y - a.radius, x1: town.x + a.radius + pad, y1: town.y + a.radius + pad };
-      const owned = hasCompany ? await ownedLandAt(s, company, ownedLandCandidates(s.map, box)) : null;
-      const sites = findFlatSites(s.map, { cx: town.x, cy: town.y, width: at.width, height: at.height, radius: a.radius, maxHeightSpread: a.max_height_spread, limit: a.limit * 3, owned });
-      const checked = [];
-      for (const site of sites) {
-        const chk = await s.gs.call('check_airport', { x: site.x, y: site.y, type: at.type, ...(hasCompany ? { company } : {}) });
-        checked.push({ ...site, ...chk, noise_ok: chk.noise_increase <= chk.town_allowed_noise });
-        if (checked.filter((c) => c.noise_ok && c.buildable !== false).length >= a.limit) break;
+      if (a.towns === undefined) return { ...(await airportSitesNear(s, towns, names[0], at, a)), airport: at };
+      const out = [];
+      for (const name of names) {
+        try { out.push(await airportSitesNear(s, towns, name, at, a)); } catch (e) { out.push({ town: { name }, error: e.message, sites: [] }); }
       }
-      return { town: { name: town.name, x: town.x, y: town.y, population: town.population, pax_unserved: town.pax_unserved, allowed_noise: town.allowed_noise },
-        airport: at, sites: checked };
+      return { airport: at, towns: out };
     },
   },
   {
     name: 'tiles', group: 'world', session: true,
-    description: 'Raw terrain mirror for a small rectangle: height, slope and class per tile (water, clear, trees, other=houses/objects, rail, road, station, industry...), and (AgentBridge v12) who owns it: "*" = your company, "#" = another company (rail rows in an area are not necessarily yours). Max 40x40.',
-    args: z.object({ ...who, x0: int(), y0: int(), x1: int(), y1: int(), refresh: bool().default(true) }),
+    description: 'Terrain mirror for a rectangle (--x0 --y0 --x1 --y1, or --x --y --radius R): --format json (default, max 40x40): height, slope and class per tile (water, clear, trees, other=houses/objects, rail, road, station, industry...), and (AgentBridge v12) who owns it: "*" = your company, "#" = another company (rail rows in an area are not necessarily yours). --format text (max 80x80): one character per tile (the class letter, UPPER case = owned by your company), an x ruler (one line per digit, read downwards) and rows "y|chars"; heights are left out.',
+    args: z.object({ ...who, x0: int().optional(), y0: int().optional(), x1: int().optional(), y1: int().optional(),
+      x: int().optional().describe('centre x (with --y and --radius, instead of x0..y1)'), y: int().optional(), radius: int().min(0).max(40).optional().describe('tiles around x,y (default 5)'),
+      format: z.enum(['json', 'text']).default('json').describe('text = one character per tile with rulers (max 80x80)'),
+      refresh: bool().default(true) }),
     run: async (ctx, a) => {
-      if ((a.x1 - a.x0 + 1) * (a.y1 - a.y0 + 1) > 1600) throw new Error('area too large; max 40x40 tiles');
       const s = await ctx.session();
+      const box = tileBox(a, s.map.sizeX, s.map.sizeY);
+      const max = a.format === 'text' ? 80 : 40;
+      if (box.x1 - box.x0 + 1 > max || box.y1 - box.y0 + 1 > max) throw new Error(`area too large; max ${max}x${max} tiles${a.format === 'text' ? '' : ' (--format text takes up to 80x80)'}`);
       const me = a.company ?? s.cfg.company;
-      if (a.refresh) await s.refreshArea(a.x0, a.y0, a.x1, a.y1); else await s.ensureTiles();
-      let owners = null;
-      try { owners = new Map((await s.gs.call('tile_owners', { x0: a.x0, y0: a.y0, x1: a.x1, y1: a.y1 })).map(([x, y, o]) => [`${x},${y}`, o])); } catch (e) { if (!/unknown cmd/.test(e.message)) throw e; }
-      const mark = (x, y) => { const o = owners?.get(`${x},${y}`); return o === undefined ? '' : o === me ? '*' : '#'; };
+      if (a.refresh) await s.refreshArea(box.x0, box.y0, box.x1, box.y1); else await s.ensureTiles();
+      let owners = new Map();
+      try {
+        for (const part of splitBox(box, 40)) for (const [x, y, o] of await s.gs.call('tile_owners', part)) owners.set(`${x},${y}`, o);
+      } catch (e) { if (!/unknown cmd/.test(e.message)) throw e; owners = null; }
+      const ownerAt = owners ? (x, y) => owners.get(`${x},${y}`) : null;
+      const oldGs = owners ? {} : { owners: 'not shown: the running AgentBridge is older than v12' };
+      const classes = 'w water c coast i industry s station r rail d road t trees f farm k rocks h rough b clear o other(houses/objects)';
+      if (a.format === 'text') {
+        const text = tilesText(box, (x, y) => s.map.classAt(x, y), ownerAt, me);
+        return { legend: `one character per tile: ${classes}${owners ? '; UPPER case = owned by your company' : ''}. x ruler: one line per digit, read downwards; rows: "y|tiles"`,
+          ...oldGs, ...box, ...text };
+      }
+      const mark = (x, y) => { const o = ownerAt?.(x, y); return o === undefined ? '' : o === me ? '*' : '#'; };
       const rows = [];
-      for (let y = a.y0; y <= a.y1; y++) {
+      for (let y = box.y0; y <= box.y1; y++) {
         const r = [];
-        for (let x = a.x0; x <= a.x1; x++) r.push(`${s.map.classAt(x, y)}${s.map.heightAt(x, y)}${s.map.slopeAt(x, y) ? '/' : ''}${mark(x, y)}`);
+        for (let x = box.x0; x <= box.x1; x++) r.push(`${s.map.classAt(x, y)}${s.map.heightAt(x, y)}${s.map.slopeAt(x, y) ? '/' : ''}${mark(x, y)}`);
         rows.push({ y, tiles: r.join(' ') });
       }
-      return { legend: `class letter + height, "/" = sloped${owners ? ', "*" = owned by your company, "#" = by another company' : ''}. w water c coast i industry s station r rail d road t trees f farm k rocks h rough b clear o other(houses/objects)`,
-        ...(owners ? {} : { owners: 'not shown: the running AgentBridge is older than v12' }), x0: a.x0, rows };
+      return { legend: `class letter + height, "/" = sloped${owners ? ', "*" = owned by your company, "#" = by another company' : ''}. ${classes}`,
+        ...oldGs, x0: box.x0, rows };
     },
   },
-
   {
     name: 'rail-tiles', group: 'world', session: true,
     description: 'Exact rail on a small rectangle (max 32x32), one row per tile with rail: kind (track, station, waypoint, depot, crossing, bridge, tunnel), track pieces (x = along x, y = along y, n/s/e/w = the corner pieces), signals (facing trains that come from which side: from_sw/from_se/from_ne/from_nw, one_way true for one-way path signals), depot front, bridge/tunnel other end, station id, rail type and owner (mine true/false). --mine true keeps only your tiles. AgentBridge v9.',
@@ -1967,13 +1996,21 @@ export const COMMANDS = [
   // ---- operate (read) -------------------------------------------------------------
   {
     name: 'stations', group: 'operate', session: true,
-    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving (count, and vehicle_ids with AgentBridge v12: vehicles with an order for it). Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations). --company X shows another company\'s stations as the game window shows them to anyone (location, facilities, waiting cargo, ratings; no vehicle counts); also through the relay. Returns {total, matched, stations, truncated}.',
+    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving (count, and vehicle_ids with AgentBridge v12: vehicles with an order for it). Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations), ids, near_x/near_y/radius (nearest first, with distance), unserved (no vehicle has an order for it), max_vehicles. --company X shows another company\'s stations as the game window shows them to anyone (location, facilities, waiting cargo, ratings; no vehicle counts); also through the relay. Returns {total, matched, stations, truncated}.',
     args: z.object({ ...who, facility: z.enum(FACILITIES).optional(), cargo: z.string().optional(), min_waiting: int().default(0),
-      max_rating_pct: int().default(100), name: z.string().optional(), limit: int().default(100) }),
+      max_rating_pct: int().default(100), name: z.string().optional(),
+      ids: ids().optional().describe('only these station ids'),
+      near_x: int().optional().describe('with near_y: only stations within --radius tiles (Manhattan) of this tile, nearest first, each with distance'), near_y: int().optional(),
+      radius: int().min(0).default(20).describe('tiles around near_x,near_y'),
+      unserved: bool().default(false).describe('only stations no vehicle has an order for (your company)'),
+      max_vehicles: int().min(0).optional().describe('only stations served by at most this many vehicles (your company)'),
+      limit: int().min(1).optional().describe('most stations to return (default 1000 for your company, 100 for another)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargoFilter = a.cargo !== undefined || a.min_waiting > 0 || a.max_rating_pct < 100;
       const rival = isRival(s, company);
+      if (rival && (a.unserved || a.max_vehicles !== undefined)) throw new Error('refused: --unserved and --max_vehicles need vehicle counts, which another company\'s stations do not show');
+      if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('bad_arguments: give --near_x and --near_y together');
       let all = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).map((st) => (rival ? (({ vehicles, ...rest }) => rest)(st) : st));
       if (!rival) {
         const ids = await stationVehicleIds(s, company);
@@ -1981,7 +2018,8 @@ export const COMMANDS = [
       }
       const hits = all.filter((st) => (!a.facility || st.facilities.includes(a.facility)) && (!a.name || lc(st.name).includes(lc(a.name)))
         && (!cargoFilter || st.cargo.some((c) => (!a.cargo || cargoMatches(c.name, a.cargo)) && c.waiting >= a.min_waiting && c.rating_pct <= a.max_rating_pct)));
-      return { company, ...(rival ? { view: 'other company: what the game shows anyone' } : {}), ...listResult('stations', all, hits, a.limit) };
+      const picked = filterStations(hits, a);
+      return { company, ...(rival ? { view: 'other company: what the game shows anyone' } : {}), ...listResult('stations', all, picked, a.limit ?? (rival ? 100 : 1000)) };
     },
   },
   {
@@ -2023,17 +2061,18 @@ export const COMMANDS = [
   },
   {
     name: 'summary', group: 'operate', session: true,
-    description: 'One compact text line per vehicle and per station, for a quick look without big JSON: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination"; stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
+    description: 'One compact text line per vehicle and per station, for a quick look without big JSON. Header: date and me (money, loan, max_loan, value, performance, profit of the last quarter). Lines: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination"; stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
     args: z.object({ ...who, group: int().optional(), vehicles: ids().optional(), stations: z.string().optional().describe('comma-separated station ids or names'),
       what: z.enum(['all', 'vehicles', 'stations']).default('all'), limit: int().min(1).default(200) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const [stationRows, info, companyRows] = await Promise.all([s.gs.call('stations', { company }), s.gs.call('info'), s.gs.call('companies')]);
+      const stations = stationsFromRows(stationRows, s.cargos);
       const names = new Map(stations.map((st) => [st.id, st.name]));
       const picked = a.group !== undefined || a.vehicles || a.stations;
       const wantV = a.what !== 'stations' && (!picked || a.group !== undefined || a.vehicles);
       const wantS = a.what !== 'vehicles' && (!picked || a.stations);
-      const out = { company };
+      const out = { company, date: dateString(info), me: meFromCompanies(companyRows, company) };
       if (wantV) {
         const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
         const hit = all.filter((v) => (a.group === undefined || v.group === a.group) && (!a.vehicles || a.vehicles.includes(v.id))).sort((p, q) => p.profit_last_year - q.profit_last_year);
@@ -2212,13 +2251,61 @@ export const COMMANDS = [
   },
   {
     name: 'events', group: 'operate', session: true,
-    description: 'Game events since sequence number `since` (keep latest_seq and pass it next time): vehicle_crashed, subsidy_offer/awarded/expired, industry_open/close, company_new/in_trouble/bankrupt/merger, station_first_vehicle, town_founded, exclusive_transport_rights, road_reconstruction. The game does not send scripts vehicle-lost/unprofitable or production-change events: poll `vehicles` and `industries` for those. The buffer holds the last 300 events and restarts when the game is loaded.',
-    args: z.object({ since: int().default(0), type: z.string().optional().describe('substring of the event type') }),
+    description: 'Game events since sequence number `since` (keep latest_seq and pass it next time): vehicle_crashed, subsidy_offer/awarded/expired, industry_open/close, company_new/in_trouble/bankrupt/merger, station_first_vehicle, town_founded, exclusive_transport_rights, road_reconstruction. The game does not send scripts vehicle-lost/unprofitable or production-change events: poll `vehicles` and `industries` for those. The buffer holds the last 300 events and restarts when the game is loaded. Filters: --type a,b (any), --exclude a,b, --companies A,B (or --company N).',
+    // Not `company`: events are public news, and the relay would force `company` to the player's own.
+    args: z.object({ since: int().default(0), type: z.string().optional().describe('comma-separated substrings of the event type (any matches), e.g. crash,subsidy'),
+      exclude: z.string().optional().describe('comma-separated substrings of event types to leave out, e.g. industry,town_founded'),
+      companies: ids().optional().describe('only events about these companies (event company or old_company); --company N works too') }),
     run: async (ctx, a) => {
       const s = await ctx.session();
       const events = await s.gs.call('events', { since: a.since });
       return { latest_seq: events.length ? events.at(-1).seq : a.since, my_company: s.cfg.company,
-        events: events.filter((e) => !a.type || e.type.includes(lc(a.type))) };
+        events: filterEvents(events, { types: wordList(a.type), exclude: wordList(a.exclude), companies: a.companies }) };
+    },
+  },
+
+  {
+    name: 'overview', group: 'operate', session: true,
+    description: 'One small per-turn snapshot instead of status + goal-status + companies + stations + vehicles + depots + events + vehicle-problems: date, paused, money/loan/max_loan/value/profit (last quarter), goal (one line), fleet (one line: counts per type and state, profit, loss makers), vehicle_lines (worst by profit last year), station_lines (lowest rating first), depots, problems (vehicle-problems rows with severity action, one line per problem kind with the vehicle ids), rivals (one line per other company), events since --since (yours, world news and company news; one line each) and latest_seq (pass it as --since next turn). Lines are capped (*_total says how many there are); use the full commands for detail.',
+    args: z.object({ ...who, since: int().min(0).default(0).describe('events after this seq (latest_seq of the last overview); 0 = the newest only'),
+      vehicle_lines: int().min(0).default(5), station_lines: int().min(0).default(6), event_lines: int().min(0).default(5), problem_lines: int().min(0).default(6).describe('most problem kinds shown (one line per kind with the vehicle ids)'),
+      problems: bool().default(true).describe('run the vehicle-problems checks (rail/road traces; about 1 s on a mid-size company)') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const [info, companyRows, goalRows, stationRows, vehicleRows, events, ...depotRows] = await Promise.all([
+        s.gs.call('info'), s.gs.call('companies'), s.gs.call('goal_status', { company }), s.gs.call('stations', { company }), s.gs.call('vehicles', { company }),
+        s.gs.call('events', { since: a.since }), ...VEHICLE_TYPES.map((t) => s.gs.call('depots', { company, type: vehicleTypeId(t) })),
+      ]);
+      const me = meFromCompanies(companyRows, company);
+      const stations = stationsFromRows(stationRows, s.cargos);
+      const names = new Map(stations.map((st) => [st.id, st.name]));
+      const vehicles = vehiclesFromRows(vehicleRows);
+      const minRating = (st) => Math.min(101, ...st.cargo.map((c) => c.rating_pct));
+      // Vehicles inside from the vehicle list: the GS depots count (GSVehicleList_Depot) read 0 for stopped trains in a live 15.3 game.
+      const depots = depotsLine(VEHICLE_TYPES.map((t, i) => [t, depotRows[i]]), vehicles);
+      let problems = null;
+      if (a.problems) {
+        const vp = COMMANDS_BY_NAME.get('vehicle-problems');
+        problems = (await vp.run(ctx, vp.args.parse({ company, severity: 'action' }))).problems;
+      }
+      const COMPANY_NEWS = /^company_/;
+      const seen = events.filter((e) => e.company === undefined || e.company === company || COMPANY_NEWS.test(e.type));
+      const cap = (list, n) => list.slice(Math.max(0, list.length - n));
+      return {
+        company, date: dateString(info), paused: info.paused,
+        ...(me ? { money: me.money, loan: me.loan, max_loan: me.max_loan, value: me.value, profit_last_quarter: me.profit, performance: me.performance } : {}),
+        goal: goalRows.length ? goalLine(goalFromRow(goalRows[0])) : null,
+        fleet: fleetLine(vehicles),
+        vehicles_total: vehicles.length,
+        vehicle_lines: [...vehicles].sort((p, q) => p.profit_last_year - q.profit_last_year).slice(0, a.vehicle_lines).map((v) => shortVehicleLine(v, names)),
+        stations_total: stations.length,
+        station_lines: [...stations].sort((p, q) => minRating(p) - minRating(q)).slice(0, a.station_lines).map(shortStationLine),
+        depots,
+        ...(problems ? { problems_total: problems.length, problems: problemGroups(problems).slice(0, a.problem_lines) } : {}),
+        rivals: companyRows.filter((c) => c.id !== company).slice(0, 8).map(rivalLine),
+        events_new: seen.length, events: cap(seen, a.since === 0 ? Math.min(3, a.event_lines) : a.event_lines).map(eventLine),
+        latest_seq: events.length ? events.at(-1).seq : a.since,
+      };
     },
   },
 
@@ -3034,6 +3121,7 @@ export function aliasArgs(known, raw) {
   move('id', 'vehicles');
   const single = (v) => (Array.isArray(v) && v.length === 1 ? v[0] : typeof v === 'string' && /^\s*\d+\s*$/.test(v) ? v.trim() : v);
   move('vehicles', 'vehicle', single);
+  move('company', 'companies'); // events --company N (events take no `company`: see events)
   return out;
 }
 
@@ -3125,7 +3213,35 @@ export async function executeCommand(ctx, name, rawArgs = {}, { readOnly = false
     }
     return withNotes(res);
   }
-  return withNotes(envelope(await cmd.run(ctx, parsed.data)));
+  // G20: every game action (a command with dry_run) answers with the bank balance after it.
+  const wantMoney = cmd.session && cls === 'dry_run';
+  const mark = wantMoney ? (await ctx.session()).lastExec?.n ?? 0 : 0;
+  const res = envelope(await cmd.run(ctx, parsed.data));
+  if (wantMoney && res.money_after === undefined) {
+    const m = await moneyAfter(ctx, parsed.data.company, mark, res);
+    if (m !== undefined) res.money_after = m;
+  }
+  return withNotes(res);
+}
+
+/**
+ * Bank balance of `company` (default: the configured one) after a call: from the call's last
+ * exec reply when it ran one for that company, else the result's own top-level `money` (GS
+ * replies give the balance after the action), else from GS `companies` (one extra call).
+ * undefined when unknown (no company, the game did not answer).
+ */
+async function moneyAfter(ctx, company, mark, res) {
+  try {
+    const s = await ctx.session();
+    const c = company ?? s.cfg.company;
+    if (c === null || c === undefined) return undefined;
+    const last = s.lastExec;
+    if (last && last.n > mark && last.company === c && typeof last.money === 'number') return last.money;
+    if (typeof res.money === 'number') return res.money;
+    return (await s.gs.call('companies')).find((r) => r.id === c)?.money;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

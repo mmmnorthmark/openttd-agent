@@ -38,7 +38,7 @@ const CASES = {
   'build-hq': { x: 20, y: 30, dry_run: true }, sign: { x: 5, y: 6, text: 'plot A', dry_run: true }, 'sign-remove': { x: 5, y: 6, dry_run: true }, signs: {},
   'test-build-road': { x1: 1, y1: 1, x2: 5, y2: 1 }, 'build-road': { x1: 1, y1: 1, x2: 3, y2: 1, dry_run: true },
   stations: {}, vehicles: {}, vehicle: { vehicle: 11 }, summary: {}, 'vehicle-problems': {}, 'verify-route': { from_station: 'Bigton Woods', to_station: 5 },
-  engines: { type: 'rail', cargo: 'wood' }, groups: {}, depots: {}, events: {},
+  engines: { type: 'rail', cargo: 'wood' }, groups: {}, depots: {}, events: {}, overview: {},
   'group-create': { type: 'rail', name: 'Wood line', dry_run: true }, 'group-rename': { group: 2, name: 'x', dry_run: true }, 'group-delete': { group: 2, dry_run: true },
   'group-move': { group: 2, vehicles: '11', dry_run: true }, 'group-autoreplace': { group: 2, old_engine: 5, new_engine: 6, dry_run: true },
   autorenew: {}, loan: {},
