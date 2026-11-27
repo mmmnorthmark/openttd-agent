@@ -44,3 +44,12 @@ test('status and summary carry date and me', async () => {
   assert.equal(sum.date, st.date);
   assert.equal(sum.me.max_loan, st.me.max_loan);
 });
+
+test('companies rows and history carry profit; the list carries date', async () => {
+  const res = await run('companies', { history: 2 });
+  assert.match(res.date, /^\d{4}-\d\d-\d\d$/);
+  const me = res.companies.find((c) => c.id === 0);
+  assert.equal(me.profit, me.income + me.expenses);
+  assert.ok(me.history.length >= 1);
+  for (const h of me.history) assert.equal(h.profit, h.income + h.expenses);
+});

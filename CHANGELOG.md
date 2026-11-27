@@ -85,6 +85,7 @@ Observation and output (batch 6):
   cargo_delivered, performance, profit of the last full quarter). Read `me`, never `companies[0]`:
   the list holds every company and ids need not start at your company. `summary` gets the same
   `date` and `me` header.
+- `companies` gains `date`; every row and `history` row gains `profit` (income + expenses).
 
 ## 0.7.0 (2026-11-26)
 

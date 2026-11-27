@@ -1537,7 +1537,7 @@ export const COMMANDS = [
   },
   {
     name: 'companies', group: 'game', session: true,
-    description: 'All companies: money, loan, and for the last full quarter (`period`, e.g. "1951 Q2") income, expenses (negative), company value, cargo delivered and performance rating; station_count and vehicles_by_type {rail, road, water, air} (AgentBridge v12; the company window shows both to anyone). --history N adds the last N quarters per company (`history`: period, value, income, expenses, delivered, performance; newest first; AgentBridge v12). Use for competitor assessment.',
+    description: 'All companies (and the game `date`): money, loan, and for the last full quarter (`period`, e.g. "1951 Q2") income, expenses (negative), profit (income + expenses), company value, cargo delivered and performance rating; station_count and vehicles_by_type {rail, road, water, air} (AgentBridge v12; the company window shows both to anyone). --history N adds the last N quarters per company (`history`: period, value, income, expenses, profit, delivered, performance; newest first; AgentBridge v12). Use for competitor assessment.',
     args: z.object({ history: int().min(0).max(24).default(0).describe('quarters of history per company (0 = none)') }),
     run: async (ctx, a) => {
       const s = await ctx.session();
@@ -1545,12 +1545,12 @@ export const COMMANDS = [
       const out = [];
       for (const c of rows) {
         const { vehicles_by_type: vt, ...rest } = c;
-        const row = { ...rest, period: quarterLabel(info, 1), ...(vt ? { vehicles_by_type: { rail: vt[0], road: vt[1], water: vt[2], air: vt[3] } } : {}) };
+        const row = { ...rest, profit: companyProfit(c), period: quarterLabel(info, 1), ...(vt ? { vehicles_by_type: { rail: vt[0], road: vt[1], water: vt[2], air: vt[3] } } : {}) };
         if (a.history > 0) {
           try {
             const h = await s.gs.call('company_history', { company: c.id, quarters: a.history });
             row.history = h.filter((r) => r[0] >= 1).sort((p, q) => p[0] - q[0])
-              .map(([q, value, income, expenses, delivered, performance]) => ({ period: quarterLabel(info, q), value, income, expenses, delivered, performance }));
+              .map(([q, value, income, expenses, delivered, performance]) => ({ period: quarterLabel(info, q), value, income, expenses, profit: income + expenses, delivered, performance }));
           } catch (e) {
             if (!/unknown cmd/.test(e.message)) throw e;
             row.history = null;
@@ -1559,7 +1559,7 @@ export const COMMANDS = [
         }
         out.push(row);
       }
-      return listResult('companies', out, out);
+      return { date: dateString(info), ...listResult('companies', out, out) };
     },
   },
   {
