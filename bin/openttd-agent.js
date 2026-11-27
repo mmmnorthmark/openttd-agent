@@ -60,7 +60,7 @@ function visibleCommands() {
 }
 
 const firstSentence = (text) => {
-  const m = /^(.+?[.!?])(\s|$)/.exec(text);
+  const m = /^(.+?[.!?])(?=\s+[A-Z]|$)/.exec(text); // "e.g. the" is not a sentence end
   const s = m ? m[1] : text;
   return s.length > 110 ? `${s.slice(0, 107)}...` : s;
 };

@@ -5,7 +5,8 @@
 // Reserved arguments (a command that defines the same key itself keeps its own meaning):
 //   fields   "a,b.c" (or an array): keep only these paths. A path whose first key is not a
 //            top-level key applies to the items of every top-level list ("--fields id,name" on
-//            towns). ok, error and first_error are always kept; failed results are not projected.
+//            towns). ok, error, first_error and warnings are always kept; failed results are
+//            not projected (their hints matter).
 //   brief    true: one small object: ok, error, first_error, cost, money, ids, total, matched.
 //   compact  true: one-line JSON; false: indented. Only formatting (the surface applies it).
 //   steps    'failed' (default): exec results list only failed steps (results_failed);
@@ -87,6 +88,7 @@ export function projectFields(result, paths) {
   const tree = fieldTree(paths);
   const out = { ok: result.ok, error: result.error ?? null };
   if (result.first_error !== undefined) out.first_error = result.first_error;
+  if (result.warnings !== undefined) out.warnings = result.warnings;
   const top = {}, items = {};
   for (const [k, sub] of Object.entries(tree)) (k in result ? top : items)[k] = sub;
   for (const [k, sub] of Object.entries(top)) out[k] = project(result[k], sub);
