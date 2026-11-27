@@ -247,3 +247,19 @@ test('vehicle-clone --station clones a vehicle serving that station', async () =
   await assert.rejects(run('vehicle-clone', { station: '4', cargo: 'wood', dry_run: true }), /no vehicle of yours/);
   await assert.rejects(run('vehicle-clone', { dry_run: true }), /--vehicle ID or --station/);
 });
+
+// ---- R4: vehicle-buy --routes -------------------------------------------------------------
+
+test('vehicle-buy --routes: one vehicle per route, its own orders, started', async () => {
+  const res = await run('vehicle-buy', { depot_x: 36, depot_y: 8, engine: 9, routes: 'Bigton Central,Smallham Stop; 7,4' });
+  assert.equal(res.ok, true);
+  assert.equal(res.routes.length, 2);
+  assert.deepEqual(res.routes.map((r) => r.orders.map((o) => o.station)), [[4, 7], [7, 4]]);
+  assert.equal(res.started, true);
+  const ex = fake.received.filter((r) => r.cmd === 'exec').at(-1).args.steps;
+  const [v1, v2] = res.vehicles;
+  assert.deepEqual(ex.filter((st) => st[0] === 'order_add').map((st) => [st[1], st[2], st[3]]), [[v1, 41, 9], [v1, 47, 9], [v2, 47, 9], [v2, 41, 9]]);
+  assert.deepEqual(ex.filter((st) => st[0] === 'veh_start_stop').map((st) => st[1]), [v1, v2]);
+  await assert.rejects(run('vehicle-buy', { depot_x: 36, depot_y: 8, engine: 9, routes: '4,7', orders: '4,7' }), /not with --orders/);
+  await assert.rejects(run('vehicle-buy', { depot_x: 36, depot_y: 8, engine: 9, routes: '4,7;7,4', count: 3 }), /one vehicle per route/);
+});
