@@ -729,12 +729,19 @@ function AgentBridge::CmdDepots(args) {
 	local mode = GSCompanyMode(this.CheckCompany(args));
 	local kinds = [GSTile.TRANSPORT_RAIL, GSTile.TRANSPORT_ROAD, GSTile.TRANSPORT_WATER, GSTile.TRANSPORT_AIR];
 	local out = [];
+	// v13: vehicles inside = vehicles in a depot on that tile (GSVehicleList_Depot counted 0 for trains stopped there).
+	local inside = {};
+	foreach (v, _ in GSVehicleList()) {
+		if (!GSVehicle.IsInDepot(v)) continue;
+		local t = GSVehicle.GetLocation(v);
+		inside[t] <- (t in inside) ? inside[t] + 1 : 1;
+	}
 	foreach (tile, _ in GSDepotList(kinds[args.type])) {
 		local f = -1;
 		if (args.type == 0) f = GSRail.GetRailDepotFrontTile(tile);
 		else if (args.type == 1) f = GSRoad.GetRoadDepotFrontTile(tile);
 		local ok = f != -1 && GSMap.IsValidTile(f);
-		out.append([GSMap.GetTileX(tile), GSMap.GetTileY(tile), GSVehicleList_Depot(tile).Count(), ok ? GSMap.GetTileX(f) : -1, ok ? GSMap.GetTileY(f) : -1]);
+		out.append([GSMap.GetTileX(tile), GSMap.GetTileY(tile), (tile in inside) ? inside[tile] : 0, ok ? GSMap.GetTileX(f) : -1, ok ? GSMap.GetTileY(f) : -1]);
 	}
 	return out;
 }
