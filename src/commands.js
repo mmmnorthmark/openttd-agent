@@ -1493,7 +1493,7 @@ export const COMMANDS = [
   // ---- game -------------------------------------------------------------------
   {
     name: 'status', group: 'game', session: true,
-    description: 'Game date, map size, pause state, your company, rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
+    description: 'Game date, map size, pause state, your company, rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge), background_jobs (queued vehicle sales and wagon jobs, the periodic save; kept in ~/.openttd-agent/jobs-<host>-<port>.json per game, so they survive a daemon restart) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
     args: z.object({}),
     run: async (ctx) => {
       const s = await ctx.session();
@@ -1507,7 +1507,7 @@ export const COMMANDS = [
       }
       return { info, my_company: s.cfg.company, companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
         tile_mirror: { rows_loaded: loaded, rows_total: s.map.sizeY, load_ms: s.tileLoadMs ?? null },
-        versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, warnings };
+        versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, background_jobs: s.backgroundJobs(), warnings };
     },
   },
   {
@@ -1654,7 +1654,7 @@ export const COMMANDS = [
 
   {
     name: 'save', group: 'host', session: true,
-    description: "HOST ONLY: save the running server game over the console (`save <name>`). OpenTTD writes it to the launch profile's save folder (save/<name>.sav next to the profile's openttd.cfg); load it again with launch --load <name>. Name: letters, digits, _ . - only (no paths). Periodic saves: --every_months N --prefix P makes the daemon save P-YYYY-MM every N game months (checked every 20 s while the game runs; also once now); --every_months 0 stops; with neither name nor every_months it shows the schedule. The schedule lives in the daemon (or MCP server) and ends when it restarts.",
+    description: "HOST ONLY: save the running server game over the console (`save <name>`). OpenTTD writes it to the launch profile's save folder (save/<name>.sav next to the profile's openttd.cfg); load it again with launch --load <name>. Name: letters, digits, _ . - only (no paths). Periodic saves: --every_months N --prefix P makes the daemon save P-YYYY-MM every N game months (checked every 20 s while the game runs; also once now); --every_months 0 stops; with neither name nor every_months it shows the schedule. The daemon (or MCP server) runs the schedule; it is kept in ~/.openttd-agent/jobs-<host>-<port>.json for this game and resumes when the daemon reconnects to the same game.",
     args: z.object({ name: z.string().optional().describe('save name without extension, e.g. game-night-1'),
       every_months: int().min(0).max(120).optional().describe('periodic save every N game months (0 = stop)'), prefix: z.string().default('autosave').describe('periodic save name prefix') }),
     run: async (ctx, a) => {

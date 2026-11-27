@@ -150,3 +150,47 @@ test('doctor lists each launch profile with its ports and log state', async () =
   const side = r.servers.find((x) => x.server === 'side');
   assert.deepEqual([side.running, side.game_port, side.admin_port, side.gamescript_in_log], [false, 4989, 4987, 'died']);
 });
+
+test('background jobs persist per game and come back on the next connect (D2)', () => withFake(async (fake, ctx) => {
+  const { Session, jobsFile } = await import('../src/session.js');
+  const s1 = await new Session(ctx.cfg).connect();
+  assert.equal(s1.jobsRestored, null);
+  s1.pendingSales.set('0:5', { company: 0, vehicle: 5, replaced_by: 9, since: 'x' });
+  s1.pendingWagons.set('1:7', { company: 1, vehicle: 7, depot: null, wagon: 3, cargo: 1, count: 2, sent: true });
+  await s1.startAutoSave({ everyMonths: 3, prefix: 't080-auto' });
+  s1.close();
+  const file = jobsFile(ctx.cfg);
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.deepEqual(Object.keys(saved.games), ['42-0'], 'keyed by seed and start date');
+  assert.equal(saved.games['42-0'].auto_save.prefix, 't080-auto', 'closing the session keeps the schedule');
+
+  const s2 = await new Session(ctx.cfg).connect();
+  assert.deepEqual([s2.jobsRestored.pending_sales, s2.jobsRestored.pending_wagons, s2.jobsRestored.periodic_save], [1, 1, true]);
+  const bj = s2.backgroundJobs();
+  assert.deepEqual(bj.pending_sales.map((p) => p.vehicle), [5], 'own company (0) only');
+  assert.equal(bj.other_companies_jobs, 1);
+  assert.equal(bj.periodic_save.every_months, 3);
+  s2.pendingSales.delete('0:5');
+  s2.pendingWagons.delete('1:7');
+  s2.stopAutoSave();
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).games, {}, 'finished jobs leave the file');
+  s2.pendingSales.set('0:6', { company: 0, vehicle: 6 });
+  s2.close();
+
+  fake.state.seed = 7; // another game on the same server
+  const s3 = await new Session(ctx.cfg).connect();
+  assert.equal(s3.jobsRestored, null);
+  assert.equal(s3.pendingSales.size, 0);
+  s3.close();
+}));
+
+test('status shows background_jobs', () => withFake(async (_fake, ctx) => {
+  const { Session } = await import('../src/session.js');
+  const s = await new Session(ctx.cfg).connect();
+  try {
+    const r = await runCommand({ cfg: ctx.cfg, session: async () => s }, 'status', {});
+    assert.deepEqual(r.background_jobs.pending_sales, []);
+    assert.equal(r.background_jobs.periodic_save, null);
+    assert.match(r.background_jobs.persisted_to, /jobs-127\.0\.0\.1-\d+\.json$/);
+  } finally { s.close(); }
+}));
