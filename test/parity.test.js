@@ -58,6 +58,7 @@ const CASES = {
   'build-track': { x: 30, y: 11, from_x: 30, from_y: 12, to_x: 31, to_y: 11, dry_run: true }, 'build-signal': { x: 14, y: 10, front_x: 13, front_y: 10, dry_run: true },
   'station-sites': { industry: 1 }, 'build-terminus': { x: 10, y: 30, platforms: 2, length: 4, dry_run: true },
   'build-passing-loop': { x: 20, y: 40, dir: 'se', length: 5, dry_run: true }, 'loop-sites': { from_station: 3, to_station: 'Sawmill Halt', train_tiles: 2 },
+  'road-stop-sites': { town: 'Bigton', count: 2, spacing: 3, with_depot: true },
   'build-road-path': { x1: 3, y1: 3, x2: 9, y2: 6, dry_run: true }, 'build-road-station': { x: 4, y: 4, front_x: 4, front_y: 5, dry_run: true },
   'build-road-depot': { x: 38, y: 12, front_x: 38, front_y: 11, dry_run: true }, 'build-bridge': { type: 'road', x1: 29, y1: 5, x2: 31, y2: 5, dry_run: true },
   'build-tunnel': { x: 8, y: 8, dry_run: true }, terraform: { x0: 5, y0: 5, x1: 8, y1: 7, dry_run: true }, demolish: { x0: 9, y0: 9, dry_run: true },

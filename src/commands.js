@@ -3183,6 +3183,64 @@ export const COMMANDS = [
 
   // ---- build: road ---------------------------------------------------------------------
   {
+    name: 'road-stop-sites', group: 'build', session: true,
+    description: 'Where a bus or truck stop fits near a town (drive-through stops on straight town roads near the centre, then bay stops), an industry (bay stops within --radius, default 3, of its tiles) or a tile: each site dry-run checked as your company, with cost and build (the build-road-station command to run). --count N (default 3) sites at least --spacing tiles apart (Manhattan; e.g. 6 for a bus network across a town); --cargo C keeps only sites whose catchment accepts it (acceptance, radius 3); --with_depot true adds a depot spot beside a road near the first site (depot.build). rejected counts failed candidates by reason. Changes nothing. Example: --town Bigton --count 4 --spacing 5 --with_depot true',
+    args: z.object({ ...who, town: z.string().optional().describe('town id or name'), industry: int().optional(), x: int().optional(), y: int().optional(),
+      kind: z.enum(['bus', 'truck']).optional().describe('default: bus at a town, truck otherwise'), cargo: z.string().optional().describe('only sites that accept this cargo'),
+      count: int().min(1).max(10).default(3), spacing: int().min(0).max(30).default(0).describe('least tiles between two returned sites'),
+      radius: int().min(1).max(12).optional().describe('search radius; default 4 at a town, 3 at an industry or tile'),
+      with_depot: bool().default(false).describe('also find a road depot spot near the first site') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const [economy] = await Promise.all([s.economy(), s.ensureTiles()]);
+      const end = lineEnd(s, economy, { town: a.town, industry: a.industry, x: a.x, y: a.y });
+      const r = a.radius ?? (end.kind === 'town' ? 4 : 3);
+      const kind = a.kind ?? (end.kind === 'town' ? 'bus' : 'truck');
+      const xs = end.targets.map((t) => t[0]), ys = end.targets.map((t) => t[1]);
+      await s.refreshArea(Math.min(...xs) - r - 8, Math.min(...ys) - r - 8, Math.max(...xs) + r + 8, Math.max(...ys) + r + 8);
+      const cands = end.kind === 'town'
+        ? [...townStopCandidates(s.map, { cx: end.point[0], cy: end.point[1], radius: r, max: 40 }), ...truckStopCandidates(s.map, { targets: [end.point], catchment: r, max: 40 })]
+        : truckStopCandidates(s.map, { targets: end.targets, catchment: r, max: 40 });
+      const want = a.cargo !== undefined ? cargoId(s.cargos, a.cargo) : undefined;
+      const sites = [], rejected = {};
+      const reject = (why) => { rejected[why] = (rejected[why] ?? 0) + 1; };
+      let dryRuns = 0;
+      for (const c of cands) {
+        if (sites.length >= a.count || dryRuns >= Math.max(16, a.count * 8)) break;
+        if (sites.some((p) => p.x === c.x && p.y === c.y)) continue;
+        if (a.spacing && sites.some((p) => tileDistance(p, c) < a.spacing)) { reject('too_close'); continue; }
+        dryRuns++;
+        const steps = [['road_station', c.x, c.y, c.front_x, c.front_y, kind === 'truck', c.drive_through, -1], ...(c.drive_through ? [] : [['road', c.front_x, c.front_y, c.x, c.y]])];
+        const dry = await s.exec(company, steps, { dryRun: true });
+        if (!dry.ok) { reject(dry.first_error ?? 'failed'); continue; }
+        let acceptance;
+        if (want !== undefined) {
+          const lists = await acceptanceAt(s, [[c.x, c.y]], { radius: 3, cargos: [want] });
+          acceptance = lists ? (lists[0][0]?.acceptance ?? 0) : null;
+          if (acceptance !== null && acceptance < ACCEPTED) { reject('not_accepted'); continue; }
+        }
+        sites.push({ x: c.x, y: c.y, front_x: c.front_x, front_y: c.front_y, drive_through: c.drive_through, cost: dry.cost, ...(acceptance !== undefined ? { acceptance } : {}),
+          tiles_from_target: Math.min(...end.targets.map(([tx, ty]) => tileDistance(c, { x: tx, y: ty }))),
+          build: `build-road-station --x ${c.x} --y ${c.y} --front_x ${c.front_x} --front_y ${c.front_y} --kind ${kind}${c.drive_through ? ' --drive_through true' : ''}` });
+      }
+      let depot;
+      if (a.with_depot && sites.length) {
+        const f = sites[0];
+        const roads = [];
+        for (let y = f.y - 6; y <= f.y + 6; y++) for (let x = f.x - 6; x <= f.x + 6; x++) if (s.map.inBounds(x, y) && s.map.classAt(x, y) === 'd') roads.push([x, y]);
+        const skip = new Set(sites.map((p) => `${p.x},${p.y}`));
+        depot = null;
+        for (const d of roadDepotCandidates(s.map, roads, { x: f.x, y: f.y }, { skip })) {
+          const dry = await s.exec(company, [['road_depot', d.x, d.y, d.front_x, d.front_y], ['road', d.front_x, d.front_y, d.x, d.y]], { dryRun: true });
+          if (dry.ok) { depot = { x: d.x, y: d.y, front_x: d.front_x, front_y: d.front_y, cost: dry.cost, build: `build-road-depot --x ${d.x} --y ${d.y} --front_x ${d.front_x} --front_y ${d.front_y}` }; break; }
+        }
+      }
+      return { target: end.what, kind, candidates_on_map: cands.length, dry_runs: dryRuns, rejected, ...listResult('sites', sites, sites),
+        ...(depot !== undefined ? { depot } : {}),
+        ...(sites.length < a.count ? { hint: `${sites.length} of ${a.count} sites found: try --radius ${Math.min(12, r + 3)}${a.spacing ? ', a smaller --spacing' : ''}${a.cargo ? ', or no --cargo' : ''}` } : {}) };
+    },
+  },
+  {
     name: 'build-road-path', group: 'build', session: true,
     description: 'Plan and build a road between two tiles (both included), reusing existing roads where that is cheaper, going round houses and industries, bridging water and rail where it must. dry_run=true for the cost first. road_type (see road-types) lays that road or tram type (tram track can go on existing roads).',
     args: z.object({ ...pathArgs, road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),

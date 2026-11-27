@@ -263,3 +263,19 @@ test('vehicle-buy --routes: one vehicle per route, its own orders, started', asy
   await assert.rejects(run('vehicle-buy', { depot_x: 36, depot_y: 8, engine: 9, routes: '4,7', orders: '4,7' }), /not with --orders/);
   await assert.rejects(run('vehicle-buy', { depot_x: 36, depot_y: 8, engine: 9, routes: '4,7;7,4', count: 3 }), /one vehicle per route/);
 });
+
+// ---- R2 / G10: road-stop-sites ------------------------------------------------------------
+
+test('road-stop-sites: spaced, dry-run checked town sites with a depot spot', async () => {
+  const res = await run('road-stop-sites', { town: 'Bigton', count: 2, spacing: 3, with_depot: true });
+  assert.equal(res.kind, 'bus');
+  assert.equal(res.sites.length, 2);
+  const [p, q] = res.sites;
+  assert.ok(Math.abs(p.x - q.x) + Math.abs(p.y - q.y) >= 3);
+  assert.match(p.build, /^build-road-station --x \d+ --y \d+ --front_x \d+ --front_y \d+ --kind bus/);
+  assert.match(res.depot.build, /^build-road-depot /);
+  const truck = await run('road-stop-sites', { industry: 1, count: 1, cargo: 'wood' });
+  assert.equal(truck.kind, 'truck');
+  assert.equal(truck.sites.length, 0); // the forest end accepts no wood
+  assert.equal(truck.rejected.not_accepted > 0, true);
+});
