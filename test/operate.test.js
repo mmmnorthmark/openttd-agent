@@ -109,13 +109,20 @@ test('order-add resolves a station id to its tile; orders-copy shares', async ()
 });
 
 test('a failed step is reported with its error; group-create returns the id', async () => {
-  const res = await run('vehicle-sell', { vehicles: '5,404,6' });
-  assert.equal(res.ok, false);
-  assert.equal(res.steps_done, 2);
-  assert.equal(res.error, 'step 1 (veh_sell): Vehicle not available');
-  assert.equal(res.first_error, 'failed');
-  assert.deepEqual(res.results_failed.map((r) => [r.step, r.ok]), [[1, false]], 'by default only failed steps are listed');
-  assert.equal(res.results, undefined);
+  const res = await run('vehicle-stop', { vehicles: '5,404,6' });
+  fake.state.failOps = [];
+  assert.equal(res.ok, true);
+  fake.state.failOps = ['veh_start_stop'];
+  const bad = await run('vehicle-stop', { vehicles: '5,404,6' });
+  fake.state.failOps = [];
+  assert.equal(bad.ok, false);
+  assert.equal(bad.error, 'step 0 (veh_start_stop): Vehicle not available');
+  assert.equal(bad.first_error, 'failed');
+  assert.deepEqual(bad.results_failed.map((r) => [r.step, r.ok]), [[0, false], [1, false], [2, false]], 'by default only failed steps are listed');
+  assert.equal(bad.results, undefined);
+  // vehicle-sell checks the vehicles first (0.8.0): unknown ones are not_found, nothing is sent.
+  const sell = await run('vehicle-sell', { vehicles: '5,404,6' });
+  assert.deepEqual([sell.ok, sell.first_error, sell.failed.length], [false, 'not_found', 3]);
   const g = await run('group-create', { type: 'rail', name: 'Wood line' });
   assert.equal(g.group, 100);
   assert.deepEqual(lastExec().steps, [['group_create', 0, 'Wood line', -1]]);
@@ -575,6 +582,7 @@ test('sign, signs, sign-remove (v12)', async () => {
 
 test('vehicle-problems rows carry as_of and days_watched; --fresh restarts the history', async () => {
   fake.state.trainInDepot = true;
+  (await ctx.session()).pendingSales.clear(); // an earlier vehicle-replace queued train 11 (it would show as pending_sale)
   try {
     const r = await run('vehicle-problems', { trace: false });
     const row = r.problems.find((p) => p.problem === 'stopped_in_depot');

@@ -29,7 +29,7 @@ import { takeOutputArgs, shapeResult } from './output.js';
 import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
-import { townRatingFromRow, authorityNeed, RATING_HINT, moneyDetail } from './fleet.js';
+import { townRatingFromRow, authorityNeed, RATING_HINT, moneyDetail, soldText } from './fleet.js';
 
 // Strict numbers (0.8.0): plain z.number(); runCommand (parseArgs) turns a numeric string ("12", " -3 ")
 // into its number. null, "", false and [] are no longer 0 (company 0 is a real company).
@@ -906,11 +906,25 @@ async function longestTrainOnLine(s, company, id) {
 
 // ---- depot guard (vehicle-clone, vehicle-buy --route_of) ---------------------------------
 
-/** Source vehicle row (type, position) of this company. */
+/** Source vehicle row (type, position) of this company. A sold vehicle's error says when and who serves its stations now (L10). */
 async function vehicleOf(s, company, id) {
   const veh = vehiclesFromRows(await s.gs.call('vehicles', { company })).find((v) => v.id === id);
-  if (!veh) throw new Error(`vehicle ${id} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
+  if (!veh) throw new Error((await soldNote(s, company, id)) ?? `vehicle ${id} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
   return veh;
+}
+
+/** Ledger text (L10) for a vehicle id this session sold, or null: sale date, replacement, vehicles now serving its stations. */
+async function soldNote(s, company, id) {
+  const e = s.soldVehicles?.get(`${company}:${id}`);
+  if (!e) return null;
+  const ids = e.stations?.length ? await stationVehicleIds(s, company) : null;
+  const serving = ids ? [...new Set(e.stations.flatMap((st) => ids.get(st) ?? []))].sort((p, q) => p - q) : [];
+  return soldText(e, serving);
+}
+
+/** Station ids in a vehicle's orders (for the sale ledger); [] when it cannot be read. */
+async function orderStationIds(s, company, id) {
+  try { return [...new Set((await currentOrderOf(s, company, id)).orders.filter((o) => o.kind === 'station').map((o) => o.station))]; } catch { return []; }
 }
 
 /** A vehicle's order stations, in order, as rows from `stations`. */
@@ -2133,7 +2147,13 @@ export const COMMANDS = [
     args: z.object({ ...who, vehicle: int() }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      return vehicleDetail(await s.gs.call('vehicle', { company, vehicle: a.vehicle }), s.cargos);
+      let rows;
+      try { rows = await s.gs.call('vehicle', { company, vehicle: a.vehicle }); } catch (e) {
+        const note = /does not exist/.test(e.message) ? await soldNote(s, company, a.vehicle) : null;
+        if (note) return { ok: false, error: note, first_error: 'already_sold', vehicle: a.vehicle, sold: s.soldVehicles.get(`${company}:${a.vehicle}`) };
+        throw e;
+      }
+      return vehicleDetail(rows, s.cargos);
     },
   },
   {
@@ -2168,8 +2188,9 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-problems', group: 'operate', session: true,
-    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), stalled_on_line (speed 0 on the same tile for stall_days, not at a station or broken down; the daemon samples every 15 s once vehicle-problems has run), deadlock (two such trains within 16 tiles: reverse one with vehicle-reverse), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot (with how long it has been parked), loose_wagons (wagons without a locomotive in a depot), stopped, old, broken_down, low_reliability, crashed. Every row has as_of (game date of this sample) and days_watched (how long the history behind it is); --fresh true starts the history again. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
-    args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'),
+    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), stalled_on_line (speed 0 on the same tile for stall_days, not at a station or broken down; the daemon samples every 15 s once vehicle-problems has run), deadlock (two such trains within 16 tiles: reverse one with vehicle-reverse), pending_sale (queued by vehicle-sell or vehicle-replace; nothing else is reported for it), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot (with how long it has been parked), loose_wagons (wagons without a locomotive in a depot), stopped, old, broken_down, low_reliability, crashed. Every row has as_of (game date of this sample) and days_watched (how long the history behind it is); --fresh true starts the history again. Filters: --vehicles A,B, --type, --problem a,b. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
+    args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'), vehicles: ids().optional().describe('check only these vehicle ids'),
+      type: z.enum(VEHICLE_TYPES).optional().describe('only vehicles of this type'), problem: z.string().optional().describe('only these problems, comma-separated (e.g. stuck_or_lost,no_income)'),
       stuck_days: int().min(1).default(30).describe('game days without progress before a vehicle counts as stuck or lost'),
       stall_days: int().min(1).default(10).describe('game days standing still on one tile (speed 0, not at a station) before stalled_on_line / deadlock'),
       trace: bool().default(true).describe('check rail (and, AgentBridge v11, road) connectivity to each vehicle\'s destination'),
@@ -2181,8 +2202,11 @@ export const COMMANDS = [
       let vehicles = vehiclesFromRows(await s.gs.call('vehicles', { company }));
       if (a.vehicle !== undefined) {
         vehicles = vehicles.filter((v) => v.id === a.vehicle);
-        if (!vehicles.length) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
+        if (!vehicles.length) throw new Error((await soldNote(s, company, a.vehicle)) ?? `vehicle ${a.vehicle} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
       }
+      if (a.vehicles) vehicles = vehicles.filter((v) => a.vehicles.includes(v.id));
+      if (a.type) vehicles = vehicles.filter((v) => v.type === a.type);
+      const wanted = a.problem ? new Set(a.problem.split(',').map((t) => t.trim()).filter(Boolean)) : null;
       const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
       const stationById = new Map(stations.map((st) => [st.id, st]));
       s.vehicleHistory ??= new Map();
@@ -2204,6 +2228,16 @@ export const COMMANDS = [
       const lineCache = new Map();
       const rows = [];
       for (const v of vehicles) {
+        // L6: a vehicle queued for sale is reported as that alone (not stopped_in_depot or stuck).
+        const sale = s.pendingSales.get(`${company}:${v.id}`);
+        if (sale) {
+          if ((a.severity === 'all' || a.severity === 'info') && (!wanted || wanted.has('pending_sale'))) {
+            rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, problem: 'pending_sale', severity: 'info',
+              evidence: `queued for sale since ${sale.since ?? '?'}${sale.replaced_by !== undefined && sale.replaced_by !== null ? ` (replaced by ${sale.replaced_by})` : ''}; ${v.state === 'in_depot' ? 'in a depot: sold at the next check (20 s)' : sale.send && !sale.sent ? 'no depot found yet: sent again every 20 s' : 'heading to a depot'}`,
+              suggested_fix: `nothing: it is sold when it stops in a depot (vehicle-start --vehicles ${v.id} --cancel_sale true keeps it instead)`, as_of: gameDate(info), days_watched: 0 });
+          }
+          continue;
+        }
         let orders = null;
         if (v.current_order === undefined && v.order_count > 0) { // AgentBridge before v9: one `vehicle` call each
           const cur = await currentOrderOf(s, company, v.id);
@@ -2241,7 +2275,7 @@ export const COMMANDS = [
         }
         for (const p of vehicleProblems(v, { today: info.date, stuckDays: a.stuck_days, progress, reach, line, stall: stalls.get(v.id), stallDays: a.stall_days, partners: partners.get(v.id), parkedDays: s.depotHistory.has(`${company}:${v.id}`) ? info.date - s.depotHistory.get(`${company}:${v.id}`) : null })) {
           const seen = [s.vehicleHistory.get(`${company}:${v.id}`)?.first, s.stallHistory.get(`${company}:${v.id}`)?.since, s.depotHistory.get(`${company}:${v.id}`)].filter((d) => d !== undefined);
-          if (a.severity === 'all' || a.severity === p.severity) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p, as_of: gameDate(info), days_watched: seen.length ? info.date - Math.min(...seen) : 0 });
+          if ((a.severity === 'all' || a.severity === p.severity) && (!wanted || wanted.has(p.problem))) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p, as_of: gameDate(info), days_watched: seen.length ? info.date - Math.min(...seen) : 0 });
         }
       }
       const samples = vehicles.map((v) => s.vehicleHistory.get(`${company}:${v.id}`)).filter(Boolean);
@@ -2630,9 +2664,21 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-start', group: 'operate', session: true,
-    description: 'Start vehicles (comma-separated ids). Already running ones are left alone.',
-    args: z.object({ ...act, vehicles: ids() }),
-    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true }),
+    description: 'Start vehicles (comma-separated ids). Already running ones are left alone. A vehicle queued for sale (vehicle-sell, vehicle-replace) is refused with queued_for_sale: starting it would only send it round again; --cancel_sale true takes it off the queue and starts it.',
+    args: z.object({ ...act, vehicles: ids(), cancel_sale: bool().default(false).describe('take vehicles off the sale queue and start them') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const queued = a.vehicles.filter((v) => s.pendingSales.has(`${company}:${v}`));
+      if (queued.length && !a.cancel_sale) {
+        return { ok: false, dry_run: a.dry_run, error: `queued_for_sale: vehicle${queued.length > 1 ? 's' : ''} ${queued.join(', ')} ${queued.length > 1 ? 'are' : 'is'} queued for sale and will be sold in the depot; nothing was started. To keep ${queued.length > 1 ? 'them' : 'it'}: vehicle-start --vehicles ${queued.join(',')} --cancel_sale true`,
+          first_error: 'queued_for_sale', queued_for_sale: queued, results: [] };
+      }
+      if (queued.length && !a.dry_run) for (const v of queued) s.pendingSales.delete(`${company}:${v}`);
+      const res = await run(ctx, a, a.vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
+      const sold = [];
+      for (const r of res.results.filter((x) => !x.ok)) { const note = await soldNote(s, company, a.vehicles[r.step]); if (note) sold.push(note); }
+      return { ...res, ...(queued.length ? { sale_cancelled: a.dry_run ? [] : queued } : {}), ...(sold.length ? { already_sold: sold } : {}) };
+    },
   },
   {
     name: 'vehicle-stop', group: 'operate', session: true,
@@ -2665,9 +2711,50 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-sell', group: 'operate', session: true,
-    description: 'Sell vehicles (comma-separated ids). Each must be stopped inside a depot (vehicle-depot, then check `vehicles --state in_depot`). The negative cost is the sale income.',
-    args: z.object({ ...act, vehicles: ids() }),
-    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_sell', v]), { keepGoing: true }),
+    description: 'Sell vehicles (comma-separated ids) in one call: ones stopped in a depot are sold now (sold, income); the others are sent to a depot and queued (queued): the daemon (or relay) sells each when it stops there (checked every 20 s; status background_jobs, vehicle-problems pending_sale; kept in the jobs file). --send false sells only the ones in a depot and fails the rest (not_in_depot). A vehicle already sold through openttd-agent is already_sold (ok) with the sale date. The negative cost is the sale income.',
+    args: z.object({ ...act, vehicles: ids(), send: bool().default(true).describe('send vehicles that are not in a depot there and sell them on arrival (false = refuse them)') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const rows = new Map(vehiclesFromRows(await s.gs.call('vehicles', { company })).map((v) => [v.id, v]));
+      const now = [], toQueue = [], alreadyQueued = [], alreadySold = [], failed = [];
+      for (const id of [...new Set(a.vehicles)]) {
+        const v = rows.get(id);
+        if (!v) {
+          const note = await soldNote(s, company, id);
+          if (note) alreadySold.push({ vehicle: id, note }); else failed.push({ vehicle: id, error: `not_found: vehicle ${id} does not exist or is not yours` });
+        } else if (v.state === 'in_depot') now.push(v);
+        else if (s.pendingSales.has(`${company}:${id}`)) alreadyQueued.push(id);
+        else if (a.send) toQueue.push(v);
+        else failed.push({ vehicle: id, error: `not_in_depot: vehicle ${id} is ${v.state.replace('_', ' ')}; send it with vehicle-depot or use --send true` });
+      }
+      const info = { stations: new Map() };
+      for (const v of [...now, ...toQueue]) info.stations.set(v.id, a.dry_run ? [] : await orderStationIds(s, company, v.id));
+      const sell = now.length ? await run(ctx, a, now.map((v) => ['veh_sell', v.id]), { keepGoing: true }) : null;
+      const sold = [];
+      for (const r of sell?.results ?? []) {
+        const v = now[r.step];
+        if (!r.ok) { failed.push({ vehicle: v.id, error: r.error ?? 'failed' }); continue; }
+        sold.push(v.id);
+        if (!a.dry_run) await s.recordSold({ company, vehicle: v.id, income: -r.cost, unit_number: v.unit_number, name: v.name, stations: info.stations.get(v.id) });
+      }
+      const queued = [];
+      if (toQueue.length) {
+        const sent = await run(ctx, a, toQueue.map((v) => ['veh_depot', v.id, false]), { keepGoing: true });
+        for (const r of sent.results) {
+          const v = toQueue[r.step];
+          if (!r.ok && /^not_found/.test(r.error ?? '')) { failed.push({ vehicle: v.id, error: r.error }); continue; }
+          queued.push({ vehicle: v.id, sent: r.ok, ...(r.ok ? {} : { retrying: r.error ?? 'failed' }) });
+          if (!a.dry_run) s.pendingSales.set(`${company}:${v.id}`, { company, vehicle: v.id, send: true, sent: r.ok, since: new Date().toISOString(), unit_number: v.unit_number, name: v.name, stations: info.stations.get(v.id) });
+        }
+        if (!a.dry_run) s.watchSales();
+      }
+      const income = -(sell?.cost ?? 0);
+      return { ok: !failed.length, dry_run: a.dry_run, error: failed.length ? failed.map((f) => `vehicle ${f.vehicle}: ${f.error}`).join('; ') : null,
+        ...(failed.length ? { first_error: errorCode(failed[0].error) } : {}), cost: sell?.cost ?? 0, income,
+        sold, [a.dry_run ? 'would_queue' : 'queued']: queued, ...(alreadyQueued.length ? { already_queued: alreadyQueued } : {}),
+        ...(alreadySold.length ? { already_sold: alreadySold } : {}), failed, results: sell?.results ?? [],
+        ...(queued.length && !a.dry_run ? { note: 'queued vehicles are sold when they stop in a depot (the daemon checks every 20 s); wait --vehicles ... --until sold waits for it' } : {}) };
+    },
   },
   {
     name: 'vehicle-refit', group: 'operate', session: true,

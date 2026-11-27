@@ -130,3 +130,55 @@ test('build results carry the station id and the depot tile', async () => {
   assert.deepEqual(dd.depot, { x: 13, y: 22 });
   assert.equal((await run('build-rail-station', { x: 10, y: 20, dry_run: true })).station, undefined);
 });
+
+// ---- G6 / L5 / L6 / L10: selling --------------------------------------------------------------
+
+test('vehicle-sell: sells what is in a depot, queues the rest; the queue shows in vehicle-problems and blocks vehicle-start', async () => {
+  const s = await ctx.session();
+  try {
+    const res = await run('vehicle-sell', { vehicles: '11' });
+    assert.equal(res.ok, true);
+    assert.deepEqual(res.sold, []);
+    assert.deepEqual(res.queued, [{ vehicle: 11, sent: true }]);
+    assert.ok(s.pendingSales.has('0:11'));
+    const probs = await run('vehicle-problems', { vehicles: '11', trace: false });
+    assert.deepEqual(probs.problems.map((p) => p.problem), ['pending_sale']);
+    const start = await run('vehicle-start', { vehicles: '11' });
+    assert.equal(start.first_error, 'queued_for_sale');
+    assert.equal((await run('vehicle-sell', { vehicles: '11' })).already_queued[0], 11);
+    fake.state.trainInDepot = true;
+    const done = await s.finishSales();
+    assert.deepEqual(done.sold.map((x) => x.vehicle), [11]);
+    assert.equal(s.soldVehicles.get('0:11').stations[0], 3);
+    assert.equal((await run('vehicle-problems', { vehicles: '11', trace: false })).problems.some((p) => p.problem === 'pending_sale'), false);
+  } finally { fake.state.trainInDepot = false; s.pendingSales.clear(); s.soldVehicles.clear(); }
+});
+
+test('vehicle-sell --send false refuses vehicles outside a depot; a sold vehicle is already_sold', async () => {
+  const s = await ctx.session();
+  fake.state.lostTrain = true;
+  try {
+    const refused = await run('vehicle-sell', { vehicles: '13', send: false });
+    assert.equal(refused.first_error, 'not_in_depot');
+    s.pendingSales.set('0:13', { company: 0, vehicle: 13, send: true, sent: true });
+    const start = await run('vehicle-start', { vehicles: '13', cancel_sale: true });
+    assert.equal(start.ok, true);
+    assert.deepEqual(start.sale_cancelled, [13]);
+    assert.equal(s.pendingSales.has('0:13'), false);
+    await s.recordSold({ company: 0, vehicle: 13, income: 5000, stations: [3, 5] });
+    fake.state.lostTrain = false;
+    const again = await run('vehicle-sell', { vehicles: '13' });
+    assert.equal(again.ok, true);
+    assert.match(again.already_sold[0].note, /^already_sold: vehicle 13 was sold on .* vehicles with orders for its stations now: 11/);
+    const detail = await run('vehicle', { vehicle: 13 });
+    assert.equal(detail.first_error, 'already_sold');
+    await assert.rejects(run('vehicle-clone', { vehicle: 13, dry_run: true }), /already_sold: vehicle 13/);
+  } finally { fake.state.lostTrain = false; s.pendingSales.clear(); s.soldVehicles.clear(); }
+});
+
+test('vehicle-problems: --type and --problem filters', async () => {
+  const res = await run('vehicle-problems', { type: 'road', trace: false });
+  assert.ok(res.problems.every((p) => p.type === 'road'));
+  const only = await run('vehicle-problems', { problem: 'no_income', trace: false });
+  assert.deepEqual([...new Set(only.problems.map((p) => p.problem))], ['no_income']);
+});
