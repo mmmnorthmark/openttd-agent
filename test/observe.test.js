@@ -41,7 +41,7 @@ test('status and summary carry date and me', async () => {
   assert.equal(st.me.money, fake.state.money);
   assert.equal(st.me.profit, 5000);
   const sum = await run('summary', { what: 'stations' });
-  assert.equal(sum.date, st.date);
+  assert.match(sum.date, /^\d{4}-\d\d-\d\d$/); // the fake date runs in real time
   assert.equal(sum.me.max_loan, st.me.max_loan);
 });
 
@@ -118,4 +118,15 @@ test('airport-sites --towns checks several towns in one call', async () => {
   assert.ok(res.towns[0].sites.length >= 1);
   assert.match(res.towns[2].error, /no town matching/);
   await assert.rejects(run('airport-sites', {}), /--town NAME or --towns/);
+});
+
+test('money_after on every game action, also in brief; reads have none', async () => {
+  const dry = await run('build-rail', { x1: 24, y1: 20, x2: 36, y2: 20, dry_run: true, margin: 5 });
+  assert.equal(dry.money_after, 100000);
+  const real = await run('vehicle-start', { vehicles: '11' });
+  assert.equal(typeof real.money_after, 'number');
+  assert.equal((await run('vehicle-sell', { vehicles: '5,404', dry_run: true, brief: true })).money_after, 100000);
+  const road = await run('build-road', { x1: 1, y1: 1, x2: 3, y2: 1, dry_run: true });
+  assert.equal(road.money_after, road.money, 'a GS reply with money is used as is');
+  assert.equal((await run('stations', {})).money_after, undefined);
 });

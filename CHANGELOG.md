@@ -97,6 +97,10 @@ Observation and output (batch 6):
   not `company` on purpose: the relay forces `company` to the player's own, and news is public.
 - `airport-sites --towns A,B`: several towns in one call (`towns[{town, sites}]`; a town that is
   not found gets `error`). `--town` alone keeps the old result.
+- Every game action (every session command with `--dry_run`, also in a dry run) has a top-level
+  `money_after`: the bank balance after the call, from the call's last exec reply (no extra game
+  call), else the result's own `money`, else one GS `companies` read. `--brief` keeps it. Set
+  once in `executeCommand`, so new actions get it too.
 
 ## 0.7.0 (2026-11-26)
 

@@ -3168,7 +3168,35 @@ export async function executeCommand(ctx, name, rawArgs = {}, { readOnly = false
     }
     return withNotes(res);
   }
-  return withNotes(envelope(await cmd.run(ctx, parsed.data)));
+  // G20: every game action (a command with dry_run) answers with the bank balance after it.
+  const wantMoney = cmd.session && cls === 'dry_run';
+  const mark = wantMoney ? (await ctx.session()).lastExec?.n ?? 0 : 0;
+  const res = envelope(await cmd.run(ctx, parsed.data));
+  if (wantMoney && res.money_after === undefined) {
+    const m = await moneyAfter(ctx, parsed.data.company, mark, res);
+    if (m !== undefined) res.money_after = m;
+  }
+  return withNotes(res);
+}
+
+/**
+ * Bank balance of `company` (default: the configured one) after a call: from the call's last
+ * exec reply when it ran one for that company, else the result's own top-level `money` (GS
+ * replies give the balance after the action), else from GS `companies` (one extra call).
+ * undefined when unknown (no company, the game did not answer).
+ */
+async function moneyAfter(ctx, company, mark, res) {
+  try {
+    const s = await ctx.session();
+    const c = company ?? s.cfg.company;
+    if (c === null || c === undefined) return undefined;
+    const last = s.lastExec;
+    if (last && last.n > mark && last.company === c && typeof last.money === 'number') return last.money;
+    if (typeof res.money === 'number') return res.money;
+    return (await s.gs.call('companies')).find((r) => r.id === c)?.money;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

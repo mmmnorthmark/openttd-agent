@@ -193,6 +193,8 @@ export class Session {
       i += n;
     }
     this._economy.at = 0; // world changed; refresh on next read
+    // money_after (G20): executeCommand reads the bank balance of the last exec of a call.
+    this.lastExec = { n: (this.lastExec?.n ?? 0) + 1, company, money: replies.at(-1)?.[0]?.money };
     return execSummary(steps, replies, dryRun);
   }
 
