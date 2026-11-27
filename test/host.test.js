@@ -132,3 +132,21 @@ test('a GS timeout names the cause from the server log: gs_died with the log lin
   gs.diagnose = () => host.diagnoseTarget(host.serverTarget({ admin_password: 'pw' }, 'side'));
   await assert.rejects(gs.call('info', {}, 20), /^Error: gs_died: GS cmd 'info' timed out after 20ms; the GameScript died \(server log .*died unexpectedly/);
 });
+
+test('doctor: a quarantined app bundle is reported (macOS)', { skip: process.platform !== 'darwin' }, async () => {
+  const { quarantine } = await import('../src/setup.js');
+  const { execFileSync } = await import('node:child_process');
+  const app = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'ottd-q-')), 'Fake.app');
+  fs.mkdirSync(path.join(app, 'Contents', 'MacOS'), { recursive: true });
+  const exe = path.join(app, 'Contents', 'MacOS', 'openttd');
+  fs.writeFileSync(exe, '');
+  assert.equal(quarantine(exe), null);
+  execFileSync('xattr', ['-w', 'com.apple.quarantine', '0081;00000000;Test;', app]);
+  assert.deepEqual(quarantine(exe), { app, value: '0081;00000000;Test;' });
+});
+
+test('doctor lists each launch profile with its ports and log state', async () => {
+  const r = await runCommand({ cfg: { host: '127.0.0.1', admin_port: 3977, admin_password: '' } }, 'doctor', {});
+  const side = r.servers.find((x) => x.server === 'side');
+  assert.deepEqual([side.running, side.game_port, side.admin_port, side.gamescript_in_log], [false, 4989, 4987, 'died']);
+});

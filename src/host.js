@@ -126,7 +126,7 @@ export function logTail(dir, { lines = LOG_TAIL_LINES, errors = false, grep } = 
   const total = all.length;
   if (errors) all = all.filter((l) => ERROR_LINE.test(l) && !/\[admin\]/.test(l));
   if (grep) all = all.filter((l) => l.includes(grep));
-  return { file, exists: true, total_lines: total, lines: all.slice(-lines), gs: gsLogState(text) };
+  return { file, exists: true, total_lines: total, lines: lines ? all.slice(-lines) : [], gs: gsLogState(text) };
 }
 
 /** From the log text: did AgentBridge start, and did a script die after its last start? */
@@ -374,5 +374,17 @@ export async function reloadGamescript(target, { saveName } = {}) {
     return { ok, ...(ok ? {} : { error: `gs_version: the game still runs AgentBridge v${loaded.bridge_version} after the reload (v${want} installed); check server-log --errors true` }),
       installed: install, reloaded: true, bridge_version_before: before?.bridge_version ?? null, bridge_version_now: loaded.bridge_version,
       paused: loaded.paused, save: saved.saved, rescan, load: loaded };
+  });
+}
+
+/** Every launch profile on this machine with its ports and whether its OpenTTD runs (doctor). Cheap: no admin login. */
+export function serverStates() {
+  return listServerProfiles().map((name) => {
+    const dir = profileDir(name);
+    const pids = serverPids(path.join(dir, 'openttd.cfg'));
+    const p = profilePorts(dir);
+    const gs = logTail(dir, { lines: 0 }).gs ?? null;
+    return { server: name, running: pids === null ? null : pids.length > 0, pids, game_port: p.game_port, admin_port: p.admin_port,
+      ...(gs ? { gamescript_in_log: gs.state } : {}) };
   });
 }

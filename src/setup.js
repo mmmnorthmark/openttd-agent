@@ -88,6 +88,11 @@ export function doctor() {
   }
   report.next_steps = [];
   if (!exe) report.next_steps.push('Install OpenTTD 15.x');
+  const q = exe ? quarantine(exe) : null;
+  if (q) {
+    report.quarantine = q;
+    report.next_steps.push(`macOS has quarantined ${q.app} (downloaded, never opened): a headless launch may hang on the hidden "are you sure" dialog. Open it once from Finder, or run: xattr -dr com.apple.quarantine "${q.app}"`);
+  }
   if (report.gamescript_installed_version !== report.gamescript_bundled_version) {
     report.gamescript_warning = report.gamescript_installed_version === null ? 'AgentBridge is not installed'
       : `installed AgentBridge v${report.gamescript_installed_version} differs from the v${report.gamescript_bundled_version} this openttd-agent ships`;
@@ -99,6 +104,16 @@ export function doctor() {
     report.next_steps.push(`Launch profile ${gsProblems.map((p) => p.profile).join(', ')}: [game_scripts] lists ${gsProblems.map((p) => p.game_scripts.join(', ') || 'nothing').join('; ')}; AgentBridge must be the only entry: run openttd-agent launch again (it rewrites the section)`);
   }
   return report;
+}
+
+/** macOS: the .app bundle around exe and its com.apple.quarantine value, or null (not macOS, not set, no xattr tool). */
+export function quarantine(exe) {
+  if (process.platform !== 'darwin') return null;
+  const app = exe.includes('.app/') ? exe.slice(0, exe.indexOf('.app/') + 4) : exe;
+  try {
+    const value = execFileSync('xattr', ['-p', 'com.apple.quarantine', app], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return value ? { app, value } : null;
+  } catch { return null; } // exit 1: attribute not set
 }
 
 function removeIfSymlink(p) {

@@ -9,7 +9,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import * as z from 'zod/v4';
 import { doctor, installGamescript, launch, checkSaveName, bundledGsVersion, adminHostForBind, profileDir, TERRAIN_TYPES } from './setup.js';
-import { serverTarget, profilePorts, serverPids, waitReady, notReadyDetail, stopServer, withAdmin, loadSave, listSaves, companyNew, reloadGamescript, logTail, portOpen } from './host.js';
+import { serverTarget, serverStates, profilePorts, serverPids, waitReady, notReadyDetail, stopServer, withAdmin, loadSave, listSaves, companyNew, reloadGamescript, logTail, portOpen } from './host.js';
 import { VERSION } from './version.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
@@ -1237,9 +1237,14 @@ export const COMMANDS = [
   // ---- setup ------------------------------------------------------------------
   {
     name: 'doctor', group: 'setup', session: false,
-    description: 'Check this machine: OpenTTD install, personal dir, original graphics/music, GameScript version. Run first.',
+    description: 'Check this machine: OpenTTD install (and macOS quarantine), personal dir, original graphics/music, GameScript version, and each launch profile\'s server (running, ports, whether its log shows the GameScript died). Run first.',
     args: z.object({}),
-    run: () => doctor(),
+    run: () => {
+      const report = doctor();
+      report.servers = serverStates();
+      for (const sv of report.servers) if (sv.running && sv.gamescript_in_log === 'died') report.next_steps.push(`server '${sv.server}': its log says the GameScript died; load the game again (load${sv.server === 'dedicated' ? '' : ` --server ${sv.server}`} --name <save>) and see server-log --errors true`);
+      return report;
+    },
   },
   {
     name: 'guide', group: 'setup', session: false,
