@@ -86,7 +86,10 @@ export class AdminClient extends EventEmitter {
       const fail = (err) => { clearTimeout(timer); this.sock?.destroy(); reject(err); };
       this._onWelcome = (w) => { clearTimeout(timer); resolve(w); };
       this._onLoginError = fail;
+      let connected = false;
+      const authError = () => new Error(`admin_auth: the server at ${this.host}:${this.port} closed the admin connection before login completed. Check admin_password, that the server has an admin password set and allow_insecure_admin_login = true, and that its admin slots are not full`);
       this.sock = net.createConnection({ host: this.host, port: this.port }, () => {
+        connected = true;
         this._send(PKT.ADMIN_JOIN, Buffer.concat([cstr(this.password), cstr(this.name), cstr('openttd-agent')]));
       });
       this.sock.on('data', (chunk) => {
@@ -94,8 +97,11 @@ export class AdminClient extends EventEmitter {
           for (const [type, body] of splitter.push(chunk)) this._dispatch(type, new Reader(body));
         } catch (e) { log.error('admin', 'packet handling failed', { error: String(e) }); }
       });
-      this.sock.on('error', (e) => { if (!this.welcome) fail(new Error(`admin connect to ${this.host}:${this.port} failed: ${e.message}`)); else log.error('admin', 'socket error', { error: e.message }); });
+      this.sock.on('error', (e) => { if (!this.welcome) fail(connected ? authError() : new Error(`admin connect to ${this.host}:${this.port} failed: ${e.message}`)); else log.error('admin', 'socket error', { error: e.message }); });
       this.sock.on('close', () => {
+        // Closed before welcome: the server refused the login (wrong or empty server admin password,
+        // allow_insecure_admin_login off, admin slots full). Fail now instead of waiting for the timeout.
+        if (!this.welcome) fail(connected ? authError() : new Error(`admin connect to ${this.host}:${this.port} failed: connection closed`));
         if (this._rcon) this._rcon.reject(new Error('admin connection closed'));
         if (!this.closed) log.warn('admin', 'connection closed by server');
         this.emit('close', 'closed');
@@ -167,7 +173,7 @@ export class AdminClient extends EventEmitter {
       }
       case PKT.SERVER_ERROR: {
         const code = r.u8();
-        const err = new Error(`admin login refused: ${SERVER_ERROR_NAMES[code] ?? code}. Check admin_password and that allow_insecure_admin_login = true on the host.`);
+        const err = new Error(`admin_auth: admin login refused: ${SERVER_ERROR_NAMES[code] ?? code}. Check admin_password and that allow_insecure_admin_login = true on the host.`);
         if (!this.welcome) this._onLoginError?.(err); else log.error('admin', err.message);
         return;
       }
