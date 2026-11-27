@@ -11,7 +11,11 @@ OpenTTD world and build for **your** company while you play the same company by 
 
 ## Install / update
 
-Needs Node 20+ and OpenTTD 15.x with the original TTD graphics or OpenGFX (run OpenTTD once first).
+Needs Node 20+ and OpenTTD 14.0-15.3 ([tested versions](docs/COMPATIBILITY.md); get it from the
+[official download page](https://www.openttd.org/downloads/openttd-releases/latest)), with OpenGFX
+or your own original TTD graphics (run OpenTTD once first). Another version (a beta, a nightly, a newer
+release) is refused with `untested_openttd_version` until you pass `--accept_untested true` (or set
+`OPENTTD_AGENT_ACCEPT_UNTESTED=1`). New here? `openttd-agent guide` walks you through it.
 Nothing to clone: run it straight from GitHub with `npx`, pinned to a release tag.
 
 ```sh
@@ -114,7 +118,8 @@ starts nothing and prints no secrets; agents should run it first.
 
 ### Before you start (every machine)
 
-1. **Same OpenTTD version everywhere** (15.x): `openttd-agent doctor` prints `openttd_version`.
+1. **Same OpenTTD version everywhere** (a tested one: 14.0-15.3): `openttd-agent doctor` prints
+   `openttd.version` and its class; `status` compares the server's version with this machine's.
 2. **Node 20+**, and the same openttd-agent tag as the host (`guide` on a player compares them).
 3. **Graphics:** OpenGFX is fine. To use the original TTD graphics, put your own original files in
    `Documents/OpenTTD/baseset`. Run OpenTTD once on each machine.
@@ -213,8 +218,10 @@ refusal: time, player, company, command, arguments, outcome).
 - Start with `openttd-agent guide`: its `next` step usually names the problem, with the error in `detail`.
 - **Can't join the game:** same OpenTTD version on both machines? Firewall open for TCP 3979? Right IP
   (the host's LAN address, not 127.0.0.1)?
-- **`cannot reach the relay`:** is `openttd-agent relay` running on the host, TCP 47978 open, and the
-  URL in `show-config` right?
+- **`relay_unreachable` / `cannot reach the relay`:** is `openttd-agent relay` running on the host, TCP 47978 open, and the
+  URL in `show-config` right? The error carries `hint` and `network`; see [Playing over a network](#playing-over-a-network).
+- **`untested_openttd_version`:** this OpenTTD (or the server's) is not one openttd-agent was tested with;
+  install a tested release, or accept it with `--accept_untested true`. See [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
 - **`missing or unknown token`:** the host re-issues one (`relay-remove-player`, then `relay-add-player`).
 - **`not bound to a company yet`:** the host runs `relay-set-company` (step 8).
 - **`unknown command` through the relay:** player and host run different openttd-agent versions
@@ -235,6 +242,45 @@ refusal: time, player, company, command, arguments, outcome).
 - The relay speaks plain HTTP, so **tokens cross the LAN in clear text**. Fine for a home network;
   don't run it over the internet or on a network you don't trust.
 - Tokens are stored on the host only as SHA-256 hashes (`~/.openttd-agent/relay-players.json`, mode 0600).
+
+## Playing over a network
+
+`openttd-agent net-check` diagnoses the network without admin rights and changes nothing. On a
+player's machine it classifies the host address against this machine's subnets and tries the
+relay (47978) and game (3979) ports; on the host (`--role host`) it shows who listens on the game,
+admin and relay ports and on which address, test-connects the LAN address, reads the firewall
+state (macOS: `socketfilterfw`, including whether OpenTTD and node are blocked; Linux: ufw /
+firewalld; Windows: `netsh`) and lists `fixes`. A relay call or game connection that fails also
+answers with `hint` and `network`.
+
+```
+Player can't reach the host?
+├─ net-check says the host address is "private" and on_local_subnet false
+│    -> you are on another network (another home, a phone hotspot, a guest Wi-Fi).
+│       ├─ same building: join the host's Wi-Fi/LAN, then try again
+│       └─ really remote:
+│            game  -> OpenTTD invite code (host: console --command "setting server_game_type invite-only",
+│                     then console --command server_info prints the +code; player: Multiplayer > Add Server)
+│            relay -> a private mesh VPN such as Tailscale (use the host's 100.x address in the relay URL)
+│                     or a Cloudflare Tunnel to the host's 127.0.0.1:47978 with an access policy
+├─ "nothing listens" (connection refused)
+│    -> the relay or server is not running, or the port is wrong: host runs `openttd-agent relay` / `launch`
+├─ "no answer" (timeout)
+│    -> host firewall, the host asleep, or another network: host runs `net-check --role host`
+└─ the host's net-check
+     ├─ port listens on 127.0.0.1 only -> launch / relay with --bind 0.0.0.0 (or the LAN address)
+     ├─ macOS firewall blocks OpenTTD or node -> allow that app (System Settings > Network > Firewall > Options)
+     ├─ "Block all incoming connections" -> untick only that option and allow the two apps
+     └─ Linux ufw/firewalld, Windows -> allow the port (or app) for your LAN / Private networks only
+```
+
+Allow the app or the port on your private network; never turn the firewall off. The relay speaks
+plain HTTP with a bearer token, so over anything but your own LAN use a mesh VPN or a tunnel with
+access control, not a forwarded port. The mesh VPN, tunnel and invite-code services are other
+projects, linked here only; openttd-agent bundles none of them:
+[OpenTTD multiplayer and invite codes](https://wiki.openttd.org/en/Manual/Multiplayer),
+[Tailscale](https://tailscale.com/kb/1017/install),
+[Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/).
 
 ## Commands
 
@@ -519,3 +565,11 @@ Releasing: bump `version` in package.json, date the CHANGELOG section, update th
 references in this README, commit, then `git tag -a vX.Y.Z -m vX.Y.Z` and push the branch with its tags.
 
 Config lives in `~/.openttd-agent/` (`config.json`, launch `profiles/` with the server's saves and downloaded content, and on the host `relay-players.json`, `relay-audit.jsonl`). Your own `openttd.cfg` is never modified.
+
+## Bonus
+
+Transport Tycoon's composer, John Broomhall, re-arranged and re-recorded all 22 tracks with a live
+band as *Transport Tycoon - The 2014 Sessions* (the music of the 2014 mobile Transport Tycoon).
+His site: [johnbroomhall.co.uk](https://johnbroomhall.co.uk/), with excerpts on
+[his SoundCloud](https://soundcloud.com/johnbroomhallmusic/sets/transport-tycoon-john-broomhall-track-excerpts).
+No audio is bundled with openttd-agent, and it links to no downloads of the original game's files.
