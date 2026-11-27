@@ -82,7 +82,11 @@ export function serverPids(cfgPath) {
   if (process.platform === 'win32') return null;
   try {
     const out = execFileSync('pgrep', ['-f', `openttd.* -c ${escapeRe(cfgPath)}( |$)`], { encoding: 'utf8' });
-    return out.split('\n').map((l) => Number(l.trim())).filter((n) => n > 0 && n !== process.pid);
+    const pids = out.split('\n').map((l) => Number(l.trim())).filter((n) => n > 0 && n !== process.pid);
+    // Only the OpenTTD executable itself: a shell or agent whose command line merely mentions the cfg path must never match.
+    return pids.filter((pid) => {
+      try { return /^openttd/i.test(path.basename(execFileSync('ps', ['-o', 'comm=', '-p', String(pid)], { encoding: 'utf8' }).trim())); } catch { return false; }
+    });
   } catch (e) {
     if (e.status === 1) return []; // pgrep: nothing matched
     return null;

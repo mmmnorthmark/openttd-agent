@@ -194,3 +194,11 @@ test('status shows background_jobs', () => withFake(async (_fake, ctx) => {
     assert.match(r.background_jobs.persisted_to, /jobs-127\.0\.0\.1-\d+\.json$/);
   } finally { s.close(); }
 }));
+
+test('serverPids matches only an OpenTTD executable, never a shell that mentions the cfg path', { skip: process.platform === 'win32' }, async () => {
+  const { spawn } = await import('node:child_process');
+  const cfg = path.join(HOME, 'profiles', 'decoy', 'openttd.cfg');
+  const decoy = spawn('sh', ['-c', `sleep 3; : openttd -c ${cfg} -D x`], { stdio: 'ignore' });
+  await new Promise((r) => setTimeout(r, 200));
+  try { assert.deepEqual(host.serverPids(cfg), []); } finally { decoy.kill(); }
+});
