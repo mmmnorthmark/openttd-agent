@@ -85,13 +85,13 @@ const EXTRA_CASES = [
   ['route-effort', { x1: false, y1: 20, x2: 50, y2: 20 }],             // false is not 0
   ['vehicles', { fields: '' }],                                        // bad reserved value
   ['launch', { server: 'side', game_port: 4979, admin_port: 4977, mode: 'dedicated', admin_password: 'pw', dry_run: true }],
-  ['install-gamescript', { reload: true }],
+  ['install-gamescript', { reload: true, save_name: 'parity-reload' }],
 ];
 
 const isRequired = (name) => (describeCommands().find((d) => d.name === name).args.required ?? []).length > 0;
 
 // Fields that follow the wall clock, not the command (turn-advance races the fake's game clock).
-const VOLATILE = { 'turn-advance': ['to', 'days_advanced', 'real_seconds', 'events', 'latest_seq'] };
+const VOLATILE = { 'turn-advance': ['to', 'days_advanced', 'real_seconds', 'events', 'latest_seq'], doctor: ['disk_free_mb'], launch: ['disk_free_mb'] };
 
 /** The fake game clock stands still between cases (paused at day 0) so dates are the same on both. */
 function freezeClocks() {
@@ -158,7 +158,9 @@ async function mcpCall(client, name, args) {
 /** Same JSON with the per-home paths and ports replaced. */
 function normalise(value, side) {
   const { home, port } = side === 'A' ? { home: homeA, port: fakeA.port } : { home: homeB, port: fakeB.port };
-  const text = JSON.stringify(value).split(home).join('<HOME>').split(fs.realpathSync(home)).join('<HOME>').replace(new RegExp(`\\b${port}\\b`, 'g'), '99999');
+  const text = JSON.stringify(value).split(home).join('<HOME>').split(fs.realpathSync(home)).join('<HOME>').replace(new RegExp(`\\b${port}\\b`, 'g'), '99999')
+    // Free disk space changes between the two calls.
+    .replace(/"disk_free_mb":\d+/g, '"disk_free_mb":0').replace(/\d+ MB free/g, 'N MB free');
   return JSON.parse(text);
 }
 
