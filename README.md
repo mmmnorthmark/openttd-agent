@@ -40,8 +40,12 @@ claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.7.0 mcp
 ```
 
 Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.7.0", "mcp"]`.
-For a small or fast model, expose only the tools it needs and get compact results (unreleased, on `main`):
-`openttd-agent mcp --tools goal-status,stations,vehicles,find-cargo-pairs,build-cargo-route --compact true`.
+For a small or fast model, expose only the tools it needs (unreleased, on `main`):
+`openttd-agent mcp --tools goal-status,stations,vehicles,find-cargo-pairs,build-cargo-route` (or
+`OPENTTD_AGENT_TOOLS=a,b`). MCP results are one-line JSON (`--compact false` indents them);
+`--read_only true` (or `OPENTTD_AGENT_READ_ONLY=1`) turns builds into dry runs and refuses other
+actions. MCP game calls share the background daemon with the CLI (`--no-daemon` keeps them in
+the MCP process). A relay player's MCP server lists only the tools the relay serves.
 Agents that run shell commands can use the CLI directly; it is often faster than MCP because they
 can chain calls (`batch`) and filter JSON.
 
@@ -242,7 +246,7 @@ refusal: time, player, company, command, arguments, outcome).
 | operate: change | `add-train` (checks loops against trains, clones, starts, verifies), `train-add-wagons`, `vehicle-replace` (buy or clone on the route, start, sell the old one when it reaches the depot), `vehicle-reverse`, `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot` (safe to repeat: `already_heading`, `already_in_depot`), `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace`, `loan` (`--amount N`, `--borrow N`, `--repay N` or `--max true`; GameScript v8) |
 | build: rail | `build-cargo-route` (stations, line, depot, train, orders in one call), `station-sites`, `build-line-depot`, `rail-types`, `build-rail` (planned path), `build-track` (one piece, for junctions and depot spurs), `build-rail-station`, `build-rail-depot`, `build-signal`, `build-terminus`, `build-passing-loop` (`--for_vehicle ID` sizes it for that line's longest train and traces the route after; `--remove true` undoes it), `loop-sites` (ranked, dry-run loop sites on a line) |
 | build: road | `build-truck-route` (stops, road, depot, trucks, orders in one call), `road-types`, `build-road-path` (planned path), `build-road-station` and `build-road-depot` (`connected`; `--connect auto` joins them to the nearest road; GameScript v11), `build-road` / `test-build-road` (straight) |
-| build: other | `bridge-types`, `build-bridge`, `build-tunnel`, `terraform`, `demolish`, `purchase-land` (owned land, up to 400 tiles; GameScript v10), `build-dock`, `build-buoy`, `build-water-depot`, `build-airport` |
+| build: other | `build-hq` (company headquarters), `bridge-types`, `build-bridge`, `build-tunnel`, `terraform`, `demolish`, `purchase-land` (owned land, up to 400 tiles; GameScript v10), `build-dock`, `build-buoy`, `build-water-depot`, `build-airport` |
 
 Every command that changes the game takes `--dry_run true` (cost and feasibility only). It acts as
 your company: the one the host bound your token to (a different `--company` is refused).
@@ -256,6 +260,36 @@ as `ERR_AREA_NOT_CLEAR`, or one of ours such as `no_signal_here` or `refused`. L
 cut the list. Build results keep their per-step `results[]`; in a dry run, a signal on track the
 same command would lay is marked `skipped_in_dry_run` instead of failing, so a dry run's `ok` is
 trustworthy. Cargo names are matched loosely: `iron_ore`, `Iron Ore` and `iron-ore` are the same.
+
+**Output controls and arguments (unreleased, on `main`; the same on the CLI, in `batch` and over MCP).**
+
+- Every command also takes `--fields a,b.c` (keep only these paths; a name that is not a
+  top-level key applies to the items of every list, so `towns --fields id,name` gives
+  `towns: [{id, name}]`; `ok`, `error`, `first_error`, `warnings` always stay; failures are never
+  cut), `--brief true` (one small object: `ok`, `cost`, `money`, `ids`, and the error on a failure),
+  `--compact true|false` and `--steps all`.
+- Build results list only the failed steps: `results_failed` with `steps_done` / `steps_total`.
+  `--steps all` gives the full `results`. A failed step never carries a `value`.
+- The CLI prints one-line JSON when its output is piped (`--compact false`, or
+  `OPENTTD_AGENT_COMPACT=0`, indents it) and exits 1 whenever the result has `ok: false`. MCP sets
+  `isError` on the same results; a `batch` line is `{"name", "result"}` and counts as failed the same way.
+- Arguments are checked the same way everywhere: an unknown argument is refused and nothing runs
+  (`first_error: unknown_argument`), a missing one says `required` (`bad_arguments`), an unknown
+  command is `unknown_command`. `null` (and `""` for a number) means "not given"; `false` or `[]`
+  is never a number (it used to be 0, which is company 0). A number works for a text argument
+  (`--join 12`). Read commands and dry runs clamp an out-of-range number to its bound and say so
+  (`clamped: {limit: {from: 0, to: 1}}`); a real build refuses it. Read commands ignore
+  `--dry_run` and `--list` (`ignored_args`). On the CLI, a bare word after a value joins it:
+  `--message hello all` is "hello all".
+- `OPENTTD_AGENT_READ_ONLY=1` (CLI) or `mcp --read_only true`: commands with `--dry_run` run as
+  dry runs (`forced_dry_run: true`), reads run, everything else is refused (`read_only`).
+- `OPENTTD_AGENT_TOOLS=a,b` limits the CLI (and `help`, `commands`) to those commands, like `mcp --tools`.
+
+**CLI-only built-ins:** `help [--full]` (one line per command; `--full` with every flag),
+`<command> --help`, `commands` (JSON schemas, as MCP `tools/list` shows them), `batch [--no-daemon]`,
+`mcp`, `daemon`, `daemon-stop`, `relay` (host), `version`. Global flags before the command:
+`--profile NAME`, `--no-daemon` (run this call in this process, not the background daemon),
+`--compact`, `--read_only`.
 
 Examples:
 
@@ -428,7 +462,10 @@ openttd-agent unpause
 | A command says AgentBridge is older than vN | The host runs `install-gamescript`, then loads the game again (`launch --load <save>`). |
 | GS replies stop; log says "The script died unexpectedly" | Look in the launch profile's `openttd.log`; report it with the command you ran. |
 | Can't join from another machine | Launch with `--bind 0.0.0.0` and allow OpenTTD through the firewall (TCP 3979). |
-| Changed the code, behaviour didn't change | `openttd-agent daemon-stop`; the next call starts a fresh daemon. |
+| Changed the code, behaviour didn't change | The CLI restarts a daemon whose code differs (unreleased, on `main`); on 0.7.0 and before: `openttd-agent daemon-stop`. |
+| `warnings: daemon_config_mismatch` | The background daemon runs with other settings (env such as `OPENTTD_AGENT_COMPANY`); the call ran in its own process. Give those settings their own daemon with `OPENTTD_AGENT_DAEMON_PORT`. |
+| `warnings: background_job_not_kept` | A pending sale, wagon attach or periodic save was started with `--no-daemon` (or a profile) and ends with that process; run it through the daemon or a running MCP server. |
+| `daemon_timeout` | No reply within `OPENTTD_AGENT_CALL_TIMEOUT_S` (default 3600 s); the command may still be running in the daemon. |
 | The game shows "cannot reach" on trains | `vehicle-problems`, then `verify-route --vehicle <id>`: it names the gap, or says the train is on another line's track. |
 | A route builds but earns nothing | `stations`: does the drop station show the cargo? `acceptance --x --y --cargo <c>` at it should be >= 8. |
 
@@ -459,7 +496,11 @@ host's agent ──CLI/MCP──▶ openttd-agent ──────────
   then keeps refreshing it in the background. Analysis and path planning run there, so players
   need no map copy and questions don't slow the game.
 - Playing alone, or as the host without the relay: leave `relay` unset and openttd-agent talks to
-  the admin port itself through a local daemon (127.0.0.1 only, started automatically).
+  the admin port itself through a local daemon (127.0.0.1 only, started automatically). The CLI
+  and MCP both use it, so background jobs (pending sales, wagon attaches, periodic saves) and the
+  map mirror are shared. A daemon running other code is restarted (its `/health` reports a
+  `code_id`); one running with other settings (`config_hash`) is left alone and the call runs in
+  the caller's process.
 - Wire protocol: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Development
