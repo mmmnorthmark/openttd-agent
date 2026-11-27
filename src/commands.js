@@ -3355,7 +3355,8 @@ export const COMMANDS = [
 export const COMMANDS_BY_NAME = new Map(COMMANDS.map((c) => [c.name, c]));
 
 /**
- * Forgiving argument names: --id for --vehicle, --vehicle for --vehicles and back (one id).
+ * Forgiving argument names: --id for --vehicle, --vehicle for --vehicles and back (one id), --share and
+ * --share_orders for each other.
  * Returns a new args object; keys the command really has always win.
  */
 export function aliasArgs(known, raw) {
@@ -3369,6 +3370,8 @@ export function aliasArgs(known, raw) {
   move('id', 'vehicles');
   const single = (v) => (Array.isArray(v) && v.length === 1 ? v[0] : typeof v === 'string' && /^\s*\d+\s*$/.test(v) ? v.trim() : v);
   move('vehicles', 'vehicle', single);
+  move('share', 'share_orders'); // vehicle-clone --share (C12)
+  move('share_orders', 'share'); // orders-copy --share_orders
   return out;
 }
 

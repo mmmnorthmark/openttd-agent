@@ -86,3 +86,20 @@ test('every registry command has a read-only class (add new commands to src/read
   const missing = COMMANDS.filter((c) => commandClass(c.name, Object.keys(c.args.shape)) === null).map((c) => c.name);
   assert.deepEqual(missing, []);
 });
+
+test('C12: --share is --share_orders (and back); a lone number on the CLI is the id', async () => {
+  await run('vehicle-clone', { vehicle: 11, share: false, dry_run: true, force: true, depot_x: 13, depot_y: 22, check_route: false });
+  assert.deepEqual(lastExec().steps[0], ['veh_clone', 13, 22, 11, false]);
+  await run('orders-copy', { vehicles: '12', from: 11, share_orders: false, dry_run: true });
+  assert.deepEqual(lastExec().steps[0], ['orders_copy', 12, 11, false]);
+  const { execFile } = await import('node:child_process');
+  const bin = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'openttd-agent.js');
+  const cli = (...argv) => new Promise((resolve) => execFile(process.execPath, [bin, ...argv, '--no-daemon'], { env: process.env }, (_e, out) => resolve(JSON.parse(out))));
+  const one = await cli('vehicle', '11');
+  assert.equal(one.ok, true, JSON.stringify(one).slice(0, 200));
+  assert.equal(JSON.stringify(one).includes('"Train 1"'), true);
+  const clone = await cli('vehicle-clone', '11', '--dry_run', 'true', '--force', 'true', '--depot_x', '13', '--depot_y', '22', '--check_route', 'false');
+  assert.equal(clone.ok, true, JSON.stringify(clone).slice(0, 200));
+  const counted = await cli('vehicle-clone', '--count', '2', '11', '--dry_run', 'true', '--force', 'true', '--depot_x', '13', '--depot_y', '22', '--check_route', 'false');
+  assert.equal(counted.ok, true, 'after a number value, a number is the id');
+});
