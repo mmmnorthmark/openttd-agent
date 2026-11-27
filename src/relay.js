@@ -134,6 +134,7 @@ export function startRelay({ port = loadConfig().relay_port, bind = '0.0.0.0' } 
     }
   });
 
+  server.requestTimeout = 0; // long calls (turn-advance) must not be cut after node's default 5 minutes
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, bind, () => {
