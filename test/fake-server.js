@@ -107,6 +107,14 @@ function fakeRailRows(state) {
   for (let x = 28; x <= 34; x++) rows.push([x, 40, 't', x === 31 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, 0]);
   rows.push([13, 21, 't', 2, -1, -1, -1, 0, 0, 0], [13, 22, 'd', 0, -1, 13, 21, 0, 0, 0],
     [12, 22, 'd', 0, -1, 12, 23, 0, 0, 0], [31, 41, 'd', 0, -1, 31, 40, 0, 0, 0]);
+  // state.railLoop: a short passing loop beside the main line, points (15,20) and (20,20), loop track (15..20,19)
+  // with a signal at (17,19): 3 clear tiles (too short for a 5-tile train).
+  if (state.railLoop) {
+    const at = (x, y) => rows.find((r) => r[0] === x && r[1] === y);
+    at(15, 20)[3] = 1 | 4; at(20, 20)[3] = 1 | 16;
+    rows.push([15, 19, 't', 8, -1, -1, -1, 0, 0, 0], [20, 19, 't', 32, -1, -1, -1, 0, 0, 0]);
+    for (let x = 16; x <= 19; x++) rows.push([x, 19, 't', 1, -1, -1, -1, 0, 0, x === 17 ? 1 << 6 : 0]);
+  }
   return rows.filter((r) => `${r[0]},${r[1]}` !== state.railGap);
 }
 
@@ -344,7 +352,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, railLoop: false, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
   const server = net.createServer((sock) => {
     state.openConnections++;
     sock.on('close', () => { state.openConnections--; });

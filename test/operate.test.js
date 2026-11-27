@@ -268,22 +268,32 @@ test('vehicle-problems: train on another line, losing money, then stuck; unit nu
 test('vehicle-clone: refuses a depot off the route, auto picks a joined one, skips checks off rail', async () => {
   await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true }), /does not exist/); // no lost train in this world
   fake.state.lostTrain = true;
+  fake.state.gsVersion = 12;
   try {
     await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 31, depot_y: 41, dry_run: true }),
       /refused: depot \(31,41\) is not rail-connected to Bigton Woods \(12,20\).*--depot auto \(picks \(13,22\)/);
-    const ok = await run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true });
+    // Train 1 (11) already runs Bigton Woods - Sawmill Halt with no passing loop: a second train is refused.
+    const full = await run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true });
+    assert.deepEqual([full.ok, full.first_error, full.line_check.trains_on_line, full.line_check.passing_loops], [false, 'needs_loop', 1, 0]);
+    assert.match(full.error, /vehicle-clone --force true/);
+    // Without station_vehicles (AgentBridge < v12) the loop check cannot count trains; train 13 still lost money for two years.
+    fake.state.gsVersion = 11;
+    const losing = await run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true });
+    assert.deepEqual([losing.ok, losing.first_error], [false, 'source_unprofitable']);
+    fake.state.gsVersion = 12;
+    const ok = await run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true, force: true });
     assert.equal(ok.route_check, 'connected');
     assert.deepEqual(lastExec().steps[0], ['veh_clone', 13, 22, 13, true]);
     // (12,22) is nearer Bigton Woods but faces away from the line, so auto skips it.
-    const auto = await run('vehicle-clone', { vehicle: 13, depot: 'auto', count: 2, dry_run: true });
+    const auto = await run('vehicle-clone', { vehicle: 13, depot: 'auto', count: 2, dry_run: true, force: true });
     assert.deepEqual(auto.depot, { x: 13, y: 22 });
     assert.deepEqual(auto.depot_auto.skipped.map((t) => t.depot), [{ x: 12, y: 22 }]);
     assert.equal(lastExec().steps.length, 2);
-    assert.deepEqual((await run('vehicle-clone', { vehicle: 13, dry_run: true })).depot, { x: 13, y: 22 });
+    assert.deepEqual((await run('vehicle-clone', { vehicle: 13, dry_run: true, force: true })).depot, { x: 13, y: 22 });
     await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 40, depot_y: 40, dry_run: true }), /no rail depot of company 0 at \(40,40\)/);
     await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 13, dry_run: true }), /both --depot_x and --depot_y/);
     await assert.rejects(run('vehicle-clone', { vehicle: 13, depot: 'auto', depot_x: 13, depot_y: 22, dry_run: true }), /not both/);
-    const skip = await run('vehicle-clone', { vehicle: 13, depot_x: 31, depot_y: 41, check_route: false, dry_run: true });
+    const skip = await run('vehicle-clone', { vehicle: 13, depot_x: 31, depot_y: 41, check_route: false, dry_run: true, force: true });
     assert.match(skip.route_check, /skipped/);
     await assert.rejects(run('vehicle-buy', { depot_x: 31, depot_y: 41, engine: 5, route_of: 13, dry_run: true }), /refused: depot \(31,41\)/);
     assert.equal((await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, route_of: 13, dry_run: true })).route_check, 'connected');
@@ -626,4 +636,14 @@ async function addTrainChecks() {
   assert.deepEqual(fake.received.filter((q) => q.cmd === 'exec').slice(-2).map((q) => q.args.steps[0][0]), ['veh_clone', 'veh_start_stop']);
   assert.equal(yes.started, true);
   assert.ok('verify' in yes);
+  // A real loop that is too short for the 5-tile trains does not count (S2): listed in unusable_loops.
+  fake.state.railLoop = true;
+  try {
+    const short = await run('add-train', { vehicle: 13 });
+    assert.equal(short.first_error, 'needs_loop');
+    assert.deepEqual([short.check.passing_loops, short.check.train_tiles, short.check.loops], [0, 5, []]);
+    assert.deepEqual(short.check.unusable_loops.map((l) => [l.x, l.y, l.clear_tiles, l.signals_ok]), [[15, 20, 3, true]]);
+    assert.match(short.check.unusable_loops[0].why, /^too_short/);
+    assert.match(short.error, /1 more loop is unusable/);
+  } finally { fake.state.railLoop = false; }
 }

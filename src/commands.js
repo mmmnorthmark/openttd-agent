@@ -21,7 +21,7 @@ import { ratingTable, vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMat
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, spreadLoops, plannedRail, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
-import { traceRail, traceRoad, trackExits, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
+import { traceRail, traceRoad, trackExits, findLoops, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
@@ -292,41 +292,60 @@ async function buildLineLoops(s, company, from, to, n, length, railType) {
 }
 
 /**
- * Passing loops on a traced line: points (tiles with more than one track piece) on the path, not in
- * a station and not the junction of a depot spur, counted in pairs. A heuristic: other junctions
- * on the line count too.
+ * Passing loops on a traced line (findLoops: a second track that leaves the line at points and
+ * rejoins it). Usable = signals on both sides and, with trainTiles, room for the train
+ * (clear_tiles >= trainTiles + 1). Returns { count: usable loops, loops: [...], unusable_loops: [...] },
+ * each { x, y (first points), end, clear_tiles, signals_ok, why? }.
  */
-async function countLoops(tracer, path) {
-  let points = 0;
-  // Terminus throats (points just outside the platforms) are not loops: skip 5 tiles past the
-  // last station tile at the start and before the first one at the end.
-  const kinds = [];
-  for (const p of path) kinds.push((await tracer.tileAt(p.x, p.y))?.kind ?? null);
-  let startEnd = 0;
-  while (startEnd + 1 < kinds.length && kinds[startEnd + 1] === 's') startEnd++;
-  let endStart = kinds.length - 1;
-  while (endStart - 1 >= 0 && kinds[endStart - 1] === 's') endStart--;
-  for (const [i, p] of path.entries()) {
-    if (i <= startEnd + 5 || i >= endStart - 5) continue;
-    const t = await tracer.tileAt(p.x, p.y);
-    if (!t || t.kind !== 't') continue;
-    const pieces = [1, 2, 4, 8, 16, 32].filter((b) => t.tracks & b).length;
-    if (pieces < 2) continue;
-    let spur = false;
-    for (const [dx, dy] of TRACE_DIRS) {
-      const n = await tracer.tileAt(p.x + dx, p.y + dy);
-      if (n && n.kind === 'd' && n.a === p.x && n.b === p.y) spur = true;
-      // A short spur to a depot one tile away.
-      if (n && n.kind === 't' && !path.some((q) => q.x === n.x && q.y === n.y)) {
-        for (const [ex, ey] of TRACE_DIRS) {
-          const m = await tracer.tileAt(n.x + ex, n.y + ey);
-          if (m && m.kind === 'd' && m.a === n.x && m.b === n.y) spur = true;
-        }
-      }
-    }
-    if (!spur) points++;
+async function lineLoops(tracer, path, { trainTiles = null } = {}) {
+  const out = { count: 0, loops: [], unusable_loops: [] };
+  for (const l of await findLoops({ path, getTile: tracer.tileAt })) {
+    const why = !l.signals_ok ? `no_signals: ${l.line_signal ? 'the loop side' : l.branch_signal ? 'the line side' : 'neither side'} has a signal, so trains cannot pass there`
+      : trainTiles && l.clear_tiles < trainTiles + 1 ? `too_short: ${l.clear_tiles} clear tiles; a ${trainTiles}-tile train needs ${trainTiles + 1}` : null;
+    const row = { x: l.at.x, y: l.at.y, end: l.end, clear_tiles: l.clear_tiles, signals_ok: l.signals_ok, ...(why ? { why } : {}) };
+    (why ? out.unusable_loops : out.loops).push(row);
   }
-  return Math.floor(points / 2);
+  out.count = out.loops.length;
+  return out;
+}
+
+/** Is `veh` (a vehicles row) losing money for a year or more? (vehicle-clone / add-train guard, L14) */
+const unprofitable = (veh) => veh.age_days >= 365 && veh.profit_last_year < 0 && veh.profit_this_year < 0;
+
+/** source_unprofitable refusal for cloning `veh`, or null. */
+const unprofitableRefusal = (veh) => (unprofitable(veh)
+  ? `source_unprofitable: vehicle ${veh.id} lost money last year (${veh.profit_last_year}) and this year (${veh.profit_this_year}); a clone copies a losing route. Check it with vehicle-problems --vehicles ${veh.id}, or pass --force true`
+  : null);
+
+/**
+ * Can `count` more trains run on vehicle `id`'s line? Trains on the line (same order stations,
+ * AgentBridge v12) against usable passing loops between its first two stations (v9 trace) and the
+ * longest train there. Returns { check, refusal (needs_loop text or null), tracer, stops }.
+ */
+async function lineCapacity(s, company, id, count, { cmd = 'add-train' } = {}) {
+  const info = await s.gs.call('info');
+  const stops = await orderStations(s, company, id);
+  if (stops.length < 2) return { check: null, refusal: null, tracer: null, stops };
+  const ids = await stationVehicleIds(s, company);
+  const sameLine = ids ? (ids.get(stops[0].id) ?? []).filter((v) => stops.every((st) => (ids.get(st.id) ?? []).includes(v))) : null;
+  const tracer = (info.bridge_version ?? 0) >= 9 ? await makeTracer(s, company, info) : null;
+  let loops = null, train = null;
+  if (tracer) {
+    const r = await tracer.trace(await tracer.stationStarts(stops[0]), stops[1]);
+    if (r.connected) {
+      train = await longestTrainOnLine(s, company, id);
+      loops = await lineLoops(tracer, r.path, { trainTiles: train.tiles });
+    }
+  }
+  const trains = sameLine ? sameLine.length : null;
+  const check = { trains_on_line: trains, passing_loops: loops?.count ?? null, after: trains === null ? null : trains + count, allowed: loops === null ? null : loops.count + 1,
+    ...(train ? { train_tiles: train.tiles } : {}), ...(loops ? { loops: loops.loops, unusable_loops: loops.unusable_loops } : {}) };
+  let refusal = null;
+  if (trains !== null && loops !== null && trains + count > loops.count + 1) {
+    const unusable = loops.unusable_loops.length ? ` (${loops.unusable_loops.length} more loop${loops.unusable_loops.length === 1 ? ' is' : 's are'} unusable: see check.unusable_loops)` : '';
+    refusal = `needs_loop: the line already runs ${trains} train${trains === 1 ? '' : 's'} with ${loops.count} usable passing loop${loops.count === 1 ? '' : 's'}${unusable}; ${trains + count} trains on single track need ${trains + count - 1} loops. Build one first: loop-sites --vehicle ${id}, or ${cmd} --force true`;
+  }
+  return { check, refusal, tracer, stops };
 }
 
 /** finishSales() result trimmed to one company (the relay serves several players from one session). */
@@ -2380,16 +2399,28 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-clone', group: 'operate', session: true,
-    description: 'Clone a vehicle `count` times, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check.',
+    description: 'Clone a vehicle `count` times, sharing its orders by default (--share is the same flag); start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check. Trains: refused with needs_loop when the line would run more trains than its usable passing loops + 1 (as add-train; line_check says why); any vehicle that lost money last year and this year is refused with source_unprofitable. --force true skips both.',
     args: z.object({ ...act, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
       depot_x: int().optional(), depot_y: int().optional(), vehicle: int(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
-      check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations') }),
+      check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations'),
+      force: bool().default(false).describe('skip the passing-loop (needs_loop) and source_unprofitable checks') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const { depot, ...check } = await depotForRoute(s, company, a, a.vehicle, { cmd: 'vehicle-clone' });
+      const veh = await vehicleOf(s, company, a.vehicle);
+      let lineCheck = null;
+      if (!a.force) {
+        if (veh.type === 'rail') {
+          const cap = await lineCapacity(s, company, a.vehicle, a.count, { cmd: 'vehicle-clone' });
+          lineCheck = cap.check;
+          if (cap.refusal) return { ok: false, dry_run: a.dry_run, error: cap.refusal, first_error: 'needs_loop', depot, ...check, line_check: lineCheck };
+        }
+        const why = unprofitableRefusal(veh);
+        if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: 'source_unprofitable', depot, ...check };
+      }
       const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, a.share_orders]));
       const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
-      const out = { ...res, depot, ...check, vehicles };
+      const out = { ...res, depot, ...check, ...(lineCheck ? { line_check: lineCheck } : {}), vehicles };
       if (!a.start || a.dry_run || !vehicles.length) return out;
       const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
       return { ...out, started: started.ok };
@@ -2418,27 +2449,16 @@ export const COMMANDS = [
   },
   {
     name: 'add-train', group: 'operate', session: true,
-    description: 'Add a train to a running line safely, in one call: counts the trains on the line of --vehicle (same order stations) and the passing loops on its track between its first two stations (pairs of points outside stations and depot spurs), refuses when the trains would outnumber the loops + 1 (single track: each loop lets one more train run; first_error needs_loop with the loop-sites command), then clones the train at a depot on its own route (sharing orders), starts it and traces the new train\'s route (verify). --force true skips the loop check. AgentBridge v12 (counts) and v9 (trace).',
+    description: 'Add a train to a running line safely, in one call: counts the trains on the line of --vehicle (same order stations) and the usable passing loops on its track between its first two stations (a second track that leaves the line at points and rejoins it, with a signal on each side and room for the longest train: check.loops / check.unusable_loops), refuses when the trains would outnumber the loops + 1 (single track: each loop lets one more train run; first_error needs_loop with the loop-sites command), refuses to copy a train that lost money last year and this year (source_unprofitable), then clones the train at a depot on its own route (sharing orders), starts it and traces the new train\'s route (verify). --force true skips both checks. AgentBridge v12 (counts) and v9 (trace).',
     args: z.object({ ...act, vehicle: int(), count: int().min(1).max(10).default(1), force: bool().default(false) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const info = await s.gs.call('info');
-      const stops = await orderStations(s, company, a.vehicle);
-      if (stops.length < 2) throw new Error(`refused: vehicle ${a.vehicle} has fewer than two station orders`);
-      const ids = await stationVehicleIds(s, company);
-      const sameLine = ids ? (ids.get(stops[0].id) ?? []).filter((v) => stops.every((st) => (ids.get(st.id) ?? []).includes(v))) : null;
-      const tracer = (info.bridge_version ?? 0) >= 9 ? await makeTracer(s, company, info) : null;
-      let loops = null;
-      if (tracer) {
-        const r = await tracer.trace(await tracer.stationStarts(stops[0]), stops[1]);
-        if (r.connected) loops = await countLoops(tracer, r.path);
-      }
-      const trains = sameLine ? sameLine.length : null;
-      const check = { trains_on_line: trains, passing_loops: loops, after: trains === null ? null : trains + a.count, allowed: loops === null ? null : loops + 1 };
-      if (!a.force && trains !== null && loops !== null && trains + a.count > loops + 1) {
-        return { ok: false, dry_run: a.dry_run, error: `needs_loop: the line already runs ${trains} train${trains === 1 ? '' : 's'} with ${loops} passing loop${loops === 1 ? '' : 's'}; ${trains + a.count} trains on single track need ${trains + a.count - 1} loops. Build one first: loop-sites --vehicle ${a.vehicle}, or --force true`,
-          first_error: 'needs_loop', check };
-      }
+      const cap = await lineCapacity(s, company, a.vehicle, a.count, { cmd: 'add-train' });
+      if (cap.stops.length < 2) throw new Error(`refused: vehicle ${a.vehicle} has fewer than two station orders`);
+      const { check, tracer } = cap;
+      if (!a.force && cap.refusal) return { ok: false, dry_run: a.dry_run, error: cap.refusal, first_error: 'needs_loop', check };
+      const why = a.force ? null : unprofitableRefusal(await vehicleOf(s, company, a.vehicle));
+      if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: 'source_unprofitable', check };
       const { depot, ...routeCheck } = await depotForRoute(s, company, { depot: 'auto', check_route: true }, a.vehicle, { cmd: 'vehicle-clone' });
       const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, true]));
       const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
