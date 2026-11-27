@@ -2238,13 +2238,16 @@ export const COMMANDS = [
   },
   {
     name: 'events', group: 'operate', session: true,
-    description: 'Game events since sequence number `since` (keep latest_seq and pass it next time): vehicle_crashed, subsidy_offer/awarded/expired, industry_open/close, company_new/in_trouble/bankrupt/merger, station_first_vehicle, town_founded, exclusive_transport_rights, road_reconstruction. The game does not send scripts vehicle-lost/unprofitable or production-change events: poll `vehicles` and `industries` for those. The buffer holds the last 300 events and restarts when the game is loaded.',
-    args: z.object({ since: int().default(0), type: z.string().optional().describe('substring of the event type') }),
+    description: 'Game events since sequence number `since` (keep latest_seq and pass it next time): vehicle_crashed, subsidy_offer/awarded/expired, industry_open/close, company_new/in_trouble/bankrupt/merger, station_first_vehicle, town_founded, exclusive_transport_rights, road_reconstruction. The game does not send scripts vehicle-lost/unprofitable or production-change events: poll `vehicles` and `industries` for those. The buffer holds the last 300 events and restarts when the game is loaded. Filters: --type a,b (any), --exclude a,b, --companies A,B (or --company N).',
+    // Not `company`: events are public news, and the relay would force `company` to the player's own.
+    args: z.object({ since: int().default(0), type: z.string().optional().describe('comma-separated substrings of the event type (any matches), e.g. crash,subsidy'),
+      exclude: z.string().optional().describe('comma-separated substrings of event types to leave out, e.g. industry,town_founded'),
+      companies: ids().optional().describe('only events about these companies (event company or old_company); --company N works too') }),
     run: async (ctx, a) => {
       const s = await ctx.session();
       const events = await s.gs.call('events', { since: a.since });
       return { latest_seq: events.length ? events.at(-1).seq : a.since, my_company: s.cfg.company,
-        events: events.filter((e) => !a.type || e.type.includes(lc(a.type))) };
+        events: filterEvents(events, { types: wordList(a.type), exclude: wordList(a.exclude), companies: a.companies }) };
     },
   },
 
@@ -3060,6 +3063,7 @@ export function aliasArgs(known, raw) {
   move('id', 'vehicles');
   const single = (v) => (Array.isArray(v) && v.length === 1 ? v[0] : typeof v === 'string' && /^\s*\d+\s*$/.test(v) ? v.trim() : v);
   move('vehicles', 'vehicle', single);
+  move('company', 'companies'); // events --company N (events take no `company`: see events)
   return out;
 }
 

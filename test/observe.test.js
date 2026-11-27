@@ -94,3 +94,19 @@ test('stations --ids --near_x --near_y --unserved --max_vehicles', async () => {
   assert.equal((await run('stations', { unserved: true })).matched, 0);
   await assert.rejects(run('stations', { near_x: 3 }), /near_x and --near_y together/);
 });
+
+test('filterEvents and eventLine', () => {
+  const ev = [{ seq: 1, date: '1950-1-3', type: 'industry_open', industry: 9 }, { seq: 2, date: '1950-2-1', type: 'vehicle_crashed', company: 0, vehicle: 11 },
+    { seq: 3, date: '1950-2-2', type: 'company_merger', company: 2, old_company: 1 }, { seq: 4, date: '1950-3-1', type: 'subsidy_offer', subsidy: 1 }];
+  assert.deepEqual(filterEvents(ev, { types: ['crash', 'subsidy'] }).map((e) => e.seq), [2, 4]);
+  assert.deepEqual(filterEvents(ev, { exclude: ['industry', 'subsidy'] }).map((e) => e.seq), [2, 3]);
+  assert.deepEqual(filterEvents(ev, { companies: [1] }).map((e) => e.seq), [3]);
+  assert.equal(eventLine(ev[1]), 'seq 2 1950-2-1 vehicle_crashed company 0 vehicle 11');
+});
+
+test('events --type list, --exclude, --company', async () => {
+  assert.equal((await run('events', { type: 'crash,industry' })).events.length, 2);
+  assert.deepEqual((await run('events', { exclude: 'industry' })).events.map((e) => e.type), ['vehicle_crashed']);
+  assert.deepEqual((await run('events', { company: 0 })).events.map((e) => e.seq), [2]);
+  assert.equal((await run('events', { companies: '5' })).events.length, 0);
+});

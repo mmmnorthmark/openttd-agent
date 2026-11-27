@@ -92,6 +92,9 @@ Observation and output (batch 6):
 - `stations --ids A,B`, `--near_x X --near_y Y [--radius R]` (nearest first, each with `distance`),
   `--unserved true` and `--max_vehicles N`. **Breaking:** the default `--limit` for your own
   company rises from 100 to 1000 (another company's stay at 100).
+- `events --type a,b` takes a list (any matches), `--exclude a,b` leaves types out, and
+  `--companies A,B` (alias `--company N`) keeps events about those companies. The argument is
+  not `company` on purpose: the relay forces `company` to the player's own, and news is public.
 
 ## 0.7.0 (2026-11-26)
 
