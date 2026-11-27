@@ -40,6 +40,9 @@ function parseFlags(argv) {
     if (a === '--no-daemon') { noDaemon = true; last = null; continue; }
     if (a === '--args') { Object.assign(args, JSON.parse(argv[++i])); last = null; continue; }
     if (!a.startsWith('--')) {
+      // C12: a lone whole number (first, or after a flag/number value) is the id: `vehicle 31`, `vehicle-clone 31 --count 2`.
+      const afterValue = last === null || /^(true|false|-?\d+(\.\d+)?)$/.test(String(args[last]));
+      if (/^\d+$/.test(a) && !('id' in args) && afterValue) { args.id = a; last = null; continue; }
       if (last !== null && typeof args[last] === 'string') { args[last] += ` ${a}`; continue; }
       throw new Error(`bad_arguments: unexpected argument '${a}' (use --key value)`);
     }

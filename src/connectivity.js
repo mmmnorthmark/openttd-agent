@@ -277,3 +277,80 @@ export async function traceRoad({ getTile, starts, isGoal, goal, company, maxSte
   const gap = pool.length ? pool.reduce((best, g) => (dist(g.to) < dist(best.to) ? g : best), pool[0]) : null;
   return { ...out, last_reachable: { x: last.x, y: last.y }, ...(gap ? { first_gap: { x: gap.to.x, y: gap.to.y, from: { x: gap.from.x, y: gap.from.y }, reason: gap.reason } } : {}) };
 }
+
+// ---- passing loops on a traced line (real geometry) ----------------------------------------
+
+const SIGNAL_BITS = 0xFF; // rail_tiles signals: bit d one-way, bit 4+d any signal facing trains from neighbour d
+const LOOP_TILE_KINDS = new Set(['t', 's', 'w']);
+const straightPiece = (t) => t.tracks === 1 || t.tracks === 2; // one straight piece: room for a waiting train (curves at the loop ends are not)
+
+/**
+ * Walk a branch that leaves tile `from` through edge `d`, following the only track exit on each
+ * tile, until it reaches a tile of the line (`index`: "x,y" -> path index). Signals are ignored
+ * (a loop's one-way signals face one direction). Returns { to_index, tiles } or null (dead end,
+ * a junction on the branch, a bridge/tunnel/depot, or longer than maxBranch).
+ */
+async function walkBranch(getTile, from, d, index, fromIndex, maxBranch) {
+  const tiles = [];
+  const seen = new Set();
+  let x = from.x + DIRS[d][0], y = from.y + DIRS[d][1], entry = opposite(d);
+  while (tiles.length <= maxBranch) {
+    const k = key(x, y);
+    const t = await getTile(x, y);
+    if (!t || !LOOP_TILE_KINDS.has(t.kind) || !trackEdges(t.tracks).has(entry)) return null;
+    const j = index.get(k);
+    if (j !== undefined) return j > fromIndex + 1 ? { to_index: j, tiles } : null;
+    if (seen.has(k)) return null;
+    seen.add(k);
+    tiles.push(t);
+    const exits = trackExits(t.tracks, entry);
+    if (exits.length !== 1) return null;
+    x += DIRS[exits[0]][0]; y += DIRS[exits[0]][1]; entry = opposite(exits[0]);
+  }
+  return null;
+}
+
+/**
+ * Passing loops on a traced line, from the track itself: a points tile on `path` (traceRail path,
+ * [{x, y}] in order) where a second track leaves the line and joins it again further along. Not
+ * loops: terminus throats (the branch ends in a platform), depot spurs and branches to other lines
+ * (they never rejoin), crossings (no branch). getTile(x, y) -> rail_tiles tile (may be async).
+ * clear_tiles = min(straight tiles between the points on the line, straight tiles of the branch) - 1,
+ * the room a waiting train has (build-passing-loop's clear_tiles; the same from either side); signals_ok = both sides have a
+ * signal (without one on each side the loop is one block and trains cannot pass there).
+ * Returns [{ from_index, to_index, at: {x, y}, end: {x, y}, line_tiles, branch_tiles, clear_tiles,
+ * line_signal, branch_signal, signals_ok }] in path order.
+ */
+export async function findLoops({ path, getTile, maxBranch = 80 }) {
+  const index = new Map();
+  path.forEach((p, i) => { if (!index.has(key(p.x, p.y))) index.set(key(p.x, p.y), i); });
+  const loops = [];
+  for (let i = 0; i + 1 < path.length; i++) {
+    const t = await getTile(path[i].x, path[i].y);
+    if (!t || t.kind !== 't' || trackEdges(t.tracks).size < 3) continue;
+    const next = dirTo(t.x, t.y, path[i + 1].x, path[i + 1].y);
+    if (next < 0) continue;
+    // Branches: other exits for a train that enters by the same edge as the line's way on (the stem of the points).
+    const branches = new Set();
+    for (let e = 0; e < 4; e++) {
+      const ex = trackExits(t.tracks, e);
+      if (ex.includes(next) && ex.length >= 2) for (const b of ex) if (b !== next) branches.add(b);
+    }
+    for (const b of branches) {
+      const w = await walkBranch(getTile, t, b, index, i, maxBranch);
+      if (!w) continue;
+      const between = path.slice(i + 1, w.to_index);
+      let lineSignal = false, lineStraight = 0;
+      for (const p of between) {
+        const q = await getTile(p.x, p.y);
+        if ((q?.signals ?? 0) & SIGNAL_BITS) lineSignal = true;
+        if (q && straightPiece(q)) lineStraight++;
+      }
+      const branchSignal = w.tiles.some((q) => (q.signals ?? 0) & SIGNAL_BITS);
+      const clear = Math.max(0, Math.min(lineStraight, w.tiles.filter(straightPiece).length) - 1);
+      loops.push({ from_index: i, to_index: w.to_index, at: { x: t.x, y: t.y }, end: { x: path[w.to_index].x, y: path[w.to_index].y },
+        line_tiles: between.length, branch_tiles: w.tiles.length, clear_tiles: clear, line_signal: lineSignal, branch_signal: branchSignal, signals_ok: lineSignal && branchSignal });
+    }
+  }
+  return loops;
+}

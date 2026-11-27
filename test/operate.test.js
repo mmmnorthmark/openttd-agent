@@ -246,6 +246,7 @@ test('verify-route: stations joined, then a gap with the last reachable tile', a
   assert.equal(v.unit_number, 1);
   assert.equal(v.connected, true);
   assert.deepEqual(v.from_vehicle.map((r) => [r.station, r.connected]), [[3, true]]);
+  assert.deepEqual(ok.legs_connected, [true, true], 'there and back');
   await assert.rejects(run('verify-route', { from_station: 3 }), /both --from_station and --to_station/);
 });
 
@@ -277,22 +278,32 @@ test('vehicle-problems: train on another line, losing money, then stuck; unit nu
 test('vehicle-clone: refuses a depot off the route, auto picks a joined one, skips checks off rail', async () => {
   await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true }), /does not exist/); // no lost train in this world
   fake.state.lostTrain = true;
+  fake.state.gsVersion = 12;
   try {
     await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 31, depot_y: 41, dry_run: true }),
       /refused: depot \(31,41\) is not rail-connected to Bigton Woods \(12,20\).*--depot auto \(picks \(13,22\)/);
-    const ok = await run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true });
+    // Train 1 (11) already runs Bigton Woods - Sawmill Halt with no passing loop: a second train is refused.
+    const full = await run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true });
+    assert.deepEqual([full.ok, full.first_error, full.line_check.trains_on_line, full.line_check.passing_loops], [false, 'needs_loop', 1, 0]);
+    assert.match(full.error, /vehicle-clone --force true/);
+    // Without station_vehicles (AgentBridge < v12) the loop check cannot count trains; train 13 still lost money for two years.
+    fake.state.gsVersion = 11;
+    const losing = await run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true });
+    assert.deepEqual([losing.ok, losing.first_error], [false, 'source_unprofitable']);
+    fake.state.gsVersion = 12;
+    const ok = await run('vehicle-clone', { vehicle: 13, depot_x: 13, depot_y: 22, dry_run: true, force: true });
     assert.equal(ok.route_check, 'connected');
     assert.deepEqual(lastExec().steps[0], ['veh_clone', 13, 22, 13, true]);
     // (12,22) is nearer Bigton Woods but faces away from the line, so auto skips it.
-    const auto = await run('vehicle-clone', { vehicle: 13, depot: 'auto', count: 2, dry_run: true });
+    const auto = await run('vehicle-clone', { vehicle: 13, depot: 'auto', count: 2, dry_run: true, force: true });
     assert.deepEqual(auto.depot, { x: 13, y: 22 });
     assert.deepEqual(auto.depot_auto.skipped.map((t) => t.depot), [{ x: 12, y: 22 }]);
     assert.equal(lastExec().steps.length, 2);
-    assert.deepEqual((await run('vehicle-clone', { vehicle: 13, dry_run: true })).depot, { x: 13, y: 22 });
+    assert.deepEqual((await run('vehicle-clone', { vehicle: 13, dry_run: true, force: true })).depot, { x: 13, y: 22 });
     await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 40, depot_y: 40, dry_run: true }), /no rail depot of company 0 at \(40,40\)/);
     await assert.rejects(run('vehicle-clone', { vehicle: 13, depot_x: 13, dry_run: true }), /both --depot_x and --depot_y/);
     await assert.rejects(run('vehicle-clone', { vehicle: 13, depot: 'auto', depot_x: 13, depot_y: 22, dry_run: true }), /not both/);
-    const skip = await run('vehicle-clone', { vehicle: 13, depot_x: 31, depot_y: 41, check_route: false, dry_run: true });
+    const skip = await run('vehicle-clone', { vehicle: 13, depot_x: 31, depot_y: 41, check_route: false, dry_run: true, force: true });
     assert.match(skip.route_check, /skipped/);
     await assert.rejects(run('vehicle-buy', { depot_x: 31, depot_y: 41, engine: 5, route_of: 13, dry_run: true }), /refused: depot \(31,41\)/);
     assert.equal((await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, route_of: 13, dry_run: true })).route_check, 'connected');
@@ -311,6 +322,7 @@ test('findExistingRoute: own rail stations at both ends, source handling the car
   const a = { targets: [[10, 10]] }, b = { targets: [[40, 40]] };
   assert.deepEqual(findExistingRoute([st(1, 12, 11, [0]), st(2, 41, 38)], a, b, 0), { from_station: { id: 1, name: 'S1' }, to_station: { id: 2, name: 'S2' } });
   assert.equal(findExistingRoute([st(1, 12, 11, [5]), st(2, 41, 38)], a, b, 0), null, 'source station does not handle this cargo');
+  assert.ok(findExistingRoute([st(1, 12, 11, []), st(2, 41, 38)], a, b, 0), 'a new station (no rating yet) counts');
   assert.equal(findExistingRoute([st(1, 12, 11, [0], ['truck']), st(2, 41, 38)], a, b, 0), null, 'not a rail station');
   assert.equal(findExistingRoute([st(1, 30, 30, [0]), st(2, 41, 38)], a, b, 0), null, 'too far from the source');
   const rev = [st(1, 41, 38, [0]), st(2, 12, 11)];
@@ -363,7 +375,7 @@ test('status: versions, and a warning when the running AgentBridge is older than
   try {
     const old = await run('status', {});
     assert.match(old.warnings[0], /runs AgentBridge v\d+; this openttd-agent .* ships v\d+/);
-  } finally { fake.state.gsVersion = 13; }
+  } finally { fake.state.gsVersion = 14; }
 });
 
 test('verify-route traces road vehicles and road stops (AgentBridge v11), refuses on older GameScripts', async () => {
@@ -381,9 +393,13 @@ test('verify-route traces road vehicles and road stops (AgentBridge v11), refuse
   } finally { fake.state.roadGap = null; }
   fake.state.roadOneWay = '44,9';
   try {
-    assert.equal((await run('verify-route', { from_station: 4, to_station: 7 })).connected, true, 'with the one-way direction');
-    const back = await run('verify-route', { from_station: 7, to_station: 4 });
+    assert.equal((await run('verify-route', { from_station: 4, to_station: 7, both_ways: false })).connected, true, 'with the one-way direction');
+    const back = await run('verify-route', { from_station: 7, to_station: 4, both_ways: false });
     assert.deepEqual([back.connected, back.first_gap.reason], [false, 'one_way_road']);
+    // Both ways (the default): there but not back.
+    const both = await run('verify-route', { from_station: 4, to_station: 7 });
+    assert.deepEqual([both.connected, both.legs_connected, both.there.connected, both.back.connected, both.first_gap.reason], [false, [true, false], true, false, 'one_way_road']);
+    assert.match(both.note_back, /not back/);
   } finally { fake.state.roadOneWay = null; }
   const probs = await run('vehicle-problems', {});
   assert.equal(probs.road_trace, 'road_tiles');
@@ -392,7 +408,7 @@ test('verify-route traces road vehicles and road stops (AgentBridge v11), refuse
   try {
     await assert.rejects(run('verify-route', { vehicle: 12 }), /refused: road vehicles .* AgentBridge v11/);
     assert.match((await run('vehicle-problems', {})).road_trace, /^off: /);
-  } finally { fake.state.gsVersion = 13; }
+  } finally { fake.state.gsVersion = 14; }
 });
 
 test('vehicle-depot: idempotent (already heading / in depot) and decoded failures', async () => {
@@ -410,7 +426,7 @@ test('vehicle-depot: idempotent (already heading / in depot) and decoded failure
     assert.deepEqual([old.already_in_depot, old.sent], [[11], [13]]);
     assert.deepEqual(lastExec().steps, [['veh_depot', 13, false]]);
     assert.match(old.note, /older than v11/);
-  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 13; }
+  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 14; }
 });
 
 test('loop-sites: traces the line and explains when no stretch is long enough', async () => {
@@ -466,7 +482,7 @@ test('vehicle-reverse: one veh_reverse step per vehicle; refused on an older Gam
   assert.deepEqual(lastExec().steps, [['veh_reverse', 11], ['veh_reverse', 12]]);
   assert.deepEqual(res.reversed, [11, 12]);
   fake.state.gsVersion = 11;
-  try { await assert.rejects(run('vehicle-reverse', { vehicles: '11' }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 13; }
+  try { await assert.rejects(run('vehicle-reverse', { vehicles: '11' }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 14; }
 });
 
 test('rail-tiles: decoded pieces, signals, depot fronts, owner; tiles marks owners (v12)', async () => {
@@ -506,7 +522,7 @@ test('stations carry vehicle_ids (v12); vehicles --station filters by them', asy
   try {
     assert.equal((await run('stations', {})).stations[0].vehicle_ids, undefined);
     await assert.rejects(run('vehicles', { station: 3 }), /needs AgentBridge v12/);
-  } finally { fake.state.gsVersion = 13; }
+  } finally { fake.state.gsVersion = 14; }
 });
 
 test('summary: one line per vehicle and station; filters', async () => {
@@ -636,4 +652,15 @@ async function addTrainChecks() {
   assert.deepEqual(fake.received.filter((q) => q.cmd === 'exec').slice(-2).map((q) => q.args.steps[0][0]), ['veh_clone', 'veh_start_stop']);
   assert.equal(yes.started, true);
   assert.ok('verify' in yes);
+  assert.deepEqual([yes.verify.first_leg.connected, yes.verify.first_leg.tiles, yes.verify.first_leg.detour_ratio, yes.verify.first_leg.warning], [true, 4, 1.3, undefined]);
+  // A real loop that is too short for the 5-tile trains does not count (S2): listed in unusable_loops.
+  fake.state.railLoop = true;
+  try {
+    const short = await run('add-train', { vehicle: 13 });
+    assert.equal(short.first_error, 'needs_loop');
+    assert.deepEqual([short.check.passing_loops, short.check.train_tiles, short.check.loops], [0, 5, []]);
+    assert.deepEqual(short.check.unusable_loops.map((l) => [l.x, l.y, l.clear_tiles, l.signals_ok]), [[15, 20, 3, true]]);
+    assert.match(short.check.unusable_loops[0].why, /^too_short/);
+    assert.match(short.error, /1 more loop is unusable/);
+  } finally { fake.state.railLoop = false; }
 }

@@ -22,9 +22,9 @@ import { ratingTable, vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMat
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, spreadLoops, plannedRail, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
-import { traceRail, traceRoad, trackExits, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
+import { traceRail, traceRoad, trackExits, trackEdges, findLoops, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
-import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
+import { routeEffort, findCargoPairs, pairKey, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
 import { takeOutputArgs, shapeResult } from './output.js';
 import { dateString, meFromCompanies, companyProfit, tilesText, splitBox, tileBox, filterStations, wordList, filterEvents, eventLine,
@@ -129,7 +129,8 @@ async function buildPath(ctx, a, mode) {
   const steps = (mode === 'rail' ? railSteps : roadSteps)(plan, { bridgeType: bridgeType(a.bridge) });
   const out = { reachable: true, ...plan.stats, ...(a.show_path ? { path: plan.tiles } : {}) };
   if (a.plan_only) return { ...out, steps_total: steps.length, steps };
-  const res = await execExplained(s, company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) }, a);
+  const opts = { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) };
+  const res = await vehiclesInTheWay(s, company, steps, await execWaitClear(s, company, steps, opts, a.wait_clear_s ?? 0, a));
   if (!a.dry_run) await s.refreshArea(...box);
   return { ...out, ...res };
 }
@@ -233,24 +234,26 @@ function lineEnd(s, { towns, industries }, end) {
  * station-sites: terminus spots near `end`, points facing `toward` (another end, or null), each
  * dry-run checked as `company`. opts: platforms, length, radius, limit. Used by station-sites and build-cargo-route.
  */
-async function stationSites(s, company, end, toward, { platforms = 2, length = 4, radius = 8, limit = 3, railType } = {}) {
+async function stationSites(s, company, end, toward, { platforms = 2, length = 4, radius = 8, limit = 3, railType, join = -1 } = {}) {
   const [economy] = await Promise.all([s.economy(), s.ensureTiles()]);
   const here = lineEnd(s, economy, end);
   const there = toward ? lineEnd(s, economy, toward).point : null;
   const cands = terminusCandidates(s.map, { targets: here.targets, radius, catchment: here.catchment, platforms, length, toward: there, max: 40 });
   const sites = []; let checked = 0;
+  const rejected = {}; // first failing step's error code -> count (L4)
   for (const c of cands) {
     if (sites.length >= limit || checked >= limit * 4) break;
     checked++;
-    const t = terminusSteps({ x: c.x, y: c.y, axis: c.axis, platforms: c.platforms, length: c.length, exitHigh: c.exit === 'high', join: -1 });
+    const t = terminusSteps({ x: c.x, y: c.y, axis: c.axis, platforms: c.platforms, length: c.length, exitHigh: c.exit === 'high', join });
     const res = await s.exec(company, t.steps, { dryRun: true, ...(railType !== undefined ? { railType } : {}) });
     const bad = (res.results ?? []).filter((r) => !r.ok && r.op !== 'signal');
-    if (bad.length) continue;
+    if (bad.length) { const code = errorCode(bad[0].error ?? 'failed') ?? 'failed'; rejected[code] = (rejected[code] ?? 0) + 1; continue; }
     sites.push({ x: c.x, y: c.y, axis: c.axis, exit: c.exit, platforms: c.platforms, length: c.length, cost: res.cost, connect_at: t.connect_at,
       tiles_from_target: c.gap, build: `build-terminus --x ${c.x} --y ${c.y} --axis ${c.axis} --exit ${c.exit} --platforms ${c.platforms} --length ${c.length}` });
   }
-  return { target: here.what, candidates_on_map: cands.length, dry_runs: checked, sites,
-    ...(sites.length ? {} : { hint: `no site passed: try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform` }) };
+  return { target: here.what, candidates_on_map: cands.length, dry_runs: checked, sites, ...(Object.keys(rejected).length ? { rejected } : {}),
+    ...(sites.length ? {} : { hint: cands.length ? 'no site passed its dry run (see rejected): try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform'
+      : 'no flat free spot of that size near the target on the map: try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform' }) };
 }
 
 /**
@@ -296,41 +299,60 @@ async function buildLineLoops(s, company, from, to, n, length, railType) {
 }
 
 /**
- * Passing loops on a traced line: points (tiles with more than one track piece) on the path, not in
- * a station and not the junction of a depot spur, counted in pairs. A heuristic: other junctions
- * on the line count too.
+ * Passing loops on a traced line (findLoops: a second track that leaves the line at points and
+ * rejoins it). Usable = signals on both sides and, with trainTiles, room for the train
+ * (clear_tiles >= trainTiles + 1). Returns { count: usable loops, loops: [...], unusable_loops: [...] },
+ * each { x, y (first points), end, clear_tiles, signals_ok, why? }.
  */
-async function countLoops(tracer, path) {
-  let points = 0;
-  // Terminus throats (points just outside the platforms) are not loops: skip 5 tiles past the
-  // last station tile at the start and before the first one at the end.
-  const kinds = [];
-  for (const p of path) kinds.push((await tracer.tileAt(p.x, p.y))?.kind ?? null);
-  let startEnd = 0;
-  while (startEnd + 1 < kinds.length && kinds[startEnd + 1] === 's') startEnd++;
-  let endStart = kinds.length - 1;
-  while (endStart - 1 >= 0 && kinds[endStart - 1] === 's') endStart--;
-  for (const [i, p] of path.entries()) {
-    if (i <= startEnd + 5 || i >= endStart - 5) continue;
-    const t = await tracer.tileAt(p.x, p.y);
-    if (!t || t.kind !== 't') continue;
-    const pieces = [1, 2, 4, 8, 16, 32].filter((b) => t.tracks & b).length;
-    if (pieces < 2) continue;
-    let spur = false;
-    for (const [dx, dy] of TRACE_DIRS) {
-      const n = await tracer.tileAt(p.x + dx, p.y + dy);
-      if (n && n.kind === 'd' && n.a === p.x && n.b === p.y) spur = true;
-      // A short spur to a depot one tile away.
-      if (n && n.kind === 't' && !path.some((q) => q.x === n.x && q.y === n.y)) {
-        for (const [ex, ey] of TRACE_DIRS) {
-          const m = await tracer.tileAt(n.x + ex, n.y + ey);
-          if (m && m.kind === 'd' && m.a === n.x && m.b === n.y) spur = true;
-        }
-      }
-    }
-    if (!spur) points++;
+async function lineLoops(tracer, path, { trainTiles = null } = {}) {
+  const out = { count: 0, loops: [], unusable_loops: [] };
+  for (const l of await findLoops({ path, getTile: tracer.tileAt })) {
+    const why = !l.signals_ok ? `no_signals: ${l.line_signal ? 'the loop side' : l.branch_signal ? 'the line side' : 'neither side'} has a signal, so trains cannot pass there`
+      : trainTiles && l.clear_tiles < trainTiles + 1 ? `too_short: ${l.clear_tiles} clear tiles; a ${trainTiles}-tile train needs ${trainTiles + 1}` : null;
+    const row = { x: l.at.x, y: l.at.y, end: l.end, clear_tiles: l.clear_tiles, signals_ok: l.signals_ok, ...(why ? { why } : {}) };
+    (why ? out.unusable_loops : out.loops).push(row);
   }
-  return Math.floor(points / 2);
+  out.count = out.loops.length;
+  return out;
+}
+
+/** Is `veh` (a vehicles row) losing money for a year or more? (vehicle-clone / add-train guard, L14) */
+const unprofitable = (veh) => veh.age_days >= 365 && veh.profit_last_year < 0 && veh.profit_this_year < 0;
+
+/** source_unprofitable refusal for cloning `veh`, or null. */
+const unprofitableRefusal = (veh) => (unprofitable(veh)
+  ? `source_unprofitable: vehicle ${veh.id} lost money last year (${veh.profit_last_year}) and this year (${veh.profit_this_year}); a clone copies a losing route. Check it with vehicle-problems --vehicles ${veh.id}, or pass --force true`
+  : null);
+
+/**
+ * Can `count` more trains run on vehicle `id`'s line? Trains on the line (same order stations,
+ * AgentBridge v12) against usable passing loops between its first two stations (v9 trace) and the
+ * longest train there. Returns { check, refusal (needs_loop text or null), tracer, stops }.
+ */
+async function lineCapacity(s, company, id, count, { cmd = 'add-train' } = {}) {
+  const info = await s.gs.call('info');
+  const stops = await orderStations(s, company, id);
+  if (stops.length < 2) return { check: null, refusal: null, tracer: null, stops };
+  const ids = await stationVehicleIds(s, company);
+  const sameLine = ids ? (ids.get(stops[0].id) ?? []).filter((v) => stops.every((st) => (ids.get(st.id) ?? []).includes(v))) : null;
+  const tracer = (info.bridge_version ?? 0) >= 9 ? await makeTracer(s, company, info) : null;
+  let loops = null, train = null;
+  if (tracer) {
+    const r = await tracer.trace(await tracer.stationStarts(stops[0]), stops[1]);
+    if (r.connected) {
+      train = await longestTrainOnLine(s, company, id);
+      loops = await lineLoops(tracer, r.path, { trainTiles: train.tiles });
+    }
+  }
+  const trains = sameLine ? sameLine.length : null;
+  const check = { trains_on_line: trains, passing_loops: loops?.count ?? null, after: trains === null ? null : trains + count, allowed: loops === null ? null : loops.count + 1,
+    ...(train ? { train_tiles: train.tiles } : {}), ...(loops ? { loops: loops.loops, unusable_loops: loops.unusable_loops } : {}) };
+  let refusal = null;
+  if (trains !== null && loops !== null && trains + count > loops.count + 1) {
+    const unusable = loops.unusable_loops.length ? ` (${loops.unusable_loops.length} more loop${loops.unusable_loops.length === 1 ? ' is' : 's are'} unusable: see check.unusable_loops)` : '';
+    refusal = `needs_loop: the line already runs ${trains} train${trains === 1 ? '' : 's'} with ${loops.count} usable passing loop${loops.count === 1 ? '' : 's'}${unusable}; ${trains + count} trains on single track need ${trains + count - 1} loops. Build one first: loop-sites --vehicle ${id}, or ${cmd} --force true`;
+  }
+  return { check, refusal, tracer, stops };
 }
 
 /** finishSales() result trimmed to one company (the relay serves several players from one session). */
@@ -409,21 +431,75 @@ export async function vehicleServing(s, company, stations, aId, bId) {
 }
 
 /**
+ * build-cargo-route --trains: clone `loco` up to `n` times in `depot` (shared orders) and start them,
+ * but only as many as the built line's usable passing loops allow (loops + 1 trains in all).
+ * Returns { vehicles, usable_loops, cost, warning?, error? }.
+ */
+async function cloneOnLine(s, company, from, to, depot, loco, n, trainTiles, exec) {
+  const tracer = await makeTracer(s, company, await s.gs.call('info'));
+  const r = await tracer.trace(await tracer.stationStarts(from), to);
+  const loops = r.connected && tracer.tileAt ? await lineLoops(tracer, r.path, { trainTiles }) : { count: 0, loops: [], unusable_loops: [] };
+  const k = Math.min(n, loops.count);
+  const out = { vehicles: [], usable_loops: loops.count, cost: 0 };
+  if (k < n) out.warning = `${1 + k} of ${1 + n} trains: the line has ${loops.count} usable passing loop${loops.count === 1 ? '' : 's'}${loops.unusable_loops.length ? ` (${loops.unusable_loops.length} unusable)` : ''} and single track takes loops + 1 trains; build more with loop-sites --vehicle ${loco}, then add-train --vehicle ${loco}`;
+  if (!k) return out;
+  const res = await exec(Array.from({ length: k }, () => ['veh_clone', depot.x, depot.y, loco, true]));
+  out.cost = res.cost;
+  out.vehicles = res.results.filter((q) => q.ok && q.value !== undefined).map((q) => q.value);
+  if (out.vehicles.length) await exec(out.vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
+  if (!res.ok) out.error = res.error;
+  return out;
+}
+
+/**
+ * Why build-cargo-route found no terminus at one end (L4): candidates and dry runs over every option
+ * set tried, rejected counts by error code, your stations near the end, and a hint that lists only
+ * what was not tried yet. `tried`: [{ opts, res }] (res = stationSites result).
+ */
+function noSiteReport(tried, ownNear) {
+  const rejected = {};
+  for (const { res } of tried) for (const [k, n] of Object.entries(res.rejected ?? {})) rejected[k] = (rejected[k] ?? 0) + n;
+  const opts = tried.map((t) => t.opts);
+  const maxR = Math.max(...opts.map((o) => o.radius)), minL = Math.min(...opts.map((o) => o.length)), minP = Math.min(...opts.map((o) => o.platforms));
+  const untried = [...(maxR < 24 ? [`--radius ${Math.min(24, maxR + 4)}`] : []), ...(minL > 2 ? ['--length 2'] : []), ...(minP > 1 ? ['--platforms 1'] : [])];
+  const hint = [untried.length ? `not tried yet: ${untried.join(', ')}` : 'every size and radius was tried',
+    ...(ownNear.length ? [`your station ${ownNear[0].name} (${ownNear[0].id}) is ${ownNear[0].tiles} tiles away: --reuse_stations auto joins a new platform to it`] : []),
+    'or clear land with demolish/terraform, or pick another end'].join('; ');
+  return { candidates_on_map: Math.max(...tried.map((t) => t.res.candidates_on_map)), dry_runs: tried.reduce((n, t) => n + t.res.dry_runs, 0), rejected,
+    tried: opts.map((o) => ({ radius: o.radius, length: o.length, platforms: o.platforms })), own_station_near: ownNear, hint };
+}
+
+/**
  * build-cargo-route: plan everything as a dry run (both termini, the line between their connect_at
  * anchors, a depot beside the line near the source, a train), then, unless dryRun, build it step by
  * step. On a failure it stops and reports the step and everything already built; it never demolishes.
  */
-async function buildCargoRoute(s, company, a) {
+async function buildCargoRoute(s, company, a, ctx) {
   const plan = { dry_run: a.dry_run, company };
   const built = [];
   const vehiclesBought = () => built.filter((b) => b.step === 'buy_locomotive').map((b) => b.vehicle);
   const fail = (step, error, extra = {}) => ({ ok: false, failed_step: step, error, first_error: errorCode(error), cost: extra.spent ?? 0, vehicles: vehiclesBought(), built, ...plan, ...extra,
-    hint: built.length ? 'nothing was demolished: continue from the failed step by hand (build-rail, build-line-depot, vehicle-buy, order-add, vehicle-start) using the ids and tiles in built' : 'nothing was built' });
+    hint: extra.hint ?? (built.length ? 'nothing was demolished: continue from the failed step by hand (build-rail, build-line-depot, vehicle-buy, order-add, vehicle-start) using the ids and tiles in built' : 'nothing was built') });
   const from = a.from_industry !== undefined ? { industry: a.from_industry } : a.from_town !== undefined ? { town: a.from_town } : null;
   const to = a.to_industry !== undefined ? { industry: a.to_industry } : a.to_town !== undefined ? { town: a.to_town } : null;
   if (!from || !to) throw new Error('give one source (--from_industry <id> or --from_town <name>) and one destination (--to_industry <id> or --to_town <name>)');
   const cargo = cargoId(s.cargos, a.cargo);
   const cargoInfo = s.cargos.get(cargo);
+  // L14: a source that makes nothing of this cargo (a sawmill before any wood arrives) gives an empty line.
+  if (from.industry !== undefined && !a.force) {
+    const ind = (await s.economy()).industries.find((i) => i.id === from.industry);
+    const prod = ind?.produces.find((p) => p.cargo === cargo);
+    const what = ind ? `${ind.type_name} ${ind.id}` : `industry ${from.industry}`;
+    if (ind && !prod) {
+      return fail('source', `source_produces_nothing: ${what} does not produce ${cargoInfo?.name ?? a.cargo} (it produces ${ind.produces.map((p) => p.cargo_name).join(', ') || 'nothing'})`,
+        { first_error: 'source_produces_nothing', hint: `pick a producer of ${cargoInfo?.name ?? a.cargo}: find-cargo-pairs --cargo ${a.cargo}` });
+    }
+    if (ind?.secondary && prod.last_month === 0) {
+      const inputs = ind.accepts.join(', ') || 'its input cargo';
+      return fail('source', `source_produces_nothing: ${what} made no ${prod.cargo_name} last month; it makes it only from deliveries of ${inputs}`,
+        { first_error: 'source_produces_nothing', feeder: { accepts: ind.accepts }, hint: `feed it first: find-cargo-pairs --cargo "${ind.accepts[0] ?? ''}" --dest_id ${ind.id} lists producers of its input; or pass --force true to build anyway` });
+    }
+  }
   const railTypes = await s.gs.call('rail_types', { company });
   // Default: the cheapest track (the plain build-rail default is the game's first listed type, often electrified).
   const railType = a.rail_type ?? [...railTypes].sort((p, q) => p[3] - q[3])[0]?.[0];
@@ -432,24 +508,43 @@ async function buildCargoRoute(s, company, a) {
 
   // 0. Already running this route? A second line beside the first doubles the cost for little
   // more cargo; more trains on the first line is the usual answer (a live agent built one twice).
-  if (!a.allow_existing) {
+  // --if_exists (L2): refuse (default) | skip (ok, action exists) | add_train (add-train on the line) | build.
+  const ifExists = a.allow_existing ? 'build' : a.if_exists;
+  if (ifExists !== 'build') {
     const economy = await s.economy();
     const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
     const bothWays = !!(cargoInfo?.passengers || cargoInfo?.mail);
     const existing = findExistingRoute(stations, lineEnd(s, economy, from), lineEnd(s, economy, to), cargo, { radius: a.radius + 2, bothWays });
     const servedBy = existing ? await vehicleServing(s, company, stations, existing.from_station.id, existing.to_station.id) : null;
     if (existing && servedBy !== null) {
+      const found = { ...existing, served_by: servedBy };
+      if (ifExists === 'skip') {
+        return { ok: true, action: 'exists', dry_run: a.dry_run, company, existing: found, cost: 0, vehicles: [], built: [],
+          note: `you already run this route (vehicle ${servedBy}); nothing was built. --if_exists add_train adds a train to it` };
+      }
+      if (ifExists === 'add_train') {
+        const res = await addTrain(ctx, s, company, { company, vehicle: servedBy, count: 1, force: false, dry_run: a.dry_run });
+        return { ...res, action: 'add_train', existing: found };
+      }
       return fail('existing_route', `refused: you already run this route: ${existing.from_station.name} (${existing.from_station.id}) and ${existing.to_station.name} (${existing.to_station.id}), served by vehicle ${servedBy}`,
         { existing: { ...existing, served_by: servedBy }, first_error: 'existing_route',
-          hint: `add capacity instead: vehicle-clone --vehicle ${servedBy} --depot auto --start true; or pass --allow_existing true to build a second line anyway` });
+          hint: `add capacity instead: the same command with --if_exists add_train (or add-train --vehicle ${servedBy}); --if_exists skip returns ok; --if_exists build builds a second line anyway` });
     }
-    if (existing) plan.existing_unserved = { ...existing, note: 'your stations there have no vehicle serving both, so a new line is built (they are not reused)' };
+    if (existing) plan.existing_unserved = { ...existing, note: 'your stations there have no vehicle serving both, so a new line is built (with --reuse_stations auto the new termini join them where they fit)' };
   }
 
   // 1. Stations: best dry-run-checked site at each end, facing the other end, not overlapping.
   // A town end that has no site (houses everywhere) is retried wider, shorter and with one platform.
   const opts = { platforms: a.platforms, length: a.length, radius: a.radius, limit: 3, railType };
-  const tries = (end) => (end.town === undefined ? [opts] : siteFallbacks(opts));
+  // Every end (town or industry, C8) is retried wider, shorter and with one platform.
+  const tries = () => siteFallbacks(opts);
+  const economy0 = await s.economy();
+  const ownRail = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).filter((st) => st.facilities.includes('rail'));
+  const ownNear = (end) => {
+    const here = lineEnd(s, economy0, end);
+    return ownRail.map((st) => ({ id: st.id, name: st.name, tiles: Math.min(...here.targets.map(([x, y]) => Math.max(Math.abs(st.x - x), Math.abs(st.y - y)))) }))
+      .filter((st) => st.tiles <= a.radius + 8).sort((p, q) => p.tiles - q.tiles).slice(0, 3);
+  };
   const accepts = new Map();
   const acceptOf = async (d) => {
     const along = d.axis === 'y';
@@ -457,32 +552,50 @@ async function buildCargoRoute(s, company, a) {
     return lists ? (lists[0][0]?.acceptance ?? 0) : null;
   };
   let srcSites = null, dstSites = null, accepting = [];
-  for (const o of tries(from)) {
-    srcSites = await stationSites(s, company, from, to, o);
-    if (srcSites.sites.length) { if (o !== opts) plan.source_fallback = fallbackNote(opts, o); break; }
+  const srcTried = [], dstTried = [];
+  // L3: an end next to one of your rail stations joins a new platform group to it (join = its id;
+  // the game needs the result within station_spread). Tried with the first two option sets, then a new station.
+  const reuseAt = (end) => (a.reuse_stations === 'never' ? null : ownNear(end).find((st) => st.tiles <= a.radius) ?? null);
+  const joinsFor = (reuse) => (reuse ? [...tries().slice(0, 2).map((o) => ({ o, join: reuse.id })), ...tries().map((o) => ({ o, join: -1 }))] : tries().map((o) => ({ o, join: -1 })));
+  const reuseNote = (reuse, join) => (reuse ? (join >= 0 ? { reused_station: { id: reuse.id, name: reuse.name } } : { reuse_failed: { id: reuse.id, name: reuse.name, note: 'no terminus joined to it passed its dry run (too far apart for station_spread, or no room); a new station is built' } }) : {});
+  const srcReuse = reuseAt(from), dstReuse = reuseAt(to);
+  let srcJoin = -1, dstJoin = -1;
+  for (const { o, join } of joinsFor(srcReuse)) {
+    srcSites = await stationSites(s, company, from, to, { ...o, join });
+    srcTried.push({ opts: o, res: srcSites });
+    if (srcSites.sites.length) { srcJoin = join; if (o !== opts) plan.source_fallback = fallbackNote(opts, o); break; }
   }
-  if (!srcSites.sites.length) return fail('source_station', `no terminus site passed near ${srcSites.target}${from.town !== undefined ? ' (also tried wider, shorter and single-platform termini)' : ''}`, { hint_sites: srcSites.hint });
-  for (const o of tries(to)) {
-    dstSites = await stationSites(s, company, to, from, o);
+  const noSite = (which, sites, tried, end) => {
+    const report = noSiteReport(tried, ownNear(end));
+    const rej = Object.entries(report.rejected).map(([k, n]) => `${k} ${n}`).join(', ');
+    return fail(which, `no terminus site passed near ${sites.target}: ${report.candidates_on_map} candidate spots on the map, ${report.dry_runs} dry runs over ${tried.length} size/radius options${rej ? ` (rejected: ${rej})` : ''}`,
+      { first_error: 'no_terminus_site', no_site: report, hint_sites: report.hint });
+  };
+  if (!srcSites.sites.length) return noSite('source_station', srcSites, srcTried, from);
+  for (const { o, join } of joinsFor(dstReuse)) {
+    dstSites = await stationSites(s, company, to, from, { ...o, join });
+    dstTried.push({ opts: o, res: dstSites });
     // Destination sites must accept the cargo (AgentBridge v7; null = not checkable, kept with a note).
     for (const d of dstSites.sites) accepts.set(d, await acceptOf(d));
     accepting = dstSites.sites.filter((d) => accepts.get(d) === null || accepts.get(d) >= ACCEPTED);
-    if (accepting.length) { if (o !== opts) plan.dest_fallback = fallbackNote(opts, o); break; }
+    if (accepting.length) { dstJoin = join; if (o !== opts) plan.dest_fallback = fallbackNote(opts, o); break; }
   }
-  if (!dstSites.sites.length) return fail('dest_station', `no terminus site passed near ${dstSites.target}${to.town !== undefined ? ' (also tried wider, shorter and single-platform termini)' : ''}`, { hint_sites: dstSites.hint });
+  if (!dstSites.sites.length) return noSite('dest_station', dstSites, dstTried, to);
   if (!accepting.length) {
     return fail('dest_station', `no terminus site near ${dstSites.target} accepts ${cargoInfo?.name ?? a.cargo} (acceptance ${[...accepts.values()].join(', ')}; ${ACCEPTED} needed)`);
   }
   let src = null, dst = null;
   for (const p of srcSites.sites) { const q = accepting.find((d) => !sitesOverlap(p, d)); if (q) { src = p; dst = q; break; } }
   if (!src) return fail('dest_station', 'every source and destination site overlap: the two ends are too close for two termini');
-  plan.source_site = { target: srcSites.target, ...src };
-  plan.dest_site = { target: dstSites.target, ...dst, acceptance: accepts.get(dst) };
+  src.join = srcJoin; dst.join = dstJoin;
+  plan.source_site = { target: srcSites.target, ...src, ...reuseNote(srcReuse, srcJoin) };
+  plan.dest_site = { target: dstSites.target, ...dst, acceptance: accepts.get(dst), ...reuseNote(dstReuse, dstJoin) };
   // Warn when a new terminus lands next to one of our stations: often a second line to the same place.
   const ownStations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
   const warnings = [];
   for (const [end, site] of [['source', src], ['dest', dst]]) {
     for (const st of ownStations) {
+      if (st.id === site.join) continue;
       const d = tileDistance(st, site);
       if (d <= 8) warnings.push({ near_own_station: { id: st.id, name: st.name, x: st.x, y: st.y }, end, tiles: d });
     }
@@ -539,7 +652,15 @@ async function buildCargoRoute(s, company, a) {
     plan.passing_loops_note = 'sites on the planned line; the real build picks them again on the built track (positions can move a few tiles); cost counts the loop track only';
     if (picks.length < a.passing_loops) (plan.warnings ??= []).push({ passing_loops: `only ${picks.length} of ${a.passing_loops} loops fit on straight stretches of the planned line (each needs ${loopLength + 4} straight tiles)` });
   }
-  const estimate = src.cost + dst.cost + lineCheck.cost + depotCheck.cost + plan.train.cost + loopCost;
+  // C13: --trains K: more trains only as far as the loops allow (single track: loops + 1 trains).
+  let extraTrains = 0;
+  if (a.trains > 1) {
+    const loopsPlanned = (plan.passing_loops ?? []).filter((l) => !l.dry_run_error).length;
+    extraTrains = Math.min(a.trains - 1, loopsPlanned);
+    plan.trains = { asked: a.trains, planned: 1 + extraTrains, passing_loops_planned: loopsPlanned, cost: (1 + extraTrains) * plan.train.cost,
+      ...(extraTrains < a.trains - 1 ? { note: `single track takes one train per passing loop + 1: ${1 + extraTrains} of ${a.trains}; ${a.passing_loops >= a.trains - 1 ? 'only some of the --passing_loops fit on the planned line (see warnings)' : `add --passing_loops ${a.trains - 1}`}` } : {}) };
+  }
+  const estimate = src.cost + dst.cost + lineCheck.cost + depotCheck.cost + plan.train.cost * (1 + extraTrains) + loopCost;
   plan.estimated_cost = estimate;
   plan.money = lineCheck.money;
   plan.affordable = lineCheck.money === null || lineCheck.money >= estimate;
@@ -550,10 +671,11 @@ async function buildCargoRoute(s, company, a) {
   const exec = async (steps, opts2 = {}) => { s.throttleBuild(); return s.exec(company, steps, { railType, ...opts2 }); };
   let spent = 0;
   const station = async (name, site) => {
-    const t = terminusSteps({ x: site.x, y: site.y, axis: site.axis, platforms: site.platforms, length: site.length, exitHigh: site.exit === 'high', join: -1 });
+    const t = terminusSteps({ x: site.x, y: site.y, axis: site.axis, platforms: site.platforms, length: site.length, exitHigh: site.exit === 'high', join: site.join ?? -1 });
     const res = await exec(t.steps);
     spent += res.cost;
-    const st = res.results.some((r) => r.op === 'rail_station' && r.ok) ? await stationAt(s, company, site) : null;
+    const placed = res.results.some((r) => r.op === 'rail_station' && r.ok);
+    const st = !placed ? null : site.join >= 0 ? stationsFromRows(await s.gs.call('stations', { company }), s.cargos).find((q) => q.id === site.join) ?? null : await stationAt(s, company, site);
     if (st || res.results.some((r) => r.ok)) built.push({ step: name, station: st?.id ?? null, x: site.x, y: site.y, connect_at: site.connect_at, complete: res.ok, cost: res.cost });
     return { res, st };
   };
@@ -601,8 +723,29 @@ async function buildCargoRoute(s, company, a) {
     const startRes = await exec([['veh_start_stop', loco, 1]]);
     if (!startRes.ok) return fail('start', startRes.error, { spent, vehicle: loco });
     built.push({ step: 'start', vehicle: loco, complete: true });
-    return { ok: true, ...plan, dry_run: false, source_station: A.st?.id ?? null, dest_station: B.st?.id ?? null, depot: dep.depot, vehicle: loco, vehicles: [loco],
-      cost: spent, total_cost: spent, built, next: `vehicle-clone --depot_x ${dep.depot.x} --depot_y ${dep.depot.y} --vehicle ${loco} --start true adds trains with the same orders` };
+    // C1: trace the built line both ways (and the depot's first leg) instead of leaving it to the caller.
+    let verify = { connected: null, note: 'not traced: a new station id was not found on its site' };
+    if (A.st && B.st) {
+      try { verify = await lineVerify(s, company, A.st, B.st, dep.depot); } catch (e) { verify = { connected: null, error: e.message }; }
+    }
+    if (verify.first_leg?.warning) (plan.warnings ??= []).push({ depot_exit_detour: verify.first_leg.warning });
+    const vehicles = [loco];
+    if (a.trains > 1 && verify.connected) {
+      const more = await cloneOnLine(s, company, A.st, B.st, dep.depot, loco, a.trains - 1, trainTiles, exec);
+      spent += more.cost;
+      vehicles.push(...more.vehicles);
+      built.push({ step: 'more_trains', vehicles: more.vehicles, usable_loops: more.usable_loops, complete: !more.error, cost: more.cost, ...(more.error ? { error: more.error } : {}) });
+      if (more.warning) (plan.warnings ??= []).push({ trains: more.warning });
+    } else if (a.trains > 1) {
+      (plan.warnings ??= []).push({ trains: `only 1 of ${a.trains} trains: the line was not traced exactly (${verify.connected === false ? 'it is broken' : 'needs AgentBridge v9'}), so the passing loops were not counted` });
+    }
+    const done = { ...plan, dry_run: false, source_station: A.st?.id ?? null, dest_station: B.st?.id ?? null, depot: dep.depot, vehicle: loco, vehicles,
+      cost: spent, total_cost: spent, built, verify, next: `add-train --vehicle ${loco} adds a train with the same orders (checks passing loops)` };
+    if (verify.connected === false) {
+      return { ok: false, ...done, failed_step: 'verify', first_error: 'route_broken',
+        error: `route_broken: the new line does not trace ${verify.there ? `back from ${B.st.name} to ${A.st.name}` : `from ${A.st.name} to ${B.st.name}`}${verify.first_gap ? ` (first gap at (${verify.first_gap.x},${verify.first_gap.y}): ${verify.first_gap.reason})` : ''}; train ${loco} is running. Fix the gap with build-track, then verify-route --vehicle ${loco}` };
+    }
+    return { ok: true, ...done };
   } catch (e) {
     const last = built.at(-1)?.step ?? null;
     return fail(last ? `after ${last}` : 'source_station', e.message, { spent });
@@ -905,6 +1048,65 @@ async function longestTrainOnLine(s, company, id) {
     if (same(d) && tiles > best.tiles) best = { tiles, vehicle: v.id };
   }
   return { ...best, trains_checked: others.length + 1 };
+}
+
+/**
+ * Longest train on the line through track tile (x, y): trace to the nearest station of `company`
+ * and on to a second one, then the trains with orders at both (AgentBridge v12 counts, v9 trace).
+ * Returns { tiles, vehicle, stations: [{ id }], trains_checked } or { reason } when unknown.
+ */
+async function longestTrainAt(s, company, x, y) {
+  const info = await s.gs.call('info');
+  if ((info.bridge_version ?? 0) < 9) return { reason: 'the running AgentBridge is older than v9 (no rail_tiles)' };
+  const tracer = await makeTracer(s, company, info);
+  const t = await tracer.tileAt(x, y);
+  if (!t || t.kind !== 't') return { reason: `(${x},${y}) has no track yet, so no line or train is known` };
+  const stationOf = async (skip) => {
+    const r = await traceRail({ getTile: tracer.tileAt, starts: [{ x, y }], isGoal: (q) => q.kind === 's' && q.owner === company && q.station >= 0 && q.station !== skip, company });
+    return r.connected ? (await tracer.tileAt(r.reached.x, r.reached.y)).station : null;
+  };
+  const a = await stationOf(-1);
+  const b = a === null ? null : await stationOf(a);
+  if (a === null || b === null) return { reason: `the track at (${x},${y}) does not lead to two of your stations` };
+  const ids = await stationVehicleIds(s, company);
+  if (!ids) return { reason: 'the running AgentBridge is older than v12 (no station_vehicles)' };
+  const trains = (ids.get(a) ?? []).filter((v) => (ids.get(b) ?? []).includes(v));
+  for (const v of trains) {
+    const veh = vehiclesFromRows(await s.gs.call('vehicles', { company })).find((q) => q.id === v);
+    if (veh?.type === 'rail') return { ...(await longestTrainOnLine(s, company, v)), stations: [{ id: a }, { id: b }] };
+  }
+  return { reason: `no train of yours has orders at both stations ${a} and ${b} of this line` };
+}
+
+/**
+ * First leg of a new train (C9): trace from the depot to its first station. detour_ratio = path tiles
+ * / straight-line tiles; a big one means the depot exit faces away and every new or serviced train
+ * runs to the far end first (warning depot_exit_detour). null when the tracer is not exact (< v9).
+ */
+async function firstLeg(tracer, depot, station) {
+  if (!tracer || tracer.method !== 'rail_tracks' || !depot || !station) return null;
+  const r = await tracer.trace([{ x: depot.x, y: depot.y }], station);
+  if (!r.connected) return { connected: false, to: station.name ?? station.id, first_gap: r.first_gap ?? null };
+  const direct = Math.max(1, tileDistance(depot, station));
+  const ratio = Math.round((10 * r.path.length) / direct) / 10;
+  const detour = ratio >= 2.5 && r.path.length - direct >= 12;
+  return { connected: true, to: station.name ?? station.id, tiles: r.path.length, direct_tiles: direct, detour_ratio: ratio,
+    ...(detour ? { warning: `depot_exit_detour: a train leaving the depot at (${depot.x},${depot.y}) runs ${r.path.length} tiles to reach ${station.name ?? `station ${station.id}`} (${direct} tiles away): the depot exit leads away from it, so every new or serviced train goes the long way first. Join the depot front toward the station (build-track) or build the depot on the other side` } : {}) };
+}
+
+/**
+ * Trace a built two-station line both ways and its depot's first leg (build-cargo-route, C1).
+ * Returns { connected (null when only a coarse trace was possible), there, back, first_gap, first_leg?, method, note? }.
+ */
+async function lineVerify(s, company, from, to, depot) {
+  const tracer = await makeTracer(s, company, await s.gs.call('info'));
+  const there = await tracer.trace(await tracer.stationStarts(from), to);
+  const back = await tracer.trace(await tracer.stationStarts(to), from);
+  const coarse = tracer.method !== 'rail_tracks';
+  const bad = !there.connected ? there : !back.connected ? back : null;
+  const leg = await firstLeg(tracer, depot, from);
+  return { connected: coarse && !bad ? null : !bad, there: there.connected, back: back.connected, first_gap: bad?.first_gap ?? null, method: tracer.method,
+    ...(leg ? { first_leg: leg } : {}), ...(coarse ? { note: OLD_GS_TRACE } : {}) };
 }
 
 // ---- depot guard (vehicle-clone, vehicle-buy --route_of) ---------------------------------
@@ -1238,6 +1440,37 @@ async function signalRemoveRefusal(s, a) {
 }
 
 /**
+ * The passing loop whose track holds the signal tile (x, y), or null: walk the track both ways to
+ * the nearest points, then findLoops on that stretch (AgentBridge v9). Used to refuse removing a
+ * loop's signal (without it both trains enter the loop from opposite ends and crash or jam).
+ */
+async function loopOfTile(s, x, y) {
+  const getTile = railTileSource(s);
+  const t = await getTile(x, y);
+  if (!t || t.kind !== 't') return null;
+  const edges = [...trackEdges(t.tracks)];
+  if (edges.length !== 2) return null;
+  const toPoints = async (edge) => {
+    const out = [];
+    let cx = x + TRACE_DIRS[edge][0], cy = y + TRACE_DIRS[edge][1], entry = (edge + 2) % 4;
+    for (let n = 0; n < 60; n++) {
+      const u = await getTile(cx, cy);
+      if (!u || !['t', 's', 'w'].includes(u.kind) || !trackEdges(u.tracks).has(entry)) return null;
+      out.push({ x: u.x, y: u.y });
+      if (trackEdges(u.tracks).size >= 3) return out;
+      const ex = trackExits(u.tracks, entry);
+      if (ex.length !== 1) return null;
+      cx += TRACE_DIRS[ex[0]][0]; cy += TRACE_DIRS[ex[0]][1]; entry = (ex[0] + 2) % 4;
+    }
+    return null;
+  };
+  const back = await toPoints(edges[0]), ahead = await toPoints(edges[1]);
+  if (!back || !ahead) return null;
+  const path = [...back.reverse(), { x, y }, ...ahead];
+  return (await findLoops({ path, getTile })).find((l) => l.from_index === 0 && l.to_index === path.length - 1) ?? null;
+}
+
+/**
  * vehicle-buy --attach_to: the train must be stopped inside the depot the wagon is bought in, or the
  * game sells the wagon and then refuses to couple it. Returns the refusal text, or null.
  */
@@ -1453,6 +1686,200 @@ function openttdVersions(s, warnings) {
   if (!cls.tested && cls.class !== 'unknown') warnings.push(cls.message);
   if (cmp.match === false) warnings.push(cmp.message);
   return { server, server_class: cls.class, local, match: cmp.match };
+}
+
+// ---- vehicles in the way (C5) ------------------------------------------------------------
+
+const IN_THE_WAY = /ERR_VEHICLE_IN_THE_WAY/;
+const blockedByVehicle = (res) => (res.results ?? []).some((r) => !r.ok && IN_THE_WAY.test(r.error ?? ''));
+
+/** Tile box an exec step works on: { x0, y0, x1, y1 }. */
+function stepBox(st) {
+  const box = (ax, ay, bx = ax, by = ay) => ({ x0: Math.min(ax, bx), y0: Math.min(ay, by), x1: Math.max(ax, bx), y1: Math.max(ay, by) });
+  if (st[0] === 'rail' || st[0] === 'rail_remove') return box(st[3], st[4], st[5], st[6]);
+  if (st[0] === 'road' || st[0] === 'road_remove') return box(st[1], st[2], st[3], st[4]);
+  if (st[0] === 'bridge') return box(st[2], st[3], st[4], st[5]);
+  if (st[0] === 'tunnel') return box(st[2], st[3]);
+  return box(st[1], st[2]);
+}
+
+/**
+ * ERR_VEHICLE_IN_THE_WAY on an exec result: add transient: true, blocked_at (the failed steps' tiles),
+ * vehicles_in_the_way (your vehicles within 6 tiles of them; a train's position is its front) and,
+ * in a dry run, blocked_by_vehicle: true. Other results come back unchanged.
+ */
+async function vehiclesInTheWay(s, company, steps, res) {
+  if (!blockedByVehicle(res)) return res;
+  const boxes = res.results.filter((r) => !r.ok && IN_THE_WAY.test(r.error ?? '')).map((r) => stepBox(steps[r.step]));
+  const off = (v, b) => Math.max(b.x0 - v.x, 0, v.x - b.x1) + Math.max(b.y0 - v.y, 0, v.y - b.y1);
+  let near = [];
+  try {
+    near = vehiclesFromRows(await s.gs.call('vehicles', { company }))
+      .map((v) => ({ id: v.id, type: v.type, state: v.state, x: v.x, y: v.y, ...(v.speed !== undefined ? { speed: v.speed } : {}), tiles_away: Math.min(...boxes.map((b) => off(v, b))) }))
+      .filter((v) => v.tiles_away <= 6).sort((p, q) => p.tiles_away - q.tiles_away).slice(0, 8);
+  } catch { near = []; }
+  return { ...res, transient: true, ...(res.dry_run ? { blocked_by_vehicle: true } : {}), blocked_at: boxes, vehicles_in_the_way: near,
+    hint: 'a vehicle is on the tiles: wait until it has passed and run the same command again (or pass --wait_clear_s 30); a dry run cannot reserve the tiles' };
+}
+
+/**
+ * s.exec that, when a step fails with ERR_VEHICLE_IN_THE_WAY, waits up to waitS seconds (real
+ * time, game running) and retries from the failed step every 2 s; earlier steps are not repeated.
+ * Returns an exec result over all steps, plus waited_s (and wait_note when the game is paused).
+ */
+async function execWaitClear(s, company, steps, opts, waitS, a = {}) {
+  let res = await execExplained(s, company, steps, opts, a);
+  if (opts.dryRun || !waitS || res.ok || !blockedByVehicle(res)) return res;
+  if ((await s.gs.call('info')).paused) return { ...res, waited_s: 0, wait_note: 'the game is paused, so the vehicle will not move: unpause (or turn-advance) and run it again' };
+  const t0 = Date.now();
+  const done = [];
+  let offset = 0, rest = steps;
+  while (!res.ok && blockedByVehicle(res) && Date.now() - t0 < waitS * 1000) {
+    const failed = res.results.find((r) => !r.ok);
+    done.push(...res.results.filter((r) => r.step < failed.step).map((r) => ({ ...r, step: r.step + offset })));
+    offset += failed.step;
+    rest = rest.slice(failed.step);
+    await sleep(2000);
+    res = await execExplained(s, company, rest, opts, a);
+  }
+  const results = [...done, ...res.results.map((r) => ({ ...r, step: r.step + offset }))];
+  const bad = results.find((r) => !r.ok);
+  return { ...res, results, cost: done.reduce((n, r) => n + (r.cost ?? 0), 0) + res.cost, steps_total: steps.length, steps_done: results.filter((r) => r.ok).length,
+    error: bad ? `step ${bad.step} (${bad.op}): ${bad.error ?? 'failed'}` : res.error, waited_s: Math.round((Date.now() - t0) / 1000) };
+}
+
+/** run() for track builds: --wait_clear_s and the vehicles-in-the-way report. */
+async function runClear(ctx, a, steps, opts = {}) {
+  const { s, company } = await mine(ctx, a);
+  const res = await execWaitClear(s, company, steps, { dryRun: a.dry_run, ...opts }, a.wait_clear_s ?? 0, a);
+  return vehiclesInTheWay(s, company, steps, res);
+}
+
+const waitClear = { wait_clear_s: int().min(0).max(300).default(0).describe('when a vehicle is in the way (ERR_VEHICLE_IN_THE_WAY), wait up to this many seconds for it to pass and retry from that step') };
+
+/**
+ * add-train (also build-cargo-route --if_exists add_train): line capacity and profit checks, clone at a
+ * depot on the route, start, verify. `a`: { company, vehicle, count, force, dry_run }.
+ */
+async function addTrain(ctx, s, company, a) {
+  const cap = await lineCapacity(s, company, a.vehicle, a.count, { cmd: 'add-train' });
+  if (cap.stops.length < 2) throw new Error(`refused: vehicle ${a.vehicle} has fewer than two station orders`);
+  const { check, tracer } = cap;
+  if (!a.force && cap.refusal) return { ok: false, dry_run: a.dry_run, error: cap.refusal, first_error: 'needs_loop', check };
+  const why = a.force ? null : unprofitableRefusal(await vehicleOf(s, company, a.vehicle));
+  if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: 'source_unprofitable', check };
+  const { depot, ...routeCheck } = await depotForRoute(s, company, { depot: 'auto', check_route: true }, a.vehicle, { cmd: 'vehicle-clone' });
+  const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, true]));
+  const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
+  const out = { ...res, check, depot, ...routeCheck, vehicles };
+  if (a.dry_run || !vehicles.length) return out;
+  const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
+  out.started = started.ok;
+  if (tracer) {
+    let leg = null;
+    try { leg = await firstLeg(tracer, depot, cap.stops[0]); } catch { leg = null; }
+    if (leg?.warning) out.warnings = [...(out.warnings ?? []), { depot_exit_detour: leg.warning }];
+    try {
+      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const legs = await routeLegs(s, company, tracer, stations, await vehicleOf(s, company, vehicles[0]));
+      out.verify = { connected: legs.connected, ...(legs.connected ? {} : { legs: legs.legs.filter((l) => !l.connected) }), ...(leg ? { first_leg: leg } : {}) };
+      if (!legs.connected) { out.ok = false; out.error = `route_broken: the new train ${vehicles[0]} has no path to all its stations; see verify`; out.first_error = 'route_broken'; }
+    } catch (e) { out.verify = { connected: null, error: e.message, ...(leg ? { first_leg: leg } : {}) }; }
+  }
+  return out;
+}
+
+/** "Wood: Forest 1 (10,20) -> Sawmill 2 (50,20) ..." for find-cargo-pairs --format lines. */
+function pairLine(pr) {
+  const end = (e) => `${e.kind === 'town' ? e.name : e.type} ${e.id} (${e.x},${e.y})`;
+  const dry = pr.dry_run ? (pr.dry_run.ok ? `; dry run ok, cost ${pr.dry_run.estimated_cost}, ${pr.dry_run.line_tiles} tiles of track` : `; dry run failed at ${pr.dry_run.failed_step}: ${pr.dry_run.error}`) : '';
+  const yours = pr.yours ? `; yours: ${pr.yours.from_station.name} -> ${pr.yours.to_station.name}${pr.yours.served_by !== null ? ` served by ${pr.yours.served_by}` : ' (unserved)'}` : '';
+  const effort = pr.route?.reachable ? `, effort ${pr.route.effort_per_tile}/tile` : pr.route ? ', no route' : '';
+  return `${pr.cargo}: ${end(pr.source)} -> ${end(pr.dest)}, ${pr.distance} tiles, ${pr.source_last_month}/month ${pr.source_transported_pct}% moved${effort}${yours}${dry} | ${pr.build}`;
+}
+
+/** build-cargo-route arguments for a find-cargo-pairs pair. */
+const pairRouteArgs = (pr) => ({ ...(pr.source.kind === 'town' ? { from_town: pr.source.name } : { from_industry: pr.source.id }),
+  ...(pr.dest.kind === 'town' ? { to_town: pr.dest.name } : { to_industry: pr.dest.id }), cargo: pr.cargo });
+
+const quoteArg = (v) => (typeof v === 'string' && /\s/.test(v) ? `"${v}"` : String(v));
+
+/** Why an empty find-cargo-pairs found nothing (L17): the biggest exclusion first, with the flag that loosens it. */
+function pairsHint(excluded, a) {
+  const fix = { distance: `--min_distance / --max_distance (now ${a.min_distance ?? PAIR_MIN_DIST}..${a.max_distance ?? PAIR_MAX_DIST})`, transported_pct: `--max_transported_pct (now ${a.max_transported_pct})`,
+    min_production: `--min_production (now ${a.min_production})`, town_acceptance: '--dest_kind industry, or bigger towns', near: `--radius (now ${a.radius})`, region: 'a bigger --x0 --y0 --x1 --y1 box',
+    yours: '--exclude_yours false (you already serve them)' };
+  const parts = Object.entries(excluded).sort((p, q) => q[1] - p[1]).map(([k, n]) => `${n} by ${k} (${fix[k] ?? k})`);
+  return parts.length ? `no pair left: ${parts.join('; ')}` : 'no producer of that cargo matched (check --cargo / --source_type / --source_id against industries)';
+}
+
+/**
+ * find-cargo-pairs: findCargoPairs over the economy, plus your stations (yours / --exclude_yours),
+ * --dry_run_top (build-cargo-route dry runs) and --format lines.
+ */
+async function findCargoPairsCommand(ctx, a) {
+  const s = await ctx.session();
+  const economy = await s.economy();
+  const { industries, towns } = economy;
+  if (a.with_effort) await s.ensureTiles();
+  let townAcceptance = new Map();
+  if (a.dest_kind !== 'industry' && towns.length) {
+    const lists = await acceptanceAt(s, towns.map((t) => [t.x, t.y]), { radius: 4 });
+    townAcceptance = lists && new Map(towns.map((t, i) => [t.id, Object.fromEntries(lists[i].map((c) => [c.cargo, c.acceptance]))]));
+  }
+  const townCargoFallback = new Set([...s.cargos.values()].filter((c) => c.town_effect > 0).map((c) => c.id));
+  if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
+  const box = [a.x0, a.y0, a.x1, a.y1];
+  if (box.some((v) => v !== undefined) && box.some((v) => v === undefined)) throw new Error('a region needs all four of --x0 --y0 --x1 --y1');
+  const region = a.x0 !== undefined ? { x0: Math.min(a.x0, a.x1), y0: Math.min(a.y0, a.y1), x1: Math.max(a.x0, a.x1), y1: Math.max(a.y0, a.y1) } : null;
+  const minDist = a.min_distance ?? PAIR_MIN_DIST, maxDist = a.max_distance ?? PAIR_MAX_DIST;
+  const query = { industries, types: s.types, towns, cargos: s.cargos, townAcceptance, townCargoFallback, map: s.map, cargo: a.cargo, sourceType: a.source_type,
+    destType: a.dest_type, destKind: a.dest_kind, minDist, maxDist, maxTransportedPct: a.max_transported_pct, minProduction: a.min_production,
+    near: a.near_x !== undefined ? { x: a.near_x, y: a.near_y, radius: a.radius } : null, sourceId: a.source_id, destId: a.dest_id, region, sort: a.sort };
+  // L1: pairs where your rail stations already sit at both ends, and whether a vehicle serves them.
+  // No company arg: this stays a world query; the configured company is "you" (the relay sets it per player).
+  const company = s.cfg.company ?? null;
+  const yours = new Map();
+  if (company !== null) {
+    const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).filter((st) => st.facilities.includes('rail'));
+    if (stations.length) {
+      const ends = new Map();
+      const endOf = (e) => { const k = `${e.kind ?? 'industry'}:${e.id}`; if (!ends.has(k)) ends.set(k, lineEnd(s, economy, e.kind === 'town' ? { town: String(e.id) } : { industry: e.id })); return ends.get(k); };
+      const served = new Map();
+      for (const pr of findCargoPairs({ ...query, limit: 1e6, withEffort: false }).pairs) {
+        const c = [...s.cargos.values()].find((q) => q.name === pr.cargo);
+        const existing = findExistingRoute(stations, endOf(pr.source), endOf(pr.dest), c?.id, { radius: 10, bothWays: !!(c?.passengers || c?.mail) });
+        if (!existing) continue;
+        const sk = `${existing.from_station.id}>${existing.to_station.id}`;
+        if (!served.has(sk)) served.set(sk, await vehicleServing(s, company, stations, existing.from_station.id, existing.to_station.id));
+        yours.set(pairKey(pr), { ...existing, served_by: served.get(sk) });
+      }
+    }
+  }
+  const exclude = a.exclude_yours ? new Set([...yours].filter(([, y]) => y.served_by !== null).map(([k]) => k)) : null;
+  const res = findCargoPairs({ ...query, limit: a.limit, withEffort: a.with_effort, exclude });
+  for (const pr of res.pairs) {
+    const y = yours.get(pairKey(pr));
+    if (y) pr.yours = y;
+    pr.build = `build-cargo-route ${Object.entries(pairRouteArgs(pr)).map(([k, v]) => `--${k} ${quoteArg(v)}`).join(' ')}`;
+  }
+  if (a.dry_run_top > 0) {
+    const me = s.companyOrThrow();
+    const schema = COMMANDS_BY_NAME.get('build-cargo-route').args;
+    for (const pr of res.pairs.slice(0, a.dry_run_top)) {
+      try {
+        const r = await buildCargoRoute(s, me, schema.parse({ ...pairRouteArgs(pr), company: me, dry_run: true }), ctx);
+        pr.dry_run = { ok: r.ok, estimated_cost: r.estimated_cost ?? null, line_tiles: r.line?.tiles ?? null, failed_step: r.failed_step ?? null,
+          ...(r.ok ? { affordable: r.affordable } : { error: r.first_error ?? errorCode(r.error ?? 'failed') ?? r.error }) };
+      } catch (e) { pr.dry_run = { ok: false, estimated_cost: null, line_tiles: null, failed_step: 'arguments', error: e.message }; }
+    }
+  }
+  const head = { distance_bounds: { min: minDist, max: maxDist, ...(a.min_distance === undefined || a.max_distance === undefined ? { defaulted: 'pass --min_distance / --max_distance to change' } : {}) },
+    ...(a.near_x !== undefined ? { near: { x: a.near_x, y: a.near_y, radius: a.radius } } : {}), ...(region ? { region } : {}),
+    ...(yours.size ? { yours_found: yours.size } : {}), ...(company === null ? { yours_note: 'no company set, so your own routes are not marked or excluded' } : {}) };
+  const out = { ...head, ...res, ...(res.excluded ? { hint: pairsHint(res.excluded, a) } : {}) };
+  if (a.format === 'lines') { const { pairs, ...rest } = out; return { ...rest, lines: pairs.map(pairLine) }; }
+  return out;
 }
 
 export const COMMANDS = [
@@ -1961,32 +2388,21 @@ export const COMMANDS = [
   },
   {
     name: 'find-cargo-pairs', group: 'world', session: true,
-    description: `Opportunity finder: under-served producers of a cargo paired with destinations min_distance..max_distance tiles away: industries that accept it, and towns whose centre area accepts it (acceptance >= ${ACCEPTED} within radius 4; goods, passengers, mail, food...). Ranked by terrain effort of the route (water, hills, towns, existing track). Each dest has kind industry|town. Passengers and mail pair town with town (source kind town, source_last_month = the town's last-month production); feed both names to build-cargo-route --from_town --to_town. Secondary producers (sawmill, factory, refinery...) are marked secondary: true; they show last_month 0 until supplied. Distance defaults to ${PAIR_MIN_DIST}..${PAIR_MAX_DIST} tiles (distance_bounds says which applied); --near_x/--near_y/--radius keeps sources near a tile (e.g. your network). Example: cargo=goods, dest_kind=town, min_distance=20.`,
+    description: `Opportunity finder: under-served producers of a cargo paired with destinations min_distance..max_distance tiles away: industries that accept it, and towns whose centre area accepts it (acceptance >= ${ACCEPTED} within radius 4; goods, passengers, mail, food...). Ranked by terrain effort of the route (water, hills, towns, existing track). Each dest has kind industry|town. Passengers and mail pair town with town (source kind town, source_last_month = the town's last-month production); feed both names to build-cargo-route --from_town --to_town. Secondary producers (sawmill, factory, refinery...) are marked secondary: true; they show last_month 0 until supplied. Distance defaults to ${PAIR_MIN_DIST}..${PAIR_MAX_DIST} tiles (distance_bounds says which applied); --near_x/--near_y/--radius keeps sources near a tile (e.g. your network). Example: cargo=goods, dest_kind=town, min_distance=20. Filters: --source_id / --dest_id (industry or town id), a region box --x0 --y0 --x1 --y1 (both ends inside), --sort effort|revenue|distance|production. yours {from_station, to_station, served_by} marks pairs where your rail stations already sit at both ends; --exclude_yours true (default) drops the ones a vehicle of yours serves. When nothing is left, excluded counts each reason (distance, transported_pct, min_production, town_acceptance, near, region, yours) with a hint. --dry_run_top N dry-runs build-cargo-route for the first N pairs (dry_run {ok, estimated_cost, line_tiles, failed_step, error}). --format lines gives one line per pair (lines[]) instead of pairs[]. Each pair has build (the build-cargo-route command).`,
     args: z.object({
       cargo: z.string().optional(), source_type: z.string().optional(), dest_type: z.string().optional().describe("industry type name, or 'town' / a town name"),
       dest_kind: z.enum(['any', 'industry', 'town']).default('any'),
       min_distance: int().optional().describe(`default ${PAIR_MIN_DIST}`), max_distance: int().optional().describe(`default ${PAIR_MAX_DIST} (a train route of 900 tiles takes years per trip)`), max_transported_pct: int().default(100),
       near_x: int().optional(), near_y: int().optional(), radius: int().min(1).default(60).describe('with near_x/near_y: sources within this many tiles'),
       min_production: int().default(0).describe('primary sources only; secondary ones are kept'), limit: int().default(10), with_effort: bool().default(true),
+      source_id: int().optional().describe('only this source (industry id; town id for passengers/mail)'), dest_id: int().optional().describe('only this destination (industry or town id)'),
+      x0: int().optional(), y0: int().optional(), x1: int().optional(), y1: int().optional().describe('region box x0,y0..x1,y1: both ends inside'),
+      sort: z.enum(['effort', 'revenue', 'distance', 'production']).default('effort').describe('effort: easiest terrain per tile (default); revenue: unserved volume x distance; distance: shortest first; production: biggest source first'),
+      exclude_yours: bool().default(true).describe('drop pairs one of your vehicles already serves (your rail stations at both ends)'),
+      dry_run_top: int().min(0).max(5).default(0).describe('dry-run build-cargo-route for the first N pairs: dry_run {ok, estimated_cost, line_tiles, failed_step}'),
+      format: z.enum(['json', 'lines']).default('json').describe('lines: one text line per pair instead of pairs[]'),
     }),
-    run: async (ctx, a) => {
-      const s = await ctx.session();
-      const { industries, towns } = await s.economy();
-      if (a.with_effort) await s.ensureTiles();
-      let townAcceptance = new Map();
-      if (a.dest_kind !== 'industry' && towns.length) {
-        const lists = await acceptanceAt(s, towns.map((t) => [t.x, t.y]), { radius: 4 });
-        townAcceptance = lists && new Map(towns.map((t, i) => [t.id, Object.fromEntries(lists[i].map((c) => [c.cargo, c.acceptance]))]));
-      }
-      const townCargoFallback = new Set([...s.cargos.values()].filter((c) => c.town_effect > 0).map((c) => c.id));
-      if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
-      const minDist = a.min_distance ?? PAIR_MIN_DIST, maxDist = a.max_distance ?? PAIR_MAX_DIST;
-      const res = findCargoPairs({ industries, types: s.types, towns, cargos: s.cargos, townAcceptance, townCargoFallback, map: s.map, cargo: a.cargo, sourceType: a.source_type,
-        destType: a.dest_type, destKind: a.dest_kind, minDist, maxDist, maxTransportedPct: a.max_transported_pct,
-        minProduction: a.min_production, limit: a.limit, withEffort: a.with_effort, near: a.near_x !== undefined ? { x: a.near_x, y: a.near_y, radius: a.radius } : null });
-      return { distance_bounds: { min: minDist, max: maxDist, ...(a.min_distance === undefined || a.max_distance === undefined ? { defaulted: 'pass --min_distance / --max_distance to change' } : {}) },
-        ...(a.near_x !== undefined ? { near: { x: a.near_x, y: a.near_y, radius: a.radius } } : {}), ...res };
-    },
+    run: (ctx, a) => findCargoPairsCommand(ctx, a),
   },
   {
     name: 'acceptance', group: 'world', session: true,
@@ -2403,9 +2819,10 @@ export const COMMANDS = [
   },
   {
     name: 'verify-route', group: 'operate', session: true,
-    description: 'Is there a rail or road path? --vehicle ID traces from the vehicle to each of its order stations and between consecutive order stations (rail for trains, road for road vehicles); --from_station A --to_station B (id or name) traces A to B (mode auto: rail when both have rail, road when both have truck or bus stops). Reports connected and, if not, the last reachable tile and the first gap with a reason. Rail (AgentBridge v9; coarse map-mirror trace before): no_track, track_not_joined, station_platform_side, depot_entrance_faces_away, one_way_signal_against, other_company_track, bridge_side, tunnel_side. Road (AgentBridge v11; refused before): no_road, road_not_joined, one_way_road, depot_not_joined, depot_entrance_faces_away, stop_not_joined, stop_entrance_faces_away, other_owner_road (another company\'s stop or depot).',
+    description: 'Is there a rail or road path? --vehicle ID traces from the vehicle to each of its order stations and between consecutive order stations (rail for trains, road for road vehicles); --from_station A --to_station B (id or name) traces A to B and B back to A (both_ways, default; there/back, connected = both; --both_ways false = A to B only; mode auto: rail when both have rail, road when both have truck or bus stops). legs_connected[] has one true/false per leg (vehicle: its order legs; pair: there, back). Reports connected and, if not, the last reachable tile and the first gap with a reason. Rail (AgentBridge v9; coarse map-mirror trace before): no_track, track_not_joined, station_platform_side, depot_entrance_faces_away, one_way_signal_against, other_company_track, bridge_side, tunnel_side. Road (AgentBridge v11; refused before): no_road, road_not_joined, one_way_road, depot_not_joined, depot_entrance_faces_away, stop_not_joined, stop_entrance_faces_away, other_owner_road (another company\'s stop or depot).',
     args: z.object({ ...who, vehicle: int().optional(), from_station: z.coerce.string().optional().describe('station id or name'), to_station: z.coerce.string().optional().describe('station id or name'),
-      mode: z.enum(['auto', 'rail', 'road']).default('auto').describe('station pair only: which network to trace') }),
+      mode: z.enum(['auto', 'rail', 'road']).default('auto').describe('station pair only: which network to trace'),
+      both_ways: bool().default(true).describe('station pair only: also trace B back to A (a train must get back; one-way signals can block one direction)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
@@ -2426,7 +2843,7 @@ export const COMMANDS = [
         const tracer = await pick(veh.type);
         const legs = await routeLegs(s, company, tracer, stations, veh);
         return { vehicle: veh.id, unit_number: veh.unit_number, type: veh.type, at: { x: veh.x, y: veh.y }, connected: legs.connected, method: tracer.method,
-          ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), from_vehicle: legs.from_vehicle, legs: legs.legs };
+          ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), legs_connected: legs.legs.map((l) => l.connected), from_vehicle: legs.from_vehicle, legs: legs.legs };
       }
       if (a.from_station === undefined || a.to_station === undefined) throw new Error('give --vehicle ID, or both --from_station and --to_station (id or name)');
       const from = findStation(stations, a.from_station), to = findStation(stations, a.to_station);
@@ -2434,7 +2851,12 @@ export const COMMANDS = [
       const mode = a.mode !== 'auto' ? a.mode : (from.facilities.includes('rail') && to.facilities.includes('rail')) || !(roadish(from) && roadish(to)) ? 'rail' : 'road';
       const tracer = await pick(mode);
       const r = await tracer.trace(await tracer.stationStarts(from), to);
-      return { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, mode, method: tracer.method, ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), ...brief(r) };
+      const head = { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, mode, method: tracer.method, ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}) };
+      if (!a.both_ways) return { ...head, ...brief(r), legs_connected: [r.connected] };
+      const back = await tracer.trace(await tracer.stationStarts(to), from);
+      const bad = !r.connected ? r : back;
+      return { ...head, ...brief(bad), connected: r.connected && back.connected, tiles_reached: r.tiles_reached, legs_connected: [r.connected, back.connected],
+        there: brief(r), back: brief(back), ...(r.connected && !back.connected ? { note_back: `${to.name} -> ${from.name} is not connected: trains get there but not back` } : {}) };
     },
   },
   {
@@ -2701,21 +3123,33 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-clone', group: 'operate', session: true,
-    description: 'Clone a vehicle `count` times, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check. --station ID [--cargo C] instead of --vehicle clones the best-earning vehicle with an order there (source says which). A sold vehicle id is refused with already_sold, the sale date and the vehicles serving its stations now.',
+    description: 'Clone a vehicle `count` times, sharing its orders by default (--share is the same flag); start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check. --station ID [--cargo C] instead of --vehicle clones the best-earning vehicle with an order there (source says which). A sold vehicle id is refused with already_sold, the sale date and the vehicles serving its stations now. Trains: refused with needs_loop when the line would run more trains than its usable passing loops + 1 (as add-train; line_check says why); any vehicle that lost money last year and this year is refused with source_unprofitable. --force true skips both.',
     args: z.object({ ...act, ...borrow, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
       depot_x: int().optional(), depot_y: int().optional(), vehicle: int().optional(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
       station: z.string().optional().describe('instead of --vehicle: clone the best-earning vehicle with an order for this station (id or name; AgentBridge v12)'),
       cargo: z.string().optional().describe('with --station: only a vehicle that carries this cargo'),
-      check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations') }),
+      check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations'),
+      force: bool().default(false).describe('skip the passing-loop (needs_loop) and source_unprofitable checks') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       if ((a.vehicle === undefined) === (a.station === undefined)) throw new Error('give --vehicle ID or --station ID (clone a vehicle serving it), not both');
       const source = a.station !== undefined ? await cloneSourceAt(s, company, a.station, a.cargo) : null;
       const vehicle = source ? source.vehicle : a.vehicle;
       const { depot, ...check } = await depotForRoute(s, company, a, vehicle, { cmd: 'vehicle-clone' });
+      const veh = await vehicleOf(s, company, vehicle);
+      let lineCheck = null;
+      if (!a.force) {
+        if (veh.type === 'rail') {
+          const cap = await lineCapacity(s, company, vehicle, a.count, { cmd: 'vehicle-clone' });
+          lineCheck = cap.check;
+          if (cap.refusal) return { ok: false, dry_run: a.dry_run, error: cap.refusal, first_error: 'needs_loop', ...(source ? { source } : {}), depot, ...check, line_check: lineCheck };
+        }
+        const why = unprofitableRefusal(veh);
+        if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: 'source_unprofitable', ...(source ? { source } : {}), depot, ...check };
+      }
       const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, vehicle, a.share_orders]));
       const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
-      const out = { ...res, ...(source ? { source } : {}), depot, ...check, vehicles };
+      const out = { ...res, ...(source ? { source } : {}), depot, ...check, ...(lineCheck ? { line_check: lineCheck } : {}), vehicles };
       if (!a.start || a.dry_run || !vehicles.length) return out;
       const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
       return { ...out, started: started.ok };
@@ -2748,43 +3182,11 @@ export const COMMANDS = [
   },
   {
     name: 'add-train', group: 'operate', session: true,
-    description: 'Add a train to a running line safely, in one call: counts the trains on the line of --vehicle (same order stations) and the passing loops on its track between its first two stations (pairs of points outside stations and depot spurs), refuses when the trains would outnumber the loops + 1 (single track: each loop lets one more train run; first_error needs_loop with the loop-sites command), then clones the train at a depot on its own route (sharing orders), starts it and traces the new train\'s route (verify). --force true skips the loop check. AgentBridge v12 (counts) and v9 (trace).',
+    description: 'Add a train to a running line safely, in one call: counts the trains on the line of --vehicle (same order stations) and the usable passing loops on its track between its first two stations (a second track that leaves the line at points and rejoins it, with a signal on each side and room for the longest train: check.loops / check.unusable_loops), refuses when the trains would outnumber the loops + 1 (single track: each loop lets one more train run; first_error needs_loop with the loop-sites command), refuses to copy a train that lost money last year and this year (source_unprofitable), then clones the train at a depot on its own route (sharing orders), starts it and traces the new train\'s route (verify; first_leg.detour_ratio = depot-to-first-station tiles / straight distance, warning depot_exit_detour when the depot exit leads the long way). --force true skips both checks. AgentBridge v12 (counts) and v9 (trace).',
     args: z.object({ ...act, vehicle: int(), count: int().min(1).max(10).default(1), force: bool().default(false) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const info = await s.gs.call('info');
-      const stops = await orderStations(s, company, a.vehicle);
-      if (stops.length < 2) throw new Error(`refused: vehicle ${a.vehicle} has fewer than two station orders`);
-      const ids = await stationVehicleIds(s, company);
-      const sameLine = ids ? (ids.get(stops[0].id) ?? []).filter((v) => stops.every((st) => (ids.get(st.id) ?? []).includes(v))) : null;
-      const tracer = (info.bridge_version ?? 0) >= 9 ? await makeTracer(s, company, info) : null;
-      let loops = null;
-      if (tracer) {
-        const r = await tracer.trace(await tracer.stationStarts(stops[0]), stops[1]);
-        if (r.connected) loops = await countLoops(tracer, r.path);
-      }
-      const trains = sameLine ? sameLine.length : null;
-      const check = { trains_on_line: trains, passing_loops: loops, after: trains === null ? null : trains + a.count, allowed: loops === null ? null : loops + 1 };
-      if (!a.force && trains !== null && loops !== null && trains + a.count > loops + 1) {
-        return { ok: false, dry_run: a.dry_run, error: `needs_loop: the line already runs ${trains} train${trains === 1 ? '' : 's'} with ${loops} passing loop${loops === 1 ? '' : 's'}; ${trains + a.count} trains on single track need ${trains + a.count - 1} loops. Build one first: loop-sites --vehicle ${a.vehicle}, or --force true`,
-          first_error: 'needs_loop', check };
-      }
-      const { depot, ...routeCheck } = await depotForRoute(s, company, { depot: 'auto', check_route: true }, a.vehicle, { cmd: 'vehicle-clone' });
-      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, true]));
-      const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
-      const out = { ...res, check, depot, ...routeCheck, vehicles };
-      if (a.dry_run || !vehicles.length) return out;
-      const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
-      out.started = started.ok;
-      if (tracer) {
-        try {
-          const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
-          const legs = await routeLegs(s, company, tracer, stations, await vehicleOf(s, company, vehicles[0]));
-          out.verify = { connected: legs.connected, ...(legs.connected ? {} : { legs: legs.legs.filter((l) => !l.connected) }) };
-          if (!legs.connected) { out.ok = false; out.error = `route_broken: the new train ${vehicles[0]} has no path to all its stations; see verify`; out.first_error = 'route_broken'; }
-        } catch (e) { out.verify = { connected: null, error: e.message }; }
-      }
-      return out;
+      return addTrain(ctx, s, company, a);
     },
   },
   {
@@ -3029,8 +3431,8 @@ export const COMMANDS = [
   },
   {
     name: 'build-rail', group: 'build', session: true,
-    description: 'Plan and build a rail line between two anchor tiles. Anchors are where the line connects (a station end tile, the tile in front of a depot, existing track, or connect_at from build-terminus): track is laid on every tile strictly between them. The planner prefers flat and straight, avoids houses, industries and stations, crosses roads on the level and bridges water, rail and roads where it must. Use dry_run=true first for the cost; each step reports ok/error. On failure nothing after the failed step is built: fix (terraform, demolish, other anchors) and run again; already-built track is kept.',
-    args: z.object({ ...pathArgs, rail_type: int().optional().describe('see rail-types; default: first available') }),
+    description: 'Plan and build a rail line between two anchor tiles. Anchors are where the line connects (a station end tile, the tile in front of a depot, existing track, or connect_at from build-terminus): track is laid on every tile strictly between them. The planner prefers flat and straight, avoids houses, industries and stations, crosses roads on the level and bridges water, rail and roads where it must. Use dry_run=true first for the cost; each step reports ok/error. On failure nothing after the failed step is built: fix (terraform, demolish, other anchors) and run again; already-built track is kept. A vehicle on the tiles (ERR_VEHICLE_IN_THE_WAY) gives transient: true and vehicles_in_the_way (blocked_by_vehicle in a dry run); --wait_clear_s N waits for it to pass and retries from that step.',
+    args: z.object({ ...pathArgs, rail_type: int().optional().describe('see rail-types; default: first available'), ...waitClear }),
     run: (ctx, a) => buildPath(ctx, a, 'rail'),
   },
   {
@@ -3083,7 +3485,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-cargo-route', group: 'build', session: true,
-    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. --passing_loops N lays N passing loops on straight stretches spread along the line, each sized for the train (length = train tiles + 2), so more trains can run on the single track (passing_loops in the result; a loop that does not fit is a warning, not a failure). A town end with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked). warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). Refused (failed_step existing_route) when your rail stations near both ends are already served by one of your vehicles: clone that train instead, or --allow_existing true. Stations nobody serves (e.g. after selling the fleet) do not block it. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
+    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. --passing_loops N lays N passing loops on straight stretches spread along the line, each sized for the train (length = train tiles + 2), so more trains can run on the single track (passing_loops in the result; a loop that does not fit is a warning, not a failure). --trains K then runs up to K trains: clones of the first, only as many as the built line has usable loops + 1 (warning trains when fewer). An end (town or industry) with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked); when nothing fits, first_error no_terminus_site with no_site {candidates_on_map, dry_runs, rejected (counts by error), tried, own_station_near, hint (only what was not tried)}. warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). When your rail stations near both ends are already served by one of your vehicles, --if_exists decides: refuse (default; failed_step existing_route), skip (ok, action exists), add_train (runs add-train on that line), build. Stations nobody serves (e.g. after selling the fleet) do not block it. Refused with source_produces_nothing when --from_industry does not produce the cargo, or is a secondary industry (sawmill, factory...) that made none last month (feed it first; --force true builds anyway). A real build ends by tracing the line both ways: verify {connected, there, back, first_gap, first_leg (depot to source: detour_ratio, warning depot_exit_detour)}; failed_step verify with first_error route_broken when it does not trace (the train is already running). A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
     args: z.object({
       ...act,
       from_industry: int().optional().describe('source industry id (see industries / find-cargo-pairs)'), from_town: z.string().optional().describe('source town id or name'),
@@ -3095,14 +3497,18 @@ export const COMMANDS = [
       radius: int().min(2).max(20).default(8).describe('station search box around each end'),
       margin: int().min(2).max(80).default(20).describe('how far the line may wander outside the two stations'),
       max_bridge: int().min(3).max(40).default(12), rail_type: int().optional().describe('see rail-types; default: the one with the cheapest track'),
-      allow_existing: bool().default(false).describe('build even when one of your vehicles already serves your stations at both ends (refused by default: clone trains instead)'),
+      allow_existing: bool().default(false).describe('same as --if_exists build'),
+      if_exists: z.enum(['refuse', 'skip', 'add_train', 'build']).default('refuse').describe('when one of your vehicles already serves your stations at both ends: refuse (failed_step existing_route), skip (ok: true, action: exists), add_train (add-train on that line: loop and profit checks, clone, start), build (a second line anyway)'),
       passing_loops: int().min(0).max(6).default(0).describe('passing loops to build on the line, spread along it on straight stretches (loop-sites logic), sized for the train'),
+      trains: int().min(1).max(10).default(1).describe('trains to run on the new line: the first, then clones (shared orders) only while the built line has a usable passing loop for each; use with --passing_loops'),
+      force: bool().default(false).describe('build from a source that produces none of the cargo now (source_produces_nothing: a secondary industry before its input arrives)'),
+      reuse_stations: z.enum(['auto', 'never']).default('auto').describe('auto: at an end within --radius of one of your rail stations, the new terminus joins that station (reused_station; reuse_failed when it does not fit); never: always a new station'),
     }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       if ((a.from_industry !== undefined) === (a.from_town !== undefined)) throw new Error('give exactly one of --from_industry, --from_town');
       if ((a.to_industry !== undefined) === (a.to_town !== undefined)) throw new Error('give exactly one of --to_industry, --to_town');
-      return buildCargoRoute(s, company, a);
+      return buildCargoRoute(s, company, a, ctx);
     },
   },
   {
@@ -3124,22 +3530,28 @@ export const COMMANDS = [
   },
   {
     name: 'build-track', group: 'build', session: true,
-    description: 'Lay (or with remove=true, remove) one rail piece on tile x,y joining its neighbour from_x,from_y to its neighbour to_x,to_y. Existing track on the tile is kept, so this makes junctions: e.g. connect a depot or a branch onto an existing line. Neighbours may be straight across (straight piece) or at right angles (curve).',
-    args: z.object({ ...act, ...point, from_x: int(), from_y: int(), to_x: int(), to_y: int(), remove: bool().default(false), rail_type: int().optional() }),
-    run: (ctx, a) => run(ctx, a, [[a.remove ? 'rail_remove' : 'rail', a.from_x, a.from_y, a.x, a.y, a.to_x, a.to_y]], { railType: a.rail_type }),
+    description: 'Lay (or with remove=true, remove) one rail piece on tile x,y joining its neighbour from_x,from_y to its neighbour to_x,to_y. Existing track on the tile is kept, so this makes junctions: e.g. connect a depot or a branch onto an existing line. Neighbours may be straight across (straight piece) or at right angles (curve). A vehicle on the tiles (ERR_VEHICLE_IN_THE_WAY) gives transient: true and vehicles_in_the_way (blocked_by_vehicle in a dry run); --wait_clear_s N waits for it to pass and retries from that step.',
+    args: z.object({ ...act, ...point, from_x: int(), from_y: int(), to_x: int(), to_y: int(), remove: bool().default(false), rail_type: int().optional(), ...waitClear }),
+    run: (ctx, a) => runClear(ctx, a, [[a.remove ? 'rail_remove' : 'rail', a.from_x, a.from_y, a.x, a.y, a.to_x, a.to_y]], { railType: a.rail_type }),
   },
   {
     name: 'build-signal', group: 'build', session: true,
-    description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it (refused with no_signal_here when there is none facing that way). The track must exist; in a template\'s dry run, signals on track it lays show skipped_in_dry_run.',
-    args: z.object({ ...act, ...point, ...front, type: z.enum(Object.keys(SIGNAL_TYPES)).default('path'), two_way: bool().default(false), remove: bool().default(false) }),
+    description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it (refused with no_signal_here when there is none facing that way, and with loop_signal when the tile is on a passing loop: without that signal two trains can enter the loop from both ends; --force true removes it anyway). The track must exist; in a template\'s dry run, signals on track it lays show skipped_in_dry_run.',
+    args: z.object({ ...act, ...point, ...front, type: z.enum(Object.keys(SIGNAL_TYPES)).default('path'), two_way: bool().default(false), remove: bool().default(false),
+      force: bool().default(false).describe('remove: also remove a passing loop\'s signal') }),
     run: async (ctx, a) => {
       if (a.remove) {
         const { s } = await mine(ctx, a);
         const why = await signalRemoveRefusal(s, a);
         if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: why.split(':')[0], steps_done: 0, results: [] };
+        const loop = a.force ? null : await loopOfTile(s, a.x, a.y);
+        if (loop) {
+          return { ok: false, dry_run: a.dry_run, first_error: 'loop_signal', steps_done: 0, results: [], loop: { x: loop.at.x, y: loop.at.y, end: loop.end, clear_tiles: loop.clear_tiles },
+            error: `loop_signal: (${a.x},${a.y}) is on the passing loop between the points at (${loop.at.x},${loop.at.y}) and (${loop.end.x},${loop.end.y}); without this signal trains from both ends can enter the loop and crash or jam. Nothing was removed. To take the whole loop out use build-passing-loop --remove true; to remove only this signal pass --force true` };
+        }
         return run(ctx, a, [['signal_remove', a.x, a.y, a.front_x, a.front_y]]);
       }
-      return run(ctx, a, [['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]);
+      return runClear(ctx, a, [['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]);
     },
   },
   {
@@ -3173,21 +3585,24 @@ export const COMMANDS = [
   },
   {
     name: 'build-passing-loop', group: 'build', session: true,
-    description: 'Template: passing loop for a single-track line. The main track runs length+2 tiles from x,y in direction dir (sw=+x, se=+y, ne=-x, nw=-y); a second track is laid beside it (side=1 or -1) with one-way path signals: trains heading dir use the main track, the others the loop. Both sides have length-1 clear tiles between the points and the exit signal (fits trains up to length-2 tiles). Give --train_tiles N or --for_vehicle ID (the longest train on that vehicle\'s line is used): length then defaults to train+2, and a loop with fewer than train+1 clear tiles is refused (loop_too_short). Checked first (AgentBridge v9): every main-line tile must be straight track along dir, or free land (not_straight_at / blocked_at / signal_at {x,y}); loop tiles must be free (loop_side_occupied_at). After a real build: loop_check (both directions through the loop) and, with --for_vehicle, route_after (connected|broken with first_gap). remove=true with the same x,y,dir,length,side takes the loop track and both signals (including the one on the main track) out again; the main track stays.',
+    description: 'Template: passing loop for a single-track line. The main track runs length+2 tiles from x,y in direction dir (sw=+x, se=+y, ne=-x, nw=-y); a second track is laid beside it (side=1 or -1) with one-way path signals: trains heading dir use the main track, the others the loop. Both sides have length-1 clear tiles between the points and the exit signal (fits trains up to length-2 tiles). Give --train_tiles N or --for_vehicle ID (the longest train on that vehicle\'s line is used); without either, the longest of your trains serving the line through x,y is used (train_from_line), else a train_length_unknown warning. Length then defaults to train+2, and a loop with fewer than train+1 clear tiles is refused (loop_too_short). Checked first (AgentBridge v9): every main-line tile must be straight track along dir, or free land (not_straight_at / blocked_at / signal_at {x,y}); loop tiles must be free (loop_side_occupied_at). After a real build: loop_check (both directions through the loop) and, with --for_vehicle, route_after (connected|broken with first_gap). remove=true with the same x,y,dir,length,side takes the loop track and both signals (including the one on the main track) out again; the main track stays. A vehicle on the tiles (ERR_VEHICLE_IN_THE_WAY) gives transient: true and vehicles_in_the_way (blocked_by_vehicle in a dry run); --wait_clear_s N waits for it to pass and retries from that step.',
     args: z.object({ ...act, ...point, dir: z.enum(DIR_NAMES).default('sw').describe('sw=+x, se=+y, ne=-x, nw=-y'), length: int().min(2).max(30).optional().describe('default: train tiles + 2, else 6'),
       side: int().default(1), rail_type: int().optional(),
       train_tiles: int().min(1).max(40).optional().describe('longest train that must wait in the loop, in tiles'),
       for_vehicle: int().optional().describe('a train of this line: its longest train sets train_tiles; also traces its route after the build'),
-      remove: bool().default(false).describe('take out a loop built with the same arguments') }),
+      remove: bool().default(false).describe('take out a loop built with the same arguments'), ...waitClear }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const info = await s.gs.call('info');
       const train = a.for_vehicle !== undefined ? await longestTrainOnLine(s, company, a.for_vehicle) : null;
-      const trainTiles = a.train_tiles ?? train?.tiles ?? null;
+      // C6: no train flags: the longest train already serving the line through x,y sets the size.
+      const onLine = a.train_tiles === undefined && !train && !a.remove ? await longestTrainAt(s, company, a.x, a.y) : null;
+      const trainTiles = a.train_tiles ?? train?.tiles ?? (onLine?.tiles || null);
       const length = a.length ?? (trainTiles ? trainTiles + 2 : 6);
+      const lineNote = onLine ? (onLine.tiles ? { train_from_line: onLine } : { warnings: [{ train_length_unknown: `${onLine.reason}; the loop is sized ${length} (fits trains up to ${length - 2} tiles). Pass --train_tiles N or --for_vehicle ID` }] }) : {};
       if (length > 30) return { ok: false, dry_run: a.dry_run, error: `loop_too_long: trains of ${trainTiles} tiles need length ${length}; the template allows 30`, first_error: 'loop_too_long' };
       const t = passingLoopSteps({ x: a.x, y: a.y, dir: dirIndex(a.dir), length, side: a.side < 0 ? -1 : 1 });
-      const geometry = { length, clear_tiles: t.clear_tiles, fits_trains_up_to_tiles: t.clear_tiles - 1, ends: t.ends, ...(trainTiles ? { train_tiles: trainTiles } : {}), ...(train ? { longest_train: train } : {}) };
+      const geometry = { length, clear_tiles: t.clear_tiles, fits_trains_up_to_tiles: t.clear_tiles - 1, ends: t.ends, ...(trainTiles ? { train_tiles: trainTiles } : {}), ...(train ? { longest_train: train } : {}), ...lineNote };
       if (a.remove) {
         const res = await run(ctx, a, passingLoopRemoveSteps(t), { keepGoing: true });
         if (!a.dry_run) await s.refreshArea(a.x - length - 3, a.y - length - 3, a.x + length + 3, a.y + length + 3);
@@ -3211,7 +3626,7 @@ export const COMMANDS = [
         }
         siteCheck = 'ok';
       }
-      const res = await run(ctx, a, t.steps, { railType: a.rail_type });
+      const res = await runClear(ctx, a, t.steps, { railType: a.rail_type });
       const out = { ...res, ...geometry, site_check: siteCheck };
       if (a.dry_run || !res.ok) return out;
       await s.refreshArea(a.x - length - 3, a.y - length - 3, a.x + length + 3, a.y + length + 3);
@@ -3520,7 +3935,8 @@ export const COMMANDS = [
 export const COMMANDS_BY_NAME = new Map(COMMANDS.map((c) => [c.name, c]));
 
 /**
- * Forgiving argument names: --id for --vehicle, --vehicle for --vehicles and back (one id).
+ * Forgiving argument names: --id for --vehicle, --vehicle for --vehicles and back (one id), --share and
+ * --share_orders for each other.
  * Returns a new args object; keys the command really has always win.
  */
 export function aliasArgs(known, raw) {
@@ -3534,6 +3950,8 @@ export function aliasArgs(known, raw) {
   move('id', 'vehicles');
   const single = (v) => (Array.isArray(v) && v.length === 1 ? v[0] : typeof v === 'string' && /^\s*\d+\s*$/.test(v) ? v.trim() : v);
   move('vehicles', 'vehicle', single);
+  move('share', 'share_orders'); // vehicle-clone --share (C12)
+  move('share_orders', 'share'); // orders-copy --share_orders
   move('company', 'companies'); // events --company N (events take no `company`: see events)
   return out;
 }

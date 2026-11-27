@@ -107,6 +107,14 @@ function fakeRailRows(state) {
   for (let x = 28; x <= 34; x++) rows.push([x, 40, 't', x === 31 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, 0]);
   rows.push([13, 21, 't', 2, -1, -1, -1, 0, 0, 0], [13, 22, 'd', 0, -1, 13, 21, 0, 0, 0],
     [12, 22, 'd', 0, -1, 12, 23, 0, 0, 0], [31, 41, 'd', 0, -1, 31, 40, 0, 0, 0]);
+  // state.railLoop: a short passing loop beside the main line, points (15,20) and (20,20), loop track (15..20,19)
+  // with a signal at (17,19): 3 clear tiles (too short for a 5-tile train).
+  if (state.railLoop) {
+    const at = (x, y) => rows.find((r) => r[0] === x && r[1] === y);
+    at(15, 20)[3] = 1 | 4; at(20, 20)[3] = 1 | 16;
+    rows.push([15, 19, 't', 8, -1, -1, -1, 0, 0, 0], [20, 19, 't', 32, -1, -1, -1, 0, 0, 0]);
+    for (let x = 16; x <= 19; x++) rows.push([x, 19, 't', 1, -1, -1, -1, 0, 0, x === 17 ? 1 << 6 : 0]);
+  }
   return rows.filter((r) => `${r[0]},${r[1]}` !== state.railGap);
 }
 
@@ -235,11 +243,13 @@ const GS = {
   build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 98766, echoed_company: a.company }),
   test_build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 100000, echoed_company: a.company }),
   // operate (row formats: see main.nut)
-  stations: () => [
+  // state.newStations (an array, tests set it): real rail_station steps add a station there (no track in rail_tiles).
+  stations: (_a, state) => [
     [3, 'Bigton Woods', 12, 20, 1, [[7, 240, 35]], 2],
     [4, 'Bigton Central', 41, 9, 4 | 2, [[0, 15, 80]], 5],
     [5, 'Sawmill Halt', 24, 20, 1, [], 1],
     [7, 'Smallham Stop', 47, 9, 2, [[0, 5, 60]], 1],
+    ...(state.newStations ?? []),
   ],
   // v9 rows end with [current_order, dest_x, dest_y, dest_station, speed].
   vehicles: (_a, state) => [
@@ -272,7 +282,7 @@ const GS = {
           profit_this_year: -200, profit_last_year: -900, value: 9000, running_cost: 800, state: 0, x: 30, y: 40, speed: 40, group: 2,
           wagons: 5, length: 80, capacity: [[7, 120, 0]], shared_orders: false, order_count: 2, current_order: 0, unit_number: 2, rail_type: 0 },
         [0, 'station', 12, 20, 96, 3, 'Bigton Woods', -1],
-        [1, 'station', 24, 20, 4, 5, 'Sawmill Halt', -1],
+        state.train13To ? [1, 'station', state.train13To.x, state.train13To.y, 4, state.train13To.id, state.train13To.name, -1] : [1, 'station', 24, 20, 4, 5, 'Sawmill Halt', -1],
       ];
     }
     if (a.vehicle !== 11) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${a.company}; run: openttd-agent vehicles`);
@@ -351,6 +361,21 @@ const GS = {
         if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
         continue;
       }
+      // state.inTheWay = { x, y, times }: a rail step over that tile fails with ERR_VEHICLE_IN_THE_WAY (real runs count down).
+      const w = state.inTheWay;
+      if (w && w.times > 0 && st[0] === 'rail' && Math.min(st[3], st[5]) <= w.x && w.x <= Math.max(st[3], st[5]) && Math.min(st[4], st[6]) <= w.y && w.y <= Math.max(st[4], st[6])) {
+        if (!a.dry_run) w.times--;
+        rows.push([false, 0, 'ERR_VEHICLE_IN_THE_WAY', 0]);
+        if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+        continue;
+      }
+      // state.stationError: every rail_station step (dry run too) fails with that text.
+      if (st[0] === 'rail_station' && state.stationError) {
+        rows.push([false, 0, state.stationError, 0]);
+        if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+        continue;
+      }
+      if (st[0] === 'rail_station' && !a.dry_run && state.newStations) state.newStations.push([20 + state.newStations.length, `New ${state.newStations.length}`, st[1], st[2], 1, [], 0]);
       const bad = st[0] === 'bogus' || (st[0] === 'veh_sell' && st[1] === 404) || (!a.dry_run && state.failOps.includes(st[0]));
       rows.push(bad ? [false, 0, 'Vehicle not available', 0] : [true, 10, '', 100 + rows.length]);
       if (bad && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
@@ -363,7 +388,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 14, townRatings: { 1: ['good', 450] }, cashNeed: 0, refuseOps: [], slopeOps: [], dryMoney: null, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null, revision: '15.3' };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 14, townRatings: { 1: ['good', 450] }, cashNeed: 0, refuseOps: [], slopeOps: [], dryMoney: null, lostTrain: false, railGap: null, railLoop: false, inTheWay: null, stationError: null, newStations: null, train13To: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null, revision: '15.3' };
   const server = net.createServer((sock) => {
     state.openConnections++;
     sock.on('close', () => { state.openConnections--; });

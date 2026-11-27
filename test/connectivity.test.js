@@ -2,7 +2,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { traceRail, adjacencyTrace, mirrorStationTiles, trackExits, entryRefusal } from '../src/connectivity.js';
+import { traceRail, adjacencyTrace, mirrorStationTiles, trackExits, entryRefusal, findLoops } from '../src/connectivity.js';
 import { TileMap } from '../src/world.js';
 
 const X = 1, Y = 2, NW_NE = 4, SW_SE = 8, NW_SW = 16, NE_SE = 32;
@@ -120,4 +120,39 @@ test('road gap reasons: one-way, depot and stop entrances, missing road', async 
   const tiles = new Map([[`0,0`, road(0, 0, 1)], [`1,0`, road(1, 0, 5, { kind: 't', station: 9, owner: 3 })], [`2,0`, road(2, 0, 4, { kind: 's', station: 8, a: 1, b: 0 })]]);
   const r = await traceRoad({ getTile: (x, y) => tiles.get(`${x},${y}`) ?? null, starts: [{ x: 0, y: 0 }], isGoal: (t) => t.station === 8, goal: { x: 2, y: 0 }, company: 0 });
   assert.deepEqual([r.connected, r.first_gap.reason], [false, 'other_owner_road']);
+});
+
+/** A line station 1 (2..4,5) - track (5..30,5) - station 2 (31..33,5) with a build-passing-loop loop: points (9,5) and (16,5), lane (9..16,6). */
+function loopLine({ signals = true, lane = true } = {}) {
+  const specs = [...row(2, 4, 5, 's', 1), ...row(5, 30, 5), ...row(31, 33, 5, 's', 2)];
+  const set = (x, y, tracks, signal = 0) => { const i = specs.findIndex((q) => q[0] === x && q[1] === y); const t = [x, y, 't', tracks, -1, -1, -1, 0, signal]; if (i >= 0) specs[i] = t; else specs.push(t); };
+  if (lane) {
+    set(9, 5, X | NE_SE); set(16, 5, X | SW_SE);
+    set(9, 6, NW_SW); for (let x = 10; x <= 15; x++) set(x, 6, X, signals && x === 11 ? 0x11 : 0); set(16, 6, NW_NE);
+    if (signals) set(15, 5, X, 0x44);
+  }
+  return specs;
+}
+
+test('findLoops: a real passing loop, its clear tiles and signals; throats and spurs are not loops', async () => {
+  const trace = async (specs) => {
+    const getTile = world(specs);
+    const r = await traceRail({ getTile, starts: [{ x: 3, y: 5 }], isGoal: goalStation(2), goal: { x: 32, y: 5 } });
+    assert.equal(r.connected, true);
+    return findLoops({ path: r.path, getTile });
+  };
+  const [loop, ...rest] = await trace(loopLine());
+  assert.equal(rest.length, 0);
+  assert.deepEqual([loop.at, loop.end, loop.line_tiles, loop.branch_tiles, loop.clear_tiles, loop.signals_ok], [{ x: 9, y: 5 }, { x: 16, y: 5 }, 6, 8, 5, true]);
+  // The same loop seen from its loop side (a path through the lane): the same clear tiles.
+  const lanePath = [[8, 5], [9, 5], [9, 6], [10, 6], [11, 6], [12, 6], [13, 6], [14, 6], [15, 6], [16, 6], [16, 5], [17, 5]].map(([x, y]) => ({ x, y }));
+  const [fromLane] = await findLoops({ path: lanePath, getTile: world(loopLine()) });
+  assert.deepEqual([fromLane.at, fromLane.end, fromLane.clear_tiles, fromLane.signals_ok], [{ x: 9, y: 5 }, { x: 16, y: 5 }, 5, true]);
+  const bare = await trace(loopLine({ signals: false }));
+  assert.deepEqual([bare.length, bare[0].signals_ok, bare[0].line_signal], [1, false, false]);
+  // A spur to a dead end (or a depot) and a second platform of a terminus never rejoin the line.
+  const spur = loopLine({ lane: false });
+  spur.splice(spur.findIndex((q) => q[0] === 20 && q[1] === 5), 1, [20, 5, 't', X | NE_SE]);
+  spur.push([20, 6, 't', Y], [20, 7, 'd', 0, -1, 20, 6]);
+  assert.deepEqual(await trace(spur), []);
 });
