@@ -37,6 +37,46 @@ Host tools (batch 3):
   `~/.openttd-agent/jobs-<host>-<port>.json` per game (seed and start date) and resume when the
   daemon or relay reconnects to that game. `status` gains `background_jobs`.
 
+CLI/MCP parity and the output contract (batches 1 and 2):
+
+- **Breaking:** MCP refuses unknown arguments like the CLI (`first_error: unknown_argument`,
+  nothing runs). The SDK used to strip them and run the command with defaults (a stray `help`
+  advanced the game 41 days). Tools get a pass-through schema; aliases (`--id`) and the error
+  JSON now work over MCP too.
+- **Breaking:** build/exec results list only failed steps: `results_failed` plus
+  `steps_done`/`steps_total`. `--steps all` gives the full `results`. A failed step has no `value`
+  (it could show 1048575 as an id).
+- **Breaking:** the CLI prints one-line JSON when stdout is not a terminal (`--compact false` or
+  `OPENTTD_AGENT_COMPACT=0` indents), and the MCP server is compact by default (`mcp --compact false`).
+- **Breaking:** a result with `ok: false` makes the CLI exit 1 and sets MCP `isError` (it used to
+  exit 0 / not set it unless the command threw). `batch` prints `{"name", "result"}` for every
+  line, failures too (they used to be a bare error object without the name).
+- **Breaking:** `null`, `""`, `false` and `[]` no longer coerce to 0 for numbers (company 0 is a
+  real company). `null` (and `""` for a number) means "not given"; `false`/`[]` are refused.
+- **Breaking:** `help` prints one line per command (`help --full` for the old listing, about 4x
+  longer); `commands` schemas use `io: 'input'`, the same as MCP `tools/list`.
+- Every command takes `--fields a,b.c` (projection; item fields apply to lists), `--brief true`
+  (ok, cost, money, ids) and `--compact`, on the CLI, in `batch` and over MCP.
+- Error codes: `unknown_command`, `unknown_argument`, `bad_arguments` (a missing argument says
+  `required`), `read_only`, `daemon_timeout`, `daemon_failed`, `relay_timeout`.
+- A JSON number works for a text argument (`join: 12`). Read commands and dry runs clamp an
+  out-of-range number (`clamped`); read commands ignore `--dry_run`/`--list`, `vehicle-depot`
+  ignores `--depot auto` (`ignored_args`). CLI: a bare word after a value joins it with a space.
+- Read-only mode: `OPENTTD_AGENT_READ_ONLY=1` or `mcp --read_only true` forces dry runs
+  (`forced_dry_run: true`) and refuses other actions. `OPENTTD_AGENT_TOOLS=a,b` limits the CLI and
+  `help` like `mcp --tools`. A relay player's MCP server lists only the tools the relay serves.
+- One dispatch for CLI, batch and MCP (`src/dispatch.js`): MCP game calls now share the background
+  daemon (its map mirror and background jobs) unless `--no-daemon`; `batch --no-daemon` works and
+  keeps one connection. A one-shot call that starts a background job warns `background_job_not_kept`.
+- The daemon reports `code_id` (files of src/bin/gamescript) and `config_hash` on `/health`. The
+  CLI restarts a daemon running other code (no more `daemon-stop` after an update or an edit), and
+  once more when a daemon answers "unknown command" for a known one. A daemon running with other
+  settings (another caller's env, e.g. `OPENTTD_AGENT_COMPANY`) is left alone; the call runs in the
+  caller's process with `warnings: daemon_config_mismatch`.
+- Calls longer than 5 minutes work through the daemon and the relay (node:http, server request
+  timeouts off); one overall timeout `OPENTTD_AGENT_CALL_TIMEOUT_S` (default 3600 s).
+- `test/parity.test.js`: every command through the CLI and MCP against identical fake servers.
+
 ## 0.7.0 (2026-11-26)
 
 AgentBridge GameScript v12: hosts must run `install-gamescript` and reload the game. Older GameScripts get clear refusals or fallbacks. List outputs and `first_error` changed shape (below), so scripts that parse them need updating.

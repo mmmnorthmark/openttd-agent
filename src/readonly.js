@@ -26,7 +26,7 @@ export const WRITE_COMMANDS = new Set([
   'install-gamescript', 'configure', 'scenario-prepare', 'relay-add-player', 'relay-set-company', 'relay-remove-player',
   'chat', 'goal-set', 'pause', 'unpause', 'turn-advance', 'goal-clear', 'save',
   'load', 'server-stop', 'console', 'company-new',
-  'launch', // refused even as a dry run: a dry run still writes the launch profile files
+  'launch', // starts or restarts a server: refused even when asked as a dry run (host decision)
 ]);
 
 /** Is read-only mode asked for by the environment? */
