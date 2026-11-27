@@ -36,7 +36,11 @@ const num = () => z.number();
 const bool = () => z.preprocess((v) => (v === 'true' ? true : v === 'false' ? false : v), z.boolean());
 const point = { x: int().describe('tile x'), y: int().describe('tile y') };
 /** "1,2,3" | 5 | [1,2] -> [ints] */
-const ids = () => z.preprocess((v) => (Array.isArray(v) ? v : typeof v === 'number' || typeof v === 'string' ? String(v).split(',').filter((t) => t.trim() !== '') : v).map?.(toNumber) ?? v, z.array(int()).min(1));
+const idList = (v) => {
+  const list = Array.isArray(v) ? v : typeof v === 'number' || typeof v === 'string' ? String(v).split(',').filter((t) => t.trim() !== '') : v;
+  return Array.isArray(list) ? list.map(toNumber) : list;
+};
+const ids = () => z.preprocess(idList, z.array(int()).min(1));
 const who = { company: int().optional().describe('company id; default: your configured company') };
 const act = { ...who, dry_run: bool().default(false).describe('true = cost/feasibility only, changes nothing') };
 const lc = (v) => String(v).toLowerCase();
