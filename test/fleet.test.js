@@ -223,3 +223,15 @@ test('summary vehicle lines: speed, load and order; buckets; vehicle has a top-l
   assert.deepEqual(res.low_reliability, []);
   assert.deepEqual((await run('vehicle', { vehicle: 11 })).load, { load: 40, capacity: 120, pct: 33 });
 });
+
+test('--select picks vehicles by filter for vehicle-depot and vehicle-replace', async () => {
+  const dep = await run('vehicle-depot', { select: 'max_reliability_pct=70', service: true, dry_run: true });
+  assert.deepEqual(dep.selected, { ids: [11], matched: 1, skipped_queued: 0 });
+  const rep = await run('vehicle-replace', { select: 'type=road', dry_run: true });
+  assert.deepEqual(rep.selected.ids, [12]);
+  assert.equal(rep.replaced[0].vehicle, 12);
+  const none = await run('vehicle-replace', { select: 'min_age_days=999999', dry_run: true });
+  assert.deepEqual(none.replaced, []);
+  await assert.rejects(run('vehicle-depot', { select: 'colour=red' }), /bad_arguments: --select/);
+  await assert.rejects(run('vehicle-depot', {}), /--vehicles A,B or --select/);
+});

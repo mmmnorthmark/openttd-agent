@@ -930,6 +930,21 @@ async function vehicleLoads(s, company, vehicles) {
   }
 }
 
+/**
+ * --select FILTER (parseSelect) over the company's vehicles, minus vehicles queued for sale, at most `max`.
+ * Returns { ids, matched, skipped_queued }.
+ */
+async function selectVehicles(s, company, text, max) {
+  const f = parseSelect(text);
+  const hit = filterVehicles(vehiclesFromRows(await s.gs.call('vehicles', { company })), f);
+  const free = hit.filter((v) => !s.pendingSales.has(`${company}:${v.id}`));
+  return { ids: free.slice(0, max).map((v) => v.id), matched: hit.length, skipped_queued: hit.length - free.length };
+}
+const selectArgs = (what, max) => ({
+  select: z.string().optional().describe(`instead of --vehicles: ${what} the vehicles matching key=value filters, comma-separated (keys as vehicles: ids=1|2, type, group, state, engine, name, max_profit_last_year, max_profit_this_year, min_age_pct, min_age_days, max_reliability_pct); e.g. "type=road,min_age_pct=100"`),
+  max: int().min(1).max(100).default(max).describe('with --select: at most this many vehicles'),
+});
+
 /** Station ids in a vehicle's orders (for the sale ledger); [] when it cannot be read. */
 async function orderStationIds(s, company, id) {
   try { return [...new Set((await currentOrderOf(s, company, id)).orders.filter((o) => o.kind === 'station').map((o) => o.station))]; } catch { return []; }
@@ -2561,23 +2576,27 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-replace', group: 'operate', session: true,
-    description: 'Replace vehicles (comma-separated ids) in one call: buy the replacement at a depot on the vehicle\'s own route (--depot auto, the default, or --depot_x/--depot_y), share the old vehicle\'s orders, start it; the old vehicle gets its own copy of the orders, loads nothing more at its next unloading stop (no_load) and gets a "stop in depot" order right after it (--when unloaded, the default; --when now sends it to a depot at once), and is sold when it stops there. The daemon (or relay) checks every 20 s and sells it; --finish true sells any that have arrived now and lists the rest (pending_sales). Without --engine the replacement is a clone (same engine and wagons). --engine N buys that engine instead; for trains also --wagons N (default: as many as the old train) of --wagon ID (default: the old train\'s wagon type; AgentBridge v12) refitted to the old cargo. For age-based replacement of whole fleets, group-autoreplace or autorenew is cheaper in calls.',
+    description: 'Replace vehicles (comma-separated ids) in one call: buy the replacement at a depot on the vehicle\'s own route (--depot auto, the default, or --depot_x/--depot_y), share the old vehicle\'s orders, start it; the old vehicle gets its own copy of the orders, loads nothing more at its next unloading stop (no_load) and gets a "stop in depot" order right after it (--when unloaded, the default; --when now sends it to a depot at once), and is sold when it stops there. The daemon (or relay) checks every 20 s and sells it; --finish true sells any that have arrived now and lists the rest (pending_sales). Without --engine the replacement is a clone (same engine and wagons). --engine N buys that engine instead; for trains also --wagons N (default: as many as the old train) of --wagon ID (default: the old train\'s wagon type; AgentBridge v12) refitted to the old cargo. --select "min_age_pct=100,type=road" --max 5 picks the vehicles by filter instead of --vehicles (selected: ids, matched). For age-based replacement of whole fleets, group-autoreplace or autorenew is cheaper in calls.',
     args: z.object({ ...act, vehicles: ids().optional(), engine: int().optional(), wagon: int().optional(), wagons: int().min(0).max(60).optional(),
       depot: z.enum(['auto']).optional(), depot_x: int().optional(), depot_y: int().optional(),
       when: z.enum(['unloaded', 'now']).default('unloaded').describe('when the old vehicle heads for the depot'),
-      finish: bool().default(false).describe('only sell replaced vehicles that have stopped in a depot; no new replacements') }),
+      finish: bool().default(false).describe('only sell replaced vehicles that have stopped in a depot; no new replacements'), ...selectArgs('replace', 5) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       if (a.finish) return { ...forCompany(await s.finishSales(), company), pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
-      if (!a.vehicles) throw new Error('give --vehicles A,B (or --finish true)');
+      if (a.vehicles && a.select) throw new Error('give --vehicles A,B or --select FILTER, not both');
+      const picked = a.select ? await selectVehicles(s, company, a.select, a.max) : null;
+      const list = picked ? picked.ids : a.vehicles;
+      if (!list) throw new Error('give --vehicles A,B, --select FILTER (or --finish true)');
+      if (picked && !list.length) return { ok: true, dry_run: a.dry_run, replaced: [], selected: picked, note: 'no vehicle matches --select (vehicles queued for sale are left out)' };
       const v12 = ((await s.gs.call('info')).bridge_version ?? 0) >= 12;
       const replaced = [];
-      for (const id of a.vehicles) replaced.push(await replaceOne(s, company, a, id, v12));
+      for (const id of list) replaced.push(await replaceOne(s, company, a, id, v12));
       if (!a.dry_run) s.watchSales();
       const bad = replaced.filter((r) => !r.ok);
       return { ok: !bad.length, dry_run: a.dry_run, error: bad.length ? bad.map((r) => `vehicle ${r.vehicle}: ${r.error}`).join('; ') : null,
         ...(bad.length ? { first_error: bad[0].first_error ?? errorCode(bad[0].error) } : {}),
-        cost: replaced.reduce((n, r) => n + (r.cost ?? 0), 0), replaced, pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
+        cost: replaced.reduce((n, r) => n + (r.cost ?? 0), 0), replaced, ...(picked ? { selected: picked } : {}), pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
     },
   },
   {
@@ -2745,12 +2764,15 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-depot', group: 'operate', session: true,
-    description: 'Send vehicles (comma-separated ids) to a depot: they stop there (needed before vehicle-sell). service=true = service only and carry on. Safe to repeat: vehicles already heading to a depot are left alone (already_heading; sending again would cancel their depot order in OpenTTD) and ones already stopped in a depot are reported (already_in_depot). Failures say why (failed[].error: not_found, broken_down, loading_full_load, no_depot). AgentBridge v11; older ones only skip vehicles already in a depot.',
-    args: z.object({ ...act, vehicles: ids(), service: bool().default(false) }),
+    description: 'Send vehicles (comma-separated ids) to a depot: they stop there (needed before vehicle-sell). service=true = service only and carry on. Safe to repeat: vehicles already heading to a depot are left alone (already_heading; sending again would cancel their depot order in OpenTTD) and ones already stopped in a depot are reported (already_in_depot). Failures say why (failed[].error: not_found, broken_down, loading_full_load, no_depot). --select "max_reliability_pct=50" --service true services the vehicles matching a filter (at most --max, default 20; selected lists them). AgentBridge v11; older ones only skip vehicles already in a depot.',
+    args: z.object({ ...act, vehicles: ids().optional(), service: bool().default(false), ...selectArgs('send', 20) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
+      if (a.vehicles && a.select) throw new Error('give --vehicles A,B or --select FILTER, not both');
+      const picked = a.select ? await selectVehicles(s, company, a.select, a.max) : null;
+      if (!a.vehicles && !picked) throw new Error('give --vehicles A,B or --select FILTER');
       const v11 = ((await s.gs.call('info')).bridge_version ?? 0) >= 11;
-      let send = a.vehicles;
+      let send = picked ? picked.ids : a.vehicles;
       const inDepot = [];
       if (!v11) {
         const rows = vehiclesFromRows(await s.gs.call('vehicles', { company }));
@@ -2761,7 +2783,7 @@ export const COMMANDS = [
       const res = send.length ? await run(ctx, a, send.map((v) => ['veh_depot', v, a.service]), { keepGoing: true })
         : { ok: true, error: null, dry_run: a.dry_run, steps_total: 0, steps_done: 0, cost: 0, results: [] };
       const by = (code) => res.results.filter((r) => r.ok && (v11 ? (r.value ?? 0) === code : code === 1)).map((r) => send[r.step]);
-      return { ...res, sent: by(1), already_heading: by(2), already_in_depot: [...inDepot, ...by(3)],
+      return { ...res, ...(picked ? { selected: picked } : {}), sent: by(1), already_heading: by(2), already_in_depot: [...inDepot, ...by(3)],
         failed: res.results.filter((r) => !r.ok).map((r) => ({ vehicle: send[r.step], error: r.error ?? 'failed' })),
         ...(v11 ? {} : { note: 'the running AgentBridge is older than v11: a vehicle already heading to a depot cannot be detected, and sending it again cancels its depot order' }) };
     },
