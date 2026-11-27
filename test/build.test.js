@@ -315,9 +315,14 @@ test('road stops and depots: connected, --connect auto, decoded drive-through re
 });
 
 test('build-passing-loop: site check, train length, dry run ok, remove', async () => {
-  const sig = await run('build-passing-loop', { x: 15, y: 20, dir: 'sw', length: 4, dry_run: true });
+  // No train flags on a served line: train 11 (5 tiles) runs between the two stations of the line.
+  const served = await run('build-passing-loop', { x: 15, y: 20, dir: 'sw', length: 4, dry_run: true });
+  assert.deepEqual([served.first_error, served.train_tiles, served.train_from_line.vehicle, served.train_from_line.stations], ['loop_too_short', 5, 11, [{ id: 3 }, { id: 5 }]]);
+  const sized = await run('build-passing-loop', { x: 15, y: 20, dir: 'sw', dry_run: true });
+  assert.deepEqual([sized.length, sized.train_tiles], [7, 5], 'length defaults to the line\'s train + 2');
+  const sig = await run('build-passing-loop', { x: 15, y: 20, dir: 'sw', length: 4, train_tiles: 2, dry_run: true });
   assert.deepEqual([sig.ok, sig.first_error, sig.at], [false, 'signal_at', { x: 18, y: 20 }]);
-  const stn = await run('build-passing-loop', { x: 20, y: 20, dir: 'sw', length: 2, dry_run: true });
+  const stn = await run('build-passing-loop', { x: 20, y: 20, dir: 'sw', length: 3, train_tiles: 1, dry_run: true });
   assert.deepEqual([stn.first_error, stn.at], ['not_straight_at', { x: 24, y: 20 }]);
   assert.match(stn.error, /a station tile/);
   const short = await run('build-passing-loop', { x: 5, y: 30, length: 4, train_tiles: 5, dry_run: true });
@@ -327,6 +332,7 @@ test('build-passing-loop: site check, train length, dry run ok, remove', async (
   assert.equal(fit.site_check, 'ok');
   const built = await run('build-passing-loop', { x: 5, y: 30, length: 4 });
   assert.equal(built.ok, true);
+  assert.match(built.warnings[0].train_length_unknown, /has no track yet/);
   assert.ok(built.loop_check, 'a real build traces both directions');
   assert.match(built.route_after, /not_checked/);
   const rm = await run('build-passing-loop', { x: 5, y: 30, length: 4, remove: true });
