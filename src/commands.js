@@ -2293,9 +2293,10 @@ export const COMMANDS = [
   },
   {
     name: 'verify-route', group: 'operate', session: true,
-    description: 'Is there a rail or road path? --vehicle ID traces from the vehicle to each of its order stations and between consecutive order stations (rail for trains, road for road vehicles); --from_station A --to_station B (id or name) traces A to B (mode auto: rail when both have rail, road when both have truck or bus stops). Reports connected and, if not, the last reachable tile and the first gap with a reason. Rail (AgentBridge v9; coarse map-mirror trace before): no_track, track_not_joined, station_platform_side, depot_entrance_faces_away, one_way_signal_against, other_company_track, bridge_side, tunnel_side. Road (AgentBridge v11; refused before): no_road, road_not_joined, one_way_road, depot_not_joined, depot_entrance_faces_away, stop_not_joined, stop_entrance_faces_away, other_owner_road (another company\'s stop or depot).',
+    description: 'Is there a rail or road path? --vehicle ID traces from the vehicle to each of its order stations and between consecutive order stations (rail for trains, road for road vehicles); --from_station A --to_station B (id or name) traces A to B and B back to A (both_ways, default; there/back, connected = both; --both_ways false = A to B only; mode auto: rail when both have rail, road when both have truck or bus stops). legs_connected[] has one true/false per leg (vehicle: its order legs; pair: there, back). Reports connected and, if not, the last reachable tile and the first gap with a reason. Rail (AgentBridge v9; coarse map-mirror trace before): no_track, track_not_joined, station_platform_side, depot_entrance_faces_away, one_way_signal_against, other_company_track, bridge_side, tunnel_side. Road (AgentBridge v11; refused before): no_road, road_not_joined, one_way_road, depot_not_joined, depot_entrance_faces_away, stop_not_joined, stop_entrance_faces_away, other_owner_road (another company\'s stop or depot).',
     args: z.object({ ...who, vehicle: int().optional(), from_station: z.coerce.string().optional().describe('station id or name'), to_station: z.coerce.string().optional().describe('station id or name'),
-      mode: z.enum(['auto', 'rail', 'road']).default('auto').describe('station pair only: which network to trace') }),
+      mode: z.enum(['auto', 'rail', 'road']).default('auto').describe('station pair only: which network to trace'),
+      both_ways: bool().default(true).describe('station pair only: also trace B back to A (a train must get back; one-way signals can block one direction)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
@@ -2316,7 +2317,7 @@ export const COMMANDS = [
         const tracer = await pick(veh.type);
         const legs = await routeLegs(s, company, tracer, stations, veh);
         return { vehicle: veh.id, unit_number: veh.unit_number, type: veh.type, at: { x: veh.x, y: veh.y }, connected: legs.connected, method: tracer.method,
-          ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), from_vehicle: legs.from_vehicle, legs: legs.legs };
+          ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), legs_connected: legs.legs.map((l) => l.connected), from_vehicle: legs.from_vehicle, legs: legs.legs };
       }
       if (a.from_station === undefined || a.to_station === undefined) throw new Error('give --vehicle ID, or both --from_station and --to_station (id or name)');
       const from = findStation(stations, a.from_station), to = findStation(stations, a.to_station);
@@ -2324,7 +2325,12 @@ export const COMMANDS = [
       const mode = a.mode !== 'auto' ? a.mode : (from.facilities.includes('rail') && to.facilities.includes('rail')) || !(roadish(from) && roadish(to)) ? 'rail' : 'road';
       const tracer = await pick(mode);
       const r = await tracer.trace(await tracer.stationStarts(from), to);
-      return { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, mode, method: tracer.method, ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), ...brief(r) };
+      const head = { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, mode, method: tracer.method, ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}) };
+      if (!a.both_ways) return { ...head, ...brief(r), legs_connected: [r.connected] };
+      const back = await tracer.trace(await tracer.stationStarts(to), from);
+      const bad = !r.connected ? r : back;
+      return { ...head, ...brief(bad), connected: r.connected && back.connected, tiles_reached: r.tiles_reached, legs_connected: [r.connected, back.connected],
+        there: brief(r), back: brief(back), ...(r.connected && !back.connected ? { note_back: `${to.name} -> ${from.name} is not connected: trains get there but not back` } : {}) };
     },
   },
   {

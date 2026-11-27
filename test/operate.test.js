@@ -237,6 +237,7 @@ test('verify-route: stations joined, then a gap with the last reachable tile', a
   assert.equal(v.unit_number, 1);
   assert.equal(v.connected, true);
   assert.deepEqual(v.from_vehicle.map((r) => [r.station, r.connected]), [[3, true]]);
+  assert.deepEqual(ok.legs_connected, [true, true], 'there and back');
   await assert.rejects(run('verify-route', { from_station: 3 }), /both --from_station and --to_station/);
 });
 
@@ -382,9 +383,13 @@ test('verify-route traces road vehicles and road stops (AgentBridge v11), refuse
   } finally { fake.state.roadGap = null; }
   fake.state.roadOneWay = '44,9';
   try {
-    assert.equal((await run('verify-route', { from_station: 4, to_station: 7 })).connected, true, 'with the one-way direction');
-    const back = await run('verify-route', { from_station: 7, to_station: 4 });
+    assert.equal((await run('verify-route', { from_station: 4, to_station: 7, both_ways: false })).connected, true, 'with the one-way direction');
+    const back = await run('verify-route', { from_station: 7, to_station: 4, both_ways: false });
     assert.deepEqual([back.connected, back.first_gap.reason], [false, 'one_way_road']);
+    // Both ways (the default): there but not back.
+    const both = await run('verify-route', { from_station: 4, to_station: 7 });
+    assert.deepEqual([both.connected, both.legs_connected, both.there.connected, both.back.connected, both.first_gap.reason], [false, [true, false], true, false, 'one_way_road']);
+    assert.match(both.note_back, /not back/);
   } finally { fake.state.roadOneWay = null; }
   const probs = await run('vehicle-problems', {});
   assert.equal(probs.road_trace, 'road_tiles');
