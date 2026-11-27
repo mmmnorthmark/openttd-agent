@@ -512,3 +512,13 @@ test('build-cargo-route --if_exists: refuse (default), skip, add_train, build (L
     assert.equal(build.action, undefined);
   } finally { fake.state.lostTrain = false; fake.state.newStations = null; fake.state.train13To = null; }
 });
+
+test('build-cargo-route --trains: only as many trains as passing loops + 1 (C13)', async () => {
+  const dry = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true, allow_existing: true, trains: 3, reuse_stations: 'never' });
+  assert.equal(dry.ok, true, JSON.stringify(dry).slice(0, 300));
+  assert.deepEqual([dry.trains.asked, dry.trains.planned, dry.trains.passing_loops_planned], [3, 1, 0]);
+  assert.match(dry.trains.note, /--passing_loops 2/);
+  const real = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', allow_existing: true, trains: 2, wagons: 2, reuse_stations: 'never' });
+  assert.deepEqual(real.vehicles, [real.vehicle], 'no clone without a traced line');
+  assert.ok(real.warnings.some((w) => /only 1 of 2 trains/.test(w.trains ?? '')));
+});
