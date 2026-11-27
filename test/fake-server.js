@@ -151,6 +151,16 @@ function fakeRcon(cmd, state) {
     return [];
   }
   if (cmd === 'setting command_pause_level') return [`Current value for 'construction.command_pause_level' is '${state.pauseLevel}' (min: 0, max: 3, def: 1).`];
+  // Host tools (0.8.0): the console's save list, save, load by index, start_ai, rescan_game, quit.
+  if (cmd === 'ls') return ['0) .. (Parent directory)', '1) autosave/ (Directory)', ...state.saves.map((n, i) => `${i + 2}) ${n}.sav`)];
+  if (cmd.startsWith('save ')) { const n = cmd.slice(5); if (!state.saves.includes(n)) state.saves.push(n); return ['Saving map...', `Map successfully saved to '${n}.sav'.`]; }
+  if (/^load \d+$/.test(cmd)) return Number(cmd.slice(5)) - 2 in state.saves ? [] : ['That file cannot be found.'];
+  if (cmd.startsWith('start_ai ')) {
+    if (cmd.slice(9) !== 'IdleAI') return ['Failed to load the specified AI.'];
+    state.extraCompanies.push(state.extraCompanies.length + 1);
+    return [];
+  }
+  if (cmd === 'rescan_game' || cmd === 'quit') return [];
   return [`ran: ${cmd}`];
 }
 
@@ -185,7 +195,8 @@ const GS = {
   ],
   towns: () => [[1, 'Bigton', 42, 12, 5000, false, 800, 10, 200, 0, 6], [2, 'Smallham', 10, 50, 300, false, 40, 0, 10, 0, 2]],
   companies: (_a, state) => [{ id: 0, name: 'Test Transport', money: state.money, loan: state.loan, max_loan: FAKE_MAX_LOAN, value: 50000, income: 9000, expenses: -4000, cargo_delivered: 300, performance: 210, hq: -1,
-    ...(state.gsVersion >= 12 ? { station_count: 4, vehicles_by_type: [state.lostTrain ? 2 : 1, 1, 0, 0] } : {}) }],
+    ...(state.gsVersion >= 12 ? { station_count: 4, vehicles_by_type: [state.lostTrain ? 2 : 1, 1, 0, 0] } : {}) },
+  ...state.extraCompanies.map((id) => ({ id, name: 'Unnamed', money: 100000, loan: 100000, max_loan: FAKE_MAX_LOAN, value: 1, income: 0, expenses: 0, cargo_delivered: 0, performance: 0, hq: -1 }))],
   // v12 queries (see main.nut). Older versions answer "unknown cmd" through v12only.
   company_history: (a) => Array.from({ length: (a.quarters ?? 4) + 1 }, (_, q) => [q, 50000 - q * 1000, 9000 - q * 500, -4000, 300 - q * 10, q === 0 ? -1 : 210 - q]),
   rating_parts: (_a, state) => ({ profitable_vehicles: 1, vehicles_over_2_years: 1, min_profit: -3000, station_facilities: 5, station_facilities_served: 5, money: state.money, loan: state.loan }),
@@ -333,21 +344,24 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [] };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
   const server = net.createServer((sock) => {
     state.openConnections++;
     sock.on('close', () => { state.openConnections--; });
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));
+    const welcome = () => {
+      const tail = Buffer.alloc(4 + 1 + 4 + 2 + 2);
+      tail.writeUInt32LE(state.seed ?? 42, 0); tail.writeUInt8(0, 4); tail.writeUInt32LE(0, 5); tail.writeUInt16LE(FAKE_MAP, 9); tail.writeUInt16LE(FAKE_MAP, 11);
+      send(PKT.SERVER_WELCOME, Buffer.concat([cstr('fake'), cstr('15.3'), Buffer.from([1]), cstr(''), tail]));
+    };
     sock.on('data', (chunk) => {
       for (const [type, body] of splitter.push(chunk)) {
         const r = new Reader(body);
         if (type === PKT.ADMIN_JOIN) {
           if (r.str() !== password) { send(PKT.SERVER_ERROR, Buffer.from([9])); continue; }
           send(PKT.SERVER_PROTOCOL, Buffer.from([3, 0]));
-          const tail = Buffer.alloc(4 + 1 + 4 + 2 + 2);
-          tail.writeUInt32LE(42, 0); tail.writeUInt8(0, 4); tail.writeUInt32LE(0, 5); tail.writeUInt16LE(FAKE_MAP, 9); tail.writeUInt16LE(FAKE_MAP, 11);
-          send(PKT.SERVER_WELCOME, Buffer.concat([cstr('fake'), cstr('15.3'), Buffer.from([1]), cstr(''), tail]));
+          welcome();
         } else if (type === PKT.ADMIN_GAMESCRIPT) {
           const req = JSON.parse(r.str());
           received.push(req);
@@ -376,6 +390,13 @@ export function startFakeServer({ password = 'pw' } = {}) {
           state.rcons.push(cmd);
           for (const line of fakeRcon(cmd, state)) send(PKT.SERVER_RCON, Buffer.concat([Buffer.from([1, 0]), cstr(line)]));
           send(PKT.SERVER_RCON_END, cstr('x'));
+          if (/^load \d+$/.test(cmd) && Number(cmd.slice(5)) - 2 in state.saves) {
+            state.loads++;
+            if (state.versionAfterLoad !== null) state.gsVersion = state.versionAfterLoad;
+            send(PKT.SERVER_NEWGAME);
+            welcome();
+          }
+          if (cmd === 'quit') sock.destroy();
         }
       }
     });

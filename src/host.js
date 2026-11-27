@@ -245,10 +245,11 @@ export async function saveAndWait(admin, target, name) {
   return { saved: `${n}.sav`, ...(target.local ? { path: file, bytes } : {}), console: out };
 }
 
-/** Console `ls` -> [{ index, name }] (savegames only; folders and ".." skipped). */
+/** Console `ls` ("0) .. (Parent directory)", "1) autosave/ (Directory)", "2) game.sav") -> [{ index, name }], savegames only. */
 export function parseLs(lines) {
   return lines.map((l) => /^\s*(\d+)\)\s+(.*?)\s*$/.exec(l)).filter(Boolean)
-    .map((m) => ({ index: Number(m[1]), name: m[2] })).filter((e) => !e.name.endsWith('/') && e.name !== '..');
+    .filter((m) => !/\((Parent directory|Directory)\)$/.test(m[2]))
+    .map((m) => ({ index: Number(m[1]), name: m[2].replace(/\.sav$/i, '') }));
 }
 
 /** Resolves on the next welcome (a load finished). Arm before sending the load. */

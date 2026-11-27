@@ -35,6 +35,7 @@ const point = { x: int().describe('tile x'), y: int().describe('tile y') };
 /** "1,2,3" | 5 | [1,2] -> [ints] */
 const ids = () => z.preprocess((v) => (Array.isArray(v) ? v : String(v).split(',').filter((t) => t.trim() !== '')), z.array(int()).min(1));
 const who = { company: int().optional().describe('company id; default: your configured company') };
+const serverArg = { server: z.string().optional().describe('launch profile of the server (launch --server NAME); default: the server at the configured admin_port') };
 const act = { ...who, dry_run: bool().default(false).describe('true = cost/feasibility only, changes nothing') };
 const lc = (v) => String(v).toLowerCase();
 const PAIR_MIN_DIST = 20, PAIR_MAX_DIST = 200; // find-cargo-pairs defaults (tiles, Manhattan)
@@ -1249,8 +1250,12 @@ export const COMMANDS = [
   {
     name: 'install-gamescript', group: 'setup', session: false,
     description: 'HOST ONLY: copy the bundled AgentBridge GameScript (and IdleAI test AI) into the OpenTTD personal dir. Re-run after updating openttd-agent.',
-    args: z.object({}),
-    run: () => installGamescript(),
+    args: z.object({
+      reload: bool().default(false).describe('true = also make the running server use it: rescan, save the game, load that save (it starts the newest AgentBridge), wait for the new bridge_version and restore the pause state'),
+      server: serverArg.server,
+      save_name: z.string().optional().describe('--reload: name of the save it makes and loads (default gs-reload-<date>-<time>)'),
+    }),
+    run: async (ctx, a) => (a.reload ? reloadGamescript(serverTarget(ctx.cfg, a.server), { saveName: a.save_name !== undefined ? checkSaveName(a.save_name) : undefined }) : installGamescript()),
   },
   {
     name: 'configure', group: 'setup', session: false,
@@ -1372,6 +1377,65 @@ export const COMMANDS = [
       script_opcodes: int().min(500).max(250000).default(100000).describe('GameScript opcodes per tick stored in the copy (a scenario brings its own, usually 10000)'),
     }),
     run: (ctx, a) => prepareScenario(ctx.cfg, { search: a.search, contentId: a.content_id, name: a.name, load: a.load, scriptOpcodes: a.script_opcodes }),
+  },
+
+  // ---- host server control (session: false: own admin connection; refused through the relay) ----
+  {
+    name: 'saves', group: 'host', session: false,
+    description: "HOST ONLY: savegames in the server's save folder (the launch profile's save/), newest first: name (what load --name and launch --load take), bytes, modified.",
+    args: z.object({ ...serverArg, match: z.string().optional().describe('only names containing this text'), limit: int().min(1).max(1000).default(50) }),
+    run: (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      const { folder, saves } = listSaves(t.dir);
+      const matched = a.match ? saves.filter((x) => x.name.toLowerCase().includes(a.match.toLowerCase())) : saves;
+      return { server: t.server, folder, ...listResult('saves', saves, matched, a.limit) };
+    },
+  },
+  {
+    name: 'load', group: 'host', session: false,
+    description: "HOST ONLY: load a save on the running server (console ls, then load by its index) and wait until AgentBridge answers in the new game. Returns loaded, map, date, paused, bridge_version, seconds. --pause true/false sets the pause state after loading (default: as saved; a game saved paused loads paused). Every player's session reconnects on its next call. A save runs the GameScript stored in it: one made without AgentBridge will not answer (scenario-prepare makes a copy that does).",
+    args: z.object({ ...serverArg, name: z.string().describe('save name as `saves` lists it (with or without .sav)'), pause: bool().optional().describe('true = pause after loading, false = unpause; default as saved') }),
+    run: async (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      return { server: t.server, ...(await withAdmin(t, (admin, gs) => loadSave(admin, gs, checkSaveName(a.name), { pause: a.pause }))) };
+    },
+  },
+  {
+    name: 'server-stop', group: 'host', session: false,
+    description: "HOST ONLY: stop the server (console quit; if it does not exit, SIGTERM to the processes started with this profile's openttd.cfg, and nothing else). --save NAME saves first and waits for the file; without the save it does not quit. Returns was_running, stopped, method.",
+    args: z.object({ ...serverArg, save: z.string().optional().describe('save under this name before quitting') }),
+    run: async (ctx, a) => stopServer(serverTarget(ctx.cfg, a.server), { save: a.save !== undefined ? checkSaveName(a.save) : undefined }),
+  },
+  {
+    name: 'console', group: 'host', session: false,
+    description: 'HOST ONLY escape hatch: run one server console command over the admin port (rcon) and return its output lines, e.g. "setting command_pause_level", "list_ai", "companies". Prefer the dedicated commands (load, saves, pause, company-new, server-stop). Console `companies` numbers from 1; every other openttd-agent command from 0.',
+    args: z.object({ ...serverArg, command: z.string().min(1).describe('console command line') }),
+    run: async (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      const lines = await withAdmin(t, (admin) => admin.rcon(a.command, 30000), { name: 'openttd-agent-console' });
+      return { server: t.server, command: a.command, lines };
+    },
+  },
+  {
+    name: 'company-new', group: 'host', session: false,
+    description: 'HOST ONLY: start an AI company on the server (console start_ai) and return its company id (0-based, as every other command uses). IdleAI (installed by install-gamescript) builds nothing: a test company to act as with --company.',
+    args: z.object({ ...serverArg, ai: z.string().default('IdleAI').describe('AI name as `console --command list_ai` shows it') }),
+    run: async (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      return { server: t.server, ...(await withAdmin(t, (admin, gs) => companyNew(admin, gs, a.ai))) };
+    },
+  },
+  {
+    name: 'server-log', group: 'host', session: false,
+    description: "HOST ONLY: the end of the server's openttd.log (the launch profile's; launch rotates it, keeping 3). --errors true keeps only error lines (script errors, crashes); --grep TEXT only lines containing TEXT. `gs` says whether AgentBridge started and whether a script died after that (state started / died / not_started).",
+    args: z.object({ ...serverArg, lines: int().min(1).max(500).default(40), errors: bool().default(false), grep: z.string().optional() }),
+    run: (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      const tail = logTail(t.dir, { lines: a.lines, errors: a.errors, grep: a.grep });
+      if (!tail.exists) return { ok: false, error: `no_log: ${tail.file} does not exist (start the server with openttd-agent launch)`, server: t.server };
+      const pids = serverPids(t.cfgPath);
+      return { server: t.server, running: pids === null ? null : pids.length > 0, ...tail };
+    },
   },
 
   // ---- relay (host only: who may play which company) ---------------------------
