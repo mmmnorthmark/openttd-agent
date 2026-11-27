@@ -31,6 +31,7 @@ import { dateString, meFromCompanies, companyProfit, tilesText, splitBox, tileBo
 import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
+import { townRatingFromRow, authorityNeed, RATING_HINT, moneyDetail, soldText, loadsFromRows, waitMatch, WAIT_STATES, filterVehicles, sortVehicles, fleetBuckets, VEHICLE_SORTS, parseSelect } from './fleet.js';
 
 // Strict numbers (0.8.0): plain z.number(); runCommand (parseArgs) turns a numeric string ("12", " -3 ")
 // into its number. null, "", false and [] are no longer 0 (company 0 is a real company).
@@ -48,6 +49,7 @@ const ids = () => z.preprocess(idList, z.array(int()).min(1));
 const who = { company: int().optional().describe('company id; default: your configured company') };
 const serverArg = { server: z.string().optional().describe('launch profile of the server (launch --server NAME); default: the server at the configured admin_port') };
 const act = { ...who, dry_run: bool().default(false).describe('true = cost/feasibility only, changes nothing') };
+const borrow = { borrow_if_needed: bool().default(false).describe('when the game refuses for lack of money, borrow what the rest costs (within max_loan) and carry on') };
 const lc = (v) => String(v).toLowerCase();
 const PAIR_MIN_DIST = 20, PAIR_MAX_DIST = 200; // find-cargo-pairs defaults (tiles, Manhattan)
 /** Non-loopback IPv4 addresses of this machine (what players put in their relay URL). */
@@ -126,13 +128,12 @@ async function buildPath(ctx, a, mode) {
   const steps = (mode === 'rail' ? railSteps : roadSteps)(plan, { bridgeType: bridgeType(a.bridge) });
   const out = { reachable: true, ...plan.stats, ...(a.show_path ? { path: plan.tiles } : {}) };
   if (a.plan_only) return { ...out, steps_total: steps.length, steps };
-  if (!a.dry_run) s.throttleBuild();
-  const res = await s.exec(company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) });
+  const res = await execExplained(s, company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) }, a);
   if (!a.dry_run) await s.refreshArea(...box);
   return { ...out, ...res };
 }
 const pathArgs = {
-  ...act, x1: int(), y1: int(), x2: int(), y2: int(),
+  ...act, ...borrow, x1: int(), y1: int(), x2: int(), y2: int(),
   start_dir: z.enum(DIR_NAMES).optional().describe('force the first step out of x1,y1: sw=+x, se=+y, ne=-x, nw=-y'),
   end_dir: z.enum(DIR_NAMES).optional().describe('force the direction of the last step into x2,y2'),
   margin: int().min(2).max(80).default(20).describe('how far outside the two points the path may wander'),
@@ -907,11 +908,70 @@ async function longestTrainOnLine(s, company, id) {
 
 // ---- depot guard (vehicle-clone, vehicle-buy --route_of) ---------------------------------
 
-/** Source vehicle row (type, position) of this company. */
+/** Source vehicle row (type, position) of this company. A sold vehicle's error says when and who serves its stations now (L10). */
 async function vehicleOf(s, company, id) {
   const veh = vehiclesFromRows(await s.gs.call('vehicles', { company })).find((v) => v.id === id);
-  if (!veh) throw new Error(`vehicle ${id} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
+  if (!veh) throw new Error((await soldNote(s, company, id)) ?? `vehicle ${id} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
   return veh;
+}
+
+/** Ledger text (L10) for a vehicle id this session sold, or null: sale date, replacement, vehicles now serving its stations. */
+async function soldNote(s, company, id) {
+  const e = s.soldVehicles?.get(`${company}:${id}`);
+  if (!e) return null;
+  const ids = e.stations?.length ? await stationVehicleIds(s, company) : null;
+  const serving = ids ? [...new Set(e.stations.flatMap((st) => ids.get(st) ?? []))].sort((p, q) => p - q) : [];
+  return soldText(e, serving);
+}
+
+/** Map vehicle -> { load, capacity, pct, cargo } from GS vehicle_loads (v13), or null on an older GameScript. */
+async function vehicleLoads(s, company, vehicles) {
+  try { return loadsFromRows(await s.gs.call('vehicle_loads', { company, ...(vehicles ? { vehicles } : {}) })); } catch (e) {
+    if (/unknown cmd/.test(e.message)) return null;
+    throw e;
+  }
+}
+
+/**
+ * --select FILTER (parseSelect) over the company's vehicles, minus vehicles queued for sale, at most `max`.
+ * Returns { ids, matched, skipped_queued }.
+ */
+async function selectVehicles(s, company, text, max) {
+  const f = parseSelect(text);
+  const hit = filterVehicles(vehiclesFromRows(await s.gs.call('vehicles', { company })), f);
+  const free = hit.filter((v) => !s.pendingSales.has(`${company}:${v.id}`));
+  return { ids: free.slice(0, max).map((v) => v.id), matched: hit.length, skipped_queued: hit.length - free.length };
+}
+const selectArgs = (what, max) => ({
+  select: z.string().optional().describe(`instead of --vehicles: ${what} the vehicles matching key=value filters, comma-separated (keys as vehicles: ids=1|2, type, group, state, engine, name, max_profit_last_year, max_profit_this_year, min_age_pct, min_age_days, max_reliability_pct); e.g. "type=road,min_age_pct=100"`),
+  max: int().min(1).max(100).default(max).describe('with --select: at most this many vehicles'),
+});
+
+/**
+ * vehicle-clone --station (R11): the best vehicle to copy among those with an order for `station`:
+ * not queued for sale, not crashed, carrying `cargo` when given (vehicle_loads, v13), highest profit last year.
+ * Returns { vehicle, unit_number, profit_last_year, candidates } or throws a refusal.
+ */
+async function cloneSourceAt(s, company, station, cargo) {
+  const st = findStation(stationsFromRows(await s.gs.call('stations', { company }), s.cargos), station);
+  const ids = await stationVehicleIds(s, company, st.id);
+  if (!ids) throw new Error('refused: vehicle-clone --station needs AgentBridge v12; give --vehicle ID instead');
+  const serving = new Set(ids.get(st.id) ?? []);
+  let cands = vehiclesFromRows(await s.gs.call('vehicles', { company })).filter((v) => serving.has(v.id) && v.state !== 'crashed' && !s.pendingSales.has(`${company}:${v.id}`));
+  if (cargo !== undefined) {
+    const want = cargoId(s.cargos, cargo);
+    const loads = await vehicleLoads(s, company, cands.map((v) => v.id));
+    if (!loads) throw new Error('refused: --cargo with --station needs AgentBridge v13; give --vehicle ID instead');
+    cands = cands.filter((v) => loads.get(v.id)?.cargo.some((c) => c.cargo === want));
+  }
+  if (!cands.length) throw new Error(`refused: no vehicle of yours with an order for ${st.name} (${st.id})${cargo !== undefined ? ` carries ${cargo}` : ''} that is not queued for sale; build one with vehicle-buy --orders`);
+  const best = [...cands].sort((p, q) => q.profit_last_year - p.profit_last_year || q.profit_this_year - p.profit_this_year)[0];
+  return { vehicle: best.id, unit_number: best.unit_number, profit_last_year: best.profit_last_year, station: { id: st.id, name: st.name }, candidates: cands.length };
+}
+
+/** Station ids in a vehicle's orders (for the sale ledger); [] when it cannot be read. */
+async function orderStationIds(s, company, id) {
+  try { return [...new Set((await currentOrderOf(s, company, id)).orders.filter((o) => o.kind === 'station').map((o) => o.station))]; } catch { return []; }
 }
 
 /** A vehicle's order stations, in order, as rows from `stations`. */
@@ -1271,11 +1331,112 @@ async function driveThroughRefusal(s, company, a) {
   return why;
 }
 
-/** Run exec steps as the company (client throttle + GS rate gate apply). */
+/**
+ * The station a build just made or joined at tile x,y (R1): rail_tiles (v9) / road_tiles (v11) give the
+ * station id on that tile; else the nearest of the company's stations within `reach` tiles. { id, name } or null.
+ */
+async function builtStationAt(s, company, x, y, kind, reach = 2) {
+  const v = (await s.gs.call('info')).bridge_version ?? 0;
+  let id = -1;
+  if (kind === 'rail' && v >= 9) id = (await s.gs.call('rail_tiles', { x0: x, y0: y, x1: x, y1: y }))[0]?.[4] ?? -1;
+  if (kind === 'road' && v >= 11) id = (await s.gs.call('road_tiles', { company, x0: x, y0: y, x1: x, y1: y }))[0]?.[4] ?? -1;
+  const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+  const hit = id >= 0 ? stations.find((st) => st.id === id)
+    : stations.map((st) => ({ st, d: tileDistance(st, { x, y }) })).filter((e) => e.d <= reach).sort((p, q) => p.d - q.d)[0]?.st;
+  return hit ? { id: hit.id, name: hit.name } : null;
+}
+
+/** Run exec steps as the company (client throttle + GS rate gate apply; failures explained, see execExplained). */
 async function run(ctx, a, steps, opts = {}) {
   const { s, company } = await mine(ctx, a);
-  if (!a.dry_run) s.throttleBuild();
-  return s.exec(company, steps, { dryRun: a.dry_run, ...opts });
+  return execExplained(s, company, steps, { dryRun: a.dry_run, ...opts }, a);
+}
+
+/** The tile a step acts on: [op, x, y, ...] for most ops; rail [op, fx, fy, x, y, ...]; bridge/tunnel [op, type, x, y, ...]. */
+function stepTile(step) {
+  if (step[0] === 'rail' || step[0] === 'rail_remove') return { x: step[3], y: step[4] };
+  if (step[0] === 'bridge' || step[0] === 'tunnel') return { x: step[2], y: step[3] };
+  return typeof step[1] === 'number' && typeof step[2] === 'number' ? { x: step[1], y: step[2] } : null;
+}
+
+/** Tiles from (x1,y1) to (x2,y2) in a straight line (a road step), at most 200. */
+function lineTiles(x1, y1, x2, y2) {
+  const out = [];
+  const dx = Math.sign(x2 - x1), dy = Math.sign(y2 - y1);
+  for (let x = x1, y = y1; out.length < 200; x += dx, y += dy) { out.push({ x, y }); if (x === x2 && y === y2) break; if (!dx && !dy) break; }
+  return out;
+}
+
+/** Local-authority detail for a refused step at `tile` (GS v13 town_rating), or a note on an older GameScript. */
+async function authorityDetail(s, company, step, tile) {
+  const need = authorityNeed(step[0]);
+  let row;
+  try { [row] = await s.gs.call('town_rating', { company, points: [[tile.x, tile.y]] }); } catch (e) {
+    if (/unknown cmd/.test(e.message)) return { ...need, note: 'the running AgentBridge is older than v13: it cannot read town ratings; the host re-runs install-gamescript and loads the game again' };
+    throw e;
+  }
+  const r = townRatingFromRow(row);
+  if (r.town < 0) return { ...need, town: null };
+  const { towns } = await s.economy();
+  const name = towns.find((t) => t.id === r.town)?.name ?? `town ${r.town}`;
+  return { town: r.town, town_name: name, rating: r.rating, rating_value: r.rating_value, ...need, hint: RATING_HINT };
+}
+
+/**
+ * s.exec plus what a failure means (0.8.0):
+ * - ERR_LOCAL_AUTHORITY_REFUSES (R8): local_authority { town, town_name, rating, rating_value, needed }.
+ * - ERR_NOT_ENOUGH_CASH (L8): needed, money, loan, max_loan, loan_headroom, next; with a.borrow_if_needed
+ *   the loan is raised by what the rest of the steps cost (dry run) and the rest is run once more.
+ * - a dry run that costs more than the bank balance: the same money fields and a warning.
+ * - a road step refused on a slope (R15): first_error sloped_tile, at, hint.
+ */
+async function execExplained(s, company, steps, opts, a = {}) {
+  if (!opts.dryRun) s.throttleBuild();
+  let res = await s.exec(company, steps, opts);
+  const failed = (res.results ?? []).find((r) => !r.ok);
+  if (opts.dryRun) {
+    if (res.ok && res.money !== null && res.money !== undefined && res.cost > res.money) {
+      const m = moneyDetail({ cost: res.cost, ...(await loanState(s, company)), money: res.money });
+      res = { ...res, ...m, warnings: [...(res.warnings ?? []), `not_enough_money: this costs ${res.cost}, the bank has ${res.money}${m.next ? `; ${m.next}` : ''}`] };
+    }
+    return res;
+  }
+  if (!failed) return res;
+  const step = steps[failed.step];
+  const tile = stepTile(step);
+  const err = String(failed.error ?? '');
+  if (/ERR_NOT_ENOUGH_CASH/.test(err)) {
+    const rest = steps.slice(failed.step);
+    const est = await s.exec(company, rest, { ...opts, dryRun: true, keepGoing: true });
+    const loan = await loanState(s, company);
+    const m = moneyDetail({ cost: est.cost > 0 ? est.cost : null, ...loan });
+    if (a.borrow_if_needed && m.needed && m.needed <= m.loan_headroom) {
+      const lr = await s.exec(company, [['loan', 'add', m.needed]]);
+      if (lr.ok) {
+        const again = await s.exec(company, rest, opts);
+        const done = res.results.slice(0, failed.step);
+        const results = [...done, ...again.results.map((r) => ({ ...r, step: r.step + failed.step }))];
+        return { ...again, borrowed: lr.results[0]?.value !== undefined ? lr.results[0].value - loan.loan : m.needed, cost: res.cost + again.cost,
+          steps_total: steps.length, steps_done: done.filter((r) => r.ok).length + again.steps_done, results };
+      }
+      return { ...res, ...m, borrow_failed: lr.error };
+    }
+    return { ...res, ...m };
+  }
+  if (/ERR_LOCAL_AUTHORITY_REFUSES/.test(err) && tile) {
+    const la = await authorityDetail(s, company, step, tile);
+    const who = la.town_name ? `${la.town_name} rates you ${la.rating} (${la.rating_value}); ` : '';
+    return { ...res, error: `${res.error}: local authority refuses: ${who}${la.needed_text}`, local_authority: la };
+  }
+  if (/ERR_LAND_SLOPED_WRONG|ERR_FLAT_LAND_REQUIRED/.test(err) && ['road', 'road_station', 'road_depot'].includes(step[0])) {
+    const line = step[0] === 'road' ? lineTiles(step[1], step[2], step[3], step[4]) : [tile];
+    const xs = line.map((t) => t.x), ys = line.map((t) => t.y);
+    await s.refreshArea(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
+    const at = line.find((t) => s.map.inBounds(t.x, t.y) && s.map.slopeAt(t.x, t.y)) ?? tile;
+    return { ...res, error: `sloped_tile: (${at.x},${at.y}) is sloped the wrong way for ${step[0] === 'road' ? 'this road' : 'a stop or depot'} (game: ${err})`, first_error: 'sloped_tile', at,
+      hint: step[0] === 'road' ? `level it first (terraform --op level --x0 ${at.x} --y0 ${at.y}), or plan round it with build-road-path (it reuses roads and goes round obstacles)` : `pick a flat tile (road-stop-sites finds dry-run-checked spots), or terraform --op level --x0 ${at.x} --y0 ${at.y}` };
+  }
+  return res;
 }
 
 export const COMMANDS = [
@@ -1730,17 +1891,30 @@ export const COMMANDS = [
   },
   {
     name: 'towns', group: 'world', session: true,
-    description: 'Towns with population and last-month passenger/mail production and transported %. Filter by min_population, name, id, near_x/near_y within radius (each row then has distance); sorted by population (by distance with near_x/near_y).',
-    args: z.object({ min_population: int().default(0), limit: int().default(50), name: z.string().optional(), id: int().optional(),
+    description: 'Towns with population and last-month passenger/mail production and transported %. Filter by min_population, name, id, near_x/near_y within radius (each row then has distance); sorted by population (by distance with near_x/near_y). With a company (yours by default): my_rating {rating, value, rated} = what the town\'s local authority thinks of the company (the town window\'s word: none, appalling, very_poor, poor, mediocre, good, very_good, excellent, outstanding; value -1000..1000; a new station needs more than -200). AgentBridge v13.',
+    args: z.object({ ...who, min_population: int().default(0), limit: int().default(50), name: z.string().optional(), id: int().optional(),
       near_x: int().optional(), near_y: int().optional(), radius: int().min(1).default(50) }),
     run: async (ctx, a) => {
       if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
-      const { towns } = await (await ctx.session()).economy();
+      const s = await ctx.session();
+      const { towns } = await s.economy();
       const near = a.near_x !== undefined ? { x: a.near_x, y: a.near_y } : null;
-      const hits = towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())) && (a.id === undefined || t.id === a.id))
+      let hits = towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())) && (a.id === undefined || t.id === a.id))
         .map((t) => (near ? { ...t, distance: manhattan(t, near) } : t)).filter((t) => !near || t.distance <= a.radius)
         .sort((x, y) => (near ? x.distance - y.distance : y.population - x.population));
-      return listResult('towns', towns, hits, a.limit);
+      const company = a.company ?? s.cfg.company;
+      let note = null;
+      if (company !== null && company !== undefined && hits.length) {
+        const shown = hits.slice(0, a.limit);
+        try {
+          const rows = new Map((await s.gs.call('town_rating', { company, towns: shown.map((t) => t.id) })).map((r) => [r[0], townRatingFromRow(r)]));
+          hits = [...shown.map((t) => { const r = rows.get(t.id); return r ? { ...t, my_rating: { rating: r.rating, value: r.rating_value, rated: r.rated } } : t; }), ...hits.slice(a.limit)];
+        } catch (e) {
+          if (!/unknown cmd/.test(e.message)) throw e;
+          note = 'my_rating needs AgentBridge v13; the host re-runs install-gamescript and loads the game again';
+        }
+      }
+      return { ...(company !== null && company !== undefined ? { company } : {}), ...listResult('towns', towns, hits, a.limit), ...(note ? { my_rating_note: note } : {}) };
     },
   },
   {
@@ -2024,8 +2198,10 @@ export const COMMANDS = [
   },
   {
     name: 'vehicles', group: 'operate', session: true,
-    description: 'Your vehicles (summary=true or another --company: counts per type and state only, as the company window shows anyone): type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: type, group, state, max_profit_last_year (e.g. 0 = loss makers), min_age_pct (e.g. 90 = due for replacement), max_reliability_pct, name, station (vehicles with an order for it; AgentBridge v12). Breakdown counts and service intervals are not exposed by the game to scripts.',
-    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
+    description: `Your vehicles (summary=true or another --company: counts per type and state only, as the company window shows anyone): type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: ids (A,B), type, group, state, engine, max_profit_last_year (e.g. 0 = loss makers), max_profit_this_year, min_age_pct (e.g. 90 = due for replacement), min_age_days (e.g. 365: old enough to judge its profit), max_reliability_pct, name, station (vehicles with an order for it; AgentBridge v12). --sort ${VEHICLE_SORTS.join('|')} (a leading - sorts high first, e.g. -profit_last_year). Breakdown counts and service intervals are not exposed by the game to scripts.`,
+    args: z.object({ ...who, ids: ids().optional().describe('only these vehicle ids'), type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
+      engine: int().optional(), max_profit_this_year: int().optional(), min_age_days: int().optional(),
+      sort: z.enum([...VEHICLE_SORTS, ...VEHICLE_SORTS.map((k) => `-${k}`)]).optional().describe('sort key; leading - = descending'),
       max_profit_last_year: int().optional(), min_age_pct: int().default(0), max_reliability_pct: int().default(100), name: z.string().optional(), limit: int().min(1).default(1000),
       station: z.coerce.string().optional().describe('only vehicles with an order for this station (id or name; AgentBridge v12)'),
       summary: bool().default(false).describe('counts per type and state only (always so for another company)') }),
@@ -2044,24 +2220,31 @@ export const COMMANDS = [
         if (!ids) throw new Error('refused: vehicles --station needs AgentBridge v12; the host re-runs install-gamescript and loads the game again');
         atStation = new Set(ids.get(st.id) ?? []);
       }
-      const vehicles = all.filter((v) => (!atStation || atStation.has(v.id)) && (!a.type || v.type === a.type) && (a.group === undefined || v.group === a.group) && (!a.state || v.state === a.state)
-        && (a.max_profit_last_year === undefined || v.profit_last_year <= a.max_profit_last_year) && v.age_pct >= a.min_age_pct
-        && v.reliability_pct <= a.max_reliability_pct && (!a.name || lc(v.name).includes(lc(a.name))));
+      let vehicles = filterVehicles(all, a).filter((v) => !atStation || atStation.has(v.id));
+      if (a.sort) vehicles = sortVehicles(vehicles, a.sort);
       return { company, ...listResult('vehicles', all, vehicles, a.limit) };
     },
   },
   {
     name: 'vehicle', group: 'operate', session: true,
-    description: 'One vehicle in detail: status, capacity and load per cargo, wagons, and the full order list with decoded flags.',
+    description: 'One vehicle in detail: status, capacity and load per cargo, load {load, capacity, pct} over all cargo, wagons, and the full order list with decoded flags. A vehicle sold through openttd-agent answers already_sold with the sale date.',
     args: z.object({ ...who, vehicle: int() }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      return vehicleDetail(await s.gs.call('vehicle', { company, vehicle: a.vehicle }), s.cargos);
+      let rows;
+      try { rows = await s.gs.call('vehicle', { company, vehicle: a.vehicle }); } catch (e) {
+        const note = /does not exist/.test(e.message) ? await soldNote(s, company, a.vehicle) : null;
+        if (note) return { ok: false, error: note, first_error: 'already_sold', vehicle: a.vehicle, sold: s.soldVehicles.get(`${company}:${a.vehicle}`) };
+        throw e;
+      }
+      const d = vehicleDetail(rows, s.cargos);
+      const load = d.capacity.reduce((n, c) => n + c.load, 0), capacity = d.capacity.reduce((n, c) => n + c.capacity, 0);
+      return { ...d, load: { load, capacity, pct: capacity ? Math.round((100 * load) / capacity) : 0 } };
     },
   },
   {
     name: 'summary', group: 'operate', session: true,
-    description: 'One compact text line per vehicle and per station, for a quick look without big JSON. Header: date and me (money, loan, max_loan, value, performance, profit of the last quarter). Lines: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination"; stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
+    description: 'One compact text line per vehicle and per station, for a quick look without big JSON. Header: date and me (money, loan, max_loan, value, performance, profit of the last quarter). Lines: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination, spd, load now/capacity (AgentBridge v13), order i/n", plus age_buckets, reliability_buckets and low_reliability (below 50%: id, reliability_pct, age_pct); stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
     args: z.object({ ...who, group: int().optional(), vehicles: ids().optional(), stations: z.string().optional().describe('comma-separated station ids or names'),
       what: z.enum(['all', 'vehicles', 'stations']).default('all'), limit: int().min(1).default(200) }),
     run: async (ctx, a) => {
@@ -2076,9 +2259,10 @@ export const COMMANDS = [
       if (wantV) {
         const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
         const hit = all.filter((v) => (a.group === undefined || v.group === a.group) && (!a.vehicles || a.vehicles.includes(v.id))).sort((p, q) => p.profit_last_year - q.profit_last_year);
-        const lines = hit.map((v) => vehicleLine(v, names));
+        const loads = hit.length ? await vehicleLoads(s, company, a.vehicles) : null;
+        const lines = hit.map((v) => vehicleLine(v, names, loads?.get(v.id) ?? null));
         Object.assign(out, { vehicles_total: hit.length, vehicles: lines.slice(0, a.limit),
-          vehicles_profit: `this year ${hit.reduce((n, v) => n + v.profit_this_year, 0)}, last year ${hit.reduce((n, v) => n + v.profit_last_year, 0)}` });
+          vehicles_profit: `this year ${hit.reduce((n, v) => n + v.profit_this_year, 0)}, last year ${hit.reduce((n, v) => n + v.profit_last_year, 0)}`, ...fleetBuckets(hit) });
       }
       if (wantS) {
         const sel = a.stations ? a.stations.split(',').map((t) => findStation(stations, t.trim())) : stations;
@@ -2092,8 +2276,9 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-problems', group: 'operate', session: true,
-    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), stalled_on_line (speed 0 on the same tile for stall_days, not at a station or broken down; the daemon samples every 15 s once vehicle-problems has run), deadlock (two such trains within 16 tiles: reverse one with vehicle-reverse), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot (with how long it has been parked), loose_wagons (wagons without a locomotive in a depot), stopped, old, broken_down, low_reliability, crashed. Every row has as_of (game date of this sample) and days_watched (how long the history behind it is); --fresh true starts the history again. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
-    args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'),
+    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), stalled_on_line (speed 0 on the same tile for stall_days, not at a station or broken down; the daemon samples every 15 s once vehicle-problems has run), deadlock (two such trains within 16 tiles: reverse one with vehicle-reverse), pending_sale (queued by vehicle-sell or vehicle-replace; nothing else is reported for it), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot (with how long it has been parked), loose_wagons (wagons without a locomotive in a depot), stopped, old, broken_down, low_reliability, crashed. Every row has as_of (game date of this sample) and days_watched (how long the history behind it is); --fresh true starts the history again. Filters: --vehicles A,B, --type, --problem a,b. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
+    args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'), vehicles: ids().optional().describe('check only these vehicle ids'),
+      type: z.enum(VEHICLE_TYPES).optional().describe('only vehicles of this type'), problem: z.string().optional().describe('only these problems, comma-separated (e.g. stuck_or_lost,no_income)'),
       stuck_days: int().min(1).default(30).describe('game days without progress before a vehicle counts as stuck or lost'),
       stall_days: int().min(1).default(10).describe('game days standing still on one tile (speed 0, not at a station) before stalled_on_line / deadlock'),
       trace: bool().default(true).describe('check rail (and, AgentBridge v11, road) connectivity to each vehicle\'s destination'),
@@ -2105,8 +2290,11 @@ export const COMMANDS = [
       let vehicles = vehiclesFromRows(await s.gs.call('vehicles', { company }));
       if (a.vehicle !== undefined) {
         vehicles = vehicles.filter((v) => v.id === a.vehicle);
-        if (!vehicles.length) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
+        if (!vehicles.length) throw new Error((await soldNote(s, company, a.vehicle)) ?? `vehicle ${a.vehicle} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
       }
+      if (a.vehicles) vehicles = vehicles.filter((v) => a.vehicles.includes(v.id));
+      if (a.type) vehicles = vehicles.filter((v) => v.type === a.type);
+      const wanted = a.problem ? new Set(a.problem.split(',').map((t) => t.trim()).filter(Boolean)) : null;
       const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
       const stationById = new Map(stations.map((st) => [st.id, st]));
       s.vehicleHistory ??= new Map();
@@ -2128,6 +2316,16 @@ export const COMMANDS = [
       const lineCache = new Map();
       const rows = [];
       for (const v of vehicles) {
+        // L6: a vehicle queued for sale is reported as that alone (not stopped_in_depot or stuck).
+        const sale = s.pendingSales.get(`${company}:${v.id}`);
+        if (sale) {
+          if ((a.severity === 'all' || a.severity === 'info') && (!wanted || wanted.has('pending_sale'))) {
+            rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, problem: 'pending_sale', severity: 'info',
+              evidence: `queued for sale since ${sale.since ?? '?'}${sale.replaced_by !== undefined && sale.replaced_by !== null ? ` (replaced by ${sale.replaced_by})` : ''}; ${v.state === 'in_depot' ? 'in a depot: sold at the next check (20 s)' : sale.send && !sale.sent ? 'no depot found yet: sent again every 20 s' : 'heading to a depot'}`,
+              suggested_fix: `nothing: it is sold when it stops in a depot (vehicle-start --vehicles ${v.id} --cancel_sale true keeps it instead)`, as_of: gameDate(info), days_watched: 0 });
+          }
+          continue;
+        }
         let orders = null;
         if (v.current_order === undefined && v.order_count > 0) { // AgentBridge before v9: one `vehicle` call each
           const cur = await currentOrderOf(s, company, v.id);
@@ -2165,7 +2363,7 @@ export const COMMANDS = [
         }
         for (const p of vehicleProblems(v, { today: info.date, stuckDays: a.stuck_days, progress, reach, line, stall: stalls.get(v.id), stallDays: a.stall_days, partners: partners.get(v.id), parkedDays: s.depotHistory.has(`${company}:${v.id}`) ? info.date - s.depotHistory.get(`${company}:${v.id}`) : null })) {
           const seen = [s.vehicleHistory.get(`${company}:${v.id}`)?.first, s.stallHistory.get(`${company}:${v.id}`)?.since, s.depotHistory.get(`${company}:${v.id}`)].filter((d) => d !== undefined);
-          if (a.severity === 'all' || a.severity === p.severity) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p, as_of: gameDate(info), days_watched: seen.length ? info.date - Math.min(...seen) : 0 });
+          if ((a.severity === 'all' || a.severity === p.severity) && (!wanted || wanted.has(p.problem))) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p, as_of: gameDate(info), days_watched: seen.length ? info.date - Math.min(...seen) : 0 });
         }
       }
       const samples = vehicles.map((v) => s.vehicleHistory.get(`${company}:${v.id}`)).filter(Boolean);
@@ -2357,7 +2555,7 @@ export const COMMANDS = [
   },
   {
     name: 'loan', group: 'operate', session: true,
-    description: 'Show or change your company loan. Give one of: amount (set the loan to this), borrow (add this much), repay (pay back this much; needs the cash), max true (borrow up to max_loan). The new loan is rounded up to the loan interval; refused below 0 or over max_loan. No arguments = show. Returns loan, max_loan and money before and after (dry_run: predicted). Needs AgentBridge v8.',
+    description: 'Show or change your company loan. Give one of: amount (set the loan to this), borrow (add this much), repay (pay back this much; needs the cash), max true (borrow up to max_loan). The new loan is rounded up to the loan interval; refused below 0; more than max_loan borrows up to max_loan (clamped). No arguments = show. Returns loan, max_loan and money before and after (dry_run: predicted). Needs AgentBridge v8.',
     args: z.object({ ...act, amount: int().optional().describe('set the loan to this amount'), borrow: int().min(1).optional().describe('add this much to the loan'),
       repay: int().min(1).optional().describe('pay back this much of the loan'), max: bool().optional().describe('true = borrow up to max_loan') }),
     run: async (ctx, a) => {
@@ -2366,8 +2564,11 @@ export const COMMANDS = [
       const { s, company } = await mine(ctx, a);
       const before = await loanState(s, company);
       if (!given.length) return before;
-      const step = a.max ? ['loan', 'max', 0] : a.amount !== undefined ? ['loan', 'set', a.amount] : ['loan', 'add', a.borrow ?? -a.repay];
-      const requested = a.max ? before.max_loan : a.amount ?? before.loan + (a.borrow ?? -a.repay);
+      let step = a.max ? ['loan', 'max', 0] : a.amount !== undefined ? ['loan', 'set', a.amount] : ['loan', 'add', a.borrow ?? -a.repay];
+      let requested = a.max ? before.max_loan : a.amount ?? before.loan + (a.borrow ?? -a.repay);
+      // L8: asking for more than max_loan borrows up to it (a weak model asks "borrow 1000000" and loops on the refusal).
+      const overMax = requested > before.max_loan ? { asked: requested, clamped_to_max_loan: before.max_loan } : null;
+      if (overMax) { step = ['loan', 'max', 0]; requested = before.max_loan; }
       if (!a.dry_run) s.throttleBuild();
       const res = await s.exec(company, [step], { dryRun: a.dry_run });
       const r = res.results[0];
@@ -2375,7 +2576,7 @@ export const COMMANDS = [
       if (!res.ok) return { ok: false, dry_run: a.dry_run, error: r?.error ?? res.stopped ?? 'failed', requested_loan: requested, before, after: before };
       const target = r.value ?? 0; // execSummary drops a 0 value
       const after = a.dry_run ? { loan: target, max_loan: before.max_loan, money: before.money + target - before.loan } : await loanState(s, company);
-      return { ok: true, dry_run: a.dry_run, requested_loan: requested, ...(target !== requested ? { rounded_to: target, note: 'rounded up to a multiple of the loan interval' } : {}),
+      return { ok: true, dry_run: a.dry_run, requested_loan: requested, ...(overMax ? { clamped: overMax } : {}), ...(target !== requested ? { rounded_to: target, note: 'rounded up to a multiple of the loan interval' } : {}),
         change: target - before.loan, before, after };
     },
   },
@@ -2422,17 +2623,25 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-buy', group: 'operate', session: true,
-    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>; the train must be stopped in that depot (checked first, also in a dry run; a wagon the game will not couple is sold back). New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one). One call for a whole train: --wagon W --wagons N attaches N wagons of engine W to each new locomotive (refitted to cargo); --orders A,B (station ids or names) gives the new vehicles those orders (the first gets them, the others share them; with attach_to, the train attach_to gets them), --order_flags sets flags per order separated by ";" (e.g. "full_load_any;unload,no_load"; one set applies to every order), --start true starts them.',
-    args: z.object({ ...act, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1),
+    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>; the train must be stopped in that depot (checked first, also in a dry run; a wagon the game will not couple is sold back). New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one). One call for a whole train: --wagon W --wagons N attaches N wagons of engine W to each new locomotive (refitted to cargo); --orders A,B (station ids or names) gives the new vehicles those orders (the first gets them, the others share them; with attach_to, the train attach_to gets them), --order_flags sets flags per order separated by ";" (e.g. "full_load_any;unload,no_load"; one set applies to every order), --start true starts them. --routes "A,B;C,D" buys one vehicle per route (bus networks: many small routes), each with its own orders, and starts them (routes: vehicle + orders).',
+    args: z.object({ ...act, ...borrow, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1),
       route_of: int().optional().describe('rail: check the depot is joined to this vehicle\'s order stations first'),
       wagon: int().optional().describe('wagon engine id to attach to each new locomotive'), wagons: int().min(0).max(60).default(0),
       orders: z.string().optional().describe('comma-separated station ids or names, in order'), order_flags: z.string().default('').describe('flags per order separated by ";", or one set for all'),
-      start: bool().default(false) }),
+      routes: z.string().optional().describe('one vehicle per route, routes separated by ";" and stations by ",": "A,B;C,D" buys 2 vehicles, each with its own orders, started unless --start false'),
+      start: bool().optional().describe('start the new vehicles (default false; true with --routes)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargo = cargoId(s.cargos, a.cargo) ?? -1;
       if (a.wagons > 0 && a.wagon === undefined) throw new Error('give --wagon ENGINE_ID with --wagons N (see engines --wagons true)');
-      const plan = a.orders ? orderPlan(stationsFromRows(await s.gs.call('stations', { company }), s.cargos), a.orders, a.order_flags) : null;
+      if (a.routes !== undefined && (a.orders !== undefined || a.attach_to >= 0)) throw new Error('--routes gives each new vehicle its own orders: not with --orders or --attach_to');
+      const stationRows = a.orders || a.routes ? stationsFromRows(await s.gs.call('stations', { company }), s.cargos) : null;
+      const routePlans = a.routes !== undefined ? a.routes.split(';').map((t) => t.trim()).filter(Boolean).map((r) => orderPlan(stationRows, r, a.order_flags)) : null;
+      if (routePlans && !routePlans.length) throw new Error('--routes needs at least one route, e.g. "A,B;C,D"');
+      if (routePlans && a.count !== 1 && a.count !== routePlans.length) throw new Error(`--routes has ${routePlans.length} routes but --count is ${a.count}: one vehicle per route (leave --count out)`);
+      if (routePlans) a = { ...a, count: routePlans.length };
+      a = { ...a, start: a.start ?? !!routePlans };
+      const plan = a.orders ? orderPlan(stationRows, a.orders, a.order_flags) : null;
       const check = a.route_of !== undefined ? await depotForRoute(s, company, { ...a, check_route: true }, a.route_of, { cmd: 'vehicle-buy' }) : null;
       if (a.attach_to >= 0) {
         const why = await attachRefusal(s, company, a);
@@ -2448,7 +2657,7 @@ export const COMMANDS = [
       }
       const bought = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
       let setup = null;
-      if (res.ok && !a.dry_run && (plan || a.start || a.wagons > 0)) {
+      if (res.ok && !a.dry_run && (plan || routePlans || a.start || a.wagons > 0)) {
         const heads = a.attach_to >= 0 ? [a.attach_to] : bought;
         const steps = [];
         if (a.attach_to < 0) for (const v of heads) for (let i = 0; i < a.wagons; i++) steps.push(['veh_buy', a.depot_x, a.depot_y, a.wagon, cargo, v]);
@@ -2456,27 +2665,34 @@ export const COMMANDS = [
           for (const o of plan) steps.push(['order_add', heads[0], o.x, o.y, o.flags, -1]);
           for (const v of heads.slice(1)) steps.push(['orders_copy', v, heads[0], true]);
         }
+        if (routePlans) heads.forEach((v, i) => { for (const o of routePlans[i]) steps.push(['order_add', v, o.x, o.y, o.flags, -1]); });
         if (a.start) for (const v of heads) steps.push(['veh_start_stop', v, 1]);
         setup = await s.exec(company, steps);
         Object.assign(res, { cost: res.cost + setup.cost, ok: setup.ok, error: setup.ok ? res.error : `bought ${bought.join(', ')}; then: ${setup.error} (the vehicles are stopped in the depot)`, ...(setup.ok ? {} : { first_error: setup.first_error }) });
       }
       return { ...res, vehicles: bought, ...(check ? { route_check: check.route_check } : {}),
-        ...(plan ? { orders: plan.map((o) => ({ station: o.station, name: o.name, flags: o.flag_names })) } : {}), ...(setup ? { setup: { ok: setup.ok, steps: setup.steps_total ?? setup.results?.length } , started: a.start && setup.ok } : {}),
+        ...(plan ? { orders: plan.map((o) => ({ station: o.station, name: o.name, flags: o.flag_names })) } : {}),
+        ...(routePlans ? { routes: routePlans.map((r, i) => ({ vehicle: bought[i] ?? null, orders: r.map((o) => ({ station: o.station, name: o.name, flags: o.flag_names })) })) } : {}), ...(setup ? { setup: { ok: setup.ok, steps: setup.steps_total ?? setup.results?.length } , started: a.start && setup.ok } : {}),
         ...(soldBack ? { sold_back: soldBack, error: `${res.error}; ${soldBack.ok ? `sold the wagon${stray.length > 1 ? 's' : ''} back (${stray.join(', ')})` : `selling ${stray.join(', ')} back failed too: sell ${stray.length > 1 ? 'them' : 'it'} with vehicle-sell`}` } : {}) };
     },
   },
   {
     name: 'vehicle-clone', group: 'operate', session: true,
-    description: 'Clone a vehicle `count` times, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check.',
-    args: z.object({ ...act, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
-      depot_x: int().optional(), depot_y: int().optional(), vehicle: int(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
+    description: 'Clone a vehicle `count` times, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check. --station ID [--cargo C] instead of --vehicle clones the best-earning vehicle with an order there (source says which). A sold vehicle id is refused with already_sold, the sale date and the vehicles serving its stations now.',
+    args: z.object({ ...act, ...borrow, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
+      depot_x: int().optional(), depot_y: int().optional(), vehicle: int().optional(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
+      station: z.string().optional().describe('instead of --vehicle: clone the best-earning vehicle with an order for this station (id or name; AgentBridge v12)'),
+      cargo: z.string().optional().describe('with --station: only a vehicle that carries this cargo'),
       check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const { depot, ...check } = await depotForRoute(s, company, a, a.vehicle, { cmd: 'vehicle-clone' });
-      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, a.share_orders]));
+      if ((a.vehicle === undefined) === (a.station === undefined)) throw new Error('give --vehicle ID or --station ID (clone a vehicle serving it), not both');
+      const source = a.station !== undefined ? await cloneSourceAt(s, company, a.station, a.cargo) : null;
+      const vehicle = source ? source.vehicle : a.vehicle;
+      const { depot, ...check } = await depotForRoute(s, company, a, vehicle, { cmd: 'vehicle-clone' });
+      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, vehicle, a.share_orders]));
       const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
-      const out = { ...res, depot, ...check, vehicles };
+      const out = { ...res, ...(source ? { source } : {}), depot, ...check, vehicles };
       if (!a.start || a.dry_run || !vehicles.length) return out;
       const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
       return { ...out, started: started.ok };
@@ -2484,23 +2700,27 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-replace', group: 'operate', session: true,
-    description: 'Replace vehicles (comma-separated ids) in one call: buy the replacement at a depot on the vehicle\'s own route (--depot auto, the default, or --depot_x/--depot_y), share the old vehicle\'s orders, start it; the old vehicle gets its own copy of the orders, loads nothing more at its next unloading stop (no_load) and gets a "stop in depot" order right after it (--when unloaded, the default; --when now sends it to a depot at once), and is sold when it stops there. The daemon (or relay) checks every 20 s and sells it; --finish true sells any that have arrived now and lists the rest (pending_sales). Without --engine the replacement is a clone (same engine and wagons). --engine N buys that engine instead; for trains also --wagons N (default: as many as the old train) of --wagon ID (default: the old train\'s wagon type; AgentBridge v12) refitted to the old cargo. For age-based replacement of whole fleets, group-autoreplace or autorenew is cheaper in calls.',
+    description: 'Replace vehicles (comma-separated ids) in one call: buy the replacement at a depot on the vehicle\'s own route (--depot auto, the default, or --depot_x/--depot_y), share the old vehicle\'s orders, start it; the old vehicle gets its own copy of the orders, loads nothing more at its next unloading stop (no_load) and gets a "stop in depot" order right after it (--when unloaded, the default; --when now sends it to a depot at once), and is sold when it stops there. The daemon (or relay) checks every 20 s and sells it; --finish true sells any that have arrived now and lists the rest (pending_sales). Without --engine the replacement is a clone (same engine and wagons). --engine N buys that engine instead; for trains also --wagons N (default: as many as the old train) of --wagon ID (default: the old train\'s wagon type; AgentBridge v12) refitted to the old cargo. --select "min_age_pct=100,type=road" --max 5 picks the vehicles by filter instead of --vehicles (selected: ids, matched). For age-based replacement of whole fleets, group-autoreplace or autorenew is cheaper in calls.',
     args: z.object({ ...act, vehicles: ids().optional(), engine: int().optional(), wagon: int().optional(), wagons: int().min(0).max(60).optional(),
       depot: z.enum(['auto']).optional(), depot_x: int().optional(), depot_y: int().optional(),
       when: z.enum(['unloaded', 'now']).default('unloaded').describe('when the old vehicle heads for the depot'),
-      finish: bool().default(false).describe('only sell replaced vehicles that have stopped in a depot; no new replacements') }),
+      finish: bool().default(false).describe('only sell replaced vehicles that have stopped in a depot; no new replacements'), ...selectArgs('replace', 5) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       if (a.finish) return { ...forCompany(await s.finishSales(), company), pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
-      if (!a.vehicles) throw new Error('give --vehicles A,B (or --finish true)');
+      if (a.vehicles && a.select) throw new Error('give --vehicles A,B or --select FILTER, not both');
+      const picked = a.select ? await selectVehicles(s, company, a.select, a.max) : null;
+      const list = picked ? picked.ids : a.vehicles;
+      if (!list) throw new Error('give --vehicles A,B, --select FILTER (or --finish true)');
+      if (picked && !list.length) return { ok: true, dry_run: a.dry_run, replaced: [], selected: picked, note: 'no vehicle matches --select (vehicles queued for sale are left out)' };
       const v12 = ((await s.gs.call('info')).bridge_version ?? 0) >= 12;
       const replaced = [];
-      for (const id of a.vehicles) replaced.push(await replaceOne(s, company, a, id, v12));
+      for (const id of list) replaced.push(await replaceOne(s, company, a, id, v12));
       if (!a.dry_run) s.watchSales();
       const bad = replaced.filter((r) => !r.ok);
       return { ok: !bad.length, dry_run: a.dry_run, error: bad.length ? bad.map((r) => `vehicle ${r.vehicle}: ${r.error}`).join('; ') : null,
         ...(bad.length ? { first_error: bad[0].first_error ?? errorCode(bad[0].error) } : {}),
-        cost: replaced.reduce((n, r) => n + (r.cost ?? 0), 0), replaced, pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
+        cost: replaced.reduce((n, r) => n + (r.cost ?? 0), 0), replaced, ...(picked ? { selected: picked } : {}), pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
     },
   },
   {
@@ -2598,10 +2818,67 @@ export const COMMANDS = [
     },
   },
   {
+    name: 'wait', group: 'operate', session: true,
+    description: `Wait in one call instead of polling: --vehicles A,B --until ${WAIT_STATES.join('|')} returns when every listed vehicle is there (--any true: the first one); loaded = cargo on board >= --load_pct (default 100) of capacity (AgentBridge v13); stopped includes stopped in a depot; sold = gone after a queued sale (vehicle-sell). --days N waits N game days (about 2 s each) instead. Checks once a second; --timeout_s (default 60, max 280: one call must answer within 5 minutes) ends it with first_error wait_timeout and where each vehicle is. A paused game refuses at once (paused: game days do not pass; the host runs turn-advance). Changes nothing.`,
+    args: z.object({ ...who, vehicles: ids().optional(), until: z.enum(WAIT_STATES).optional(), days: int().min(1).max(120).optional(),
+      any: bool().default(false).describe('done when any one vehicle matches'), load_pct: int().min(1).max(100).default(100).describe('until loaded: share of capacity'),
+      timeout_s: int().min(1).max(280).default(60) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      if ((a.vehicles === undefined) !== (a.until === undefined)) throw new Error('give --vehicles A,B with --until STATE, or --days N');
+      if (a.days === undefined && a.until === undefined) throw new Error('give --vehicles A,B --until STATE, or --days N');
+      const started = Date.now();
+      const first = await s.gs.call('info');
+      const check = async () => {
+        if (a.until === 'sold') await s.finishSales();
+        const rows = new Map(vehiclesFromRows(await s.gs.call('vehicles', { company })).map((v) => [v.id, v]));
+        let loads = null;
+        if (a.until === 'loaded') {
+          try { loads = loadsFromRows(await s.gs.call('vehicle_loads', { company, vehicles: a.vehicles })); } catch (e) {
+            if (/unknown cmd/.test(e.message)) throw new Error('refused: wait --until loaded needs AgentBridge v13; the host re-runs install-gamescript and loads the game again');
+            throw e;
+          }
+        }
+        return a.vehicles.map((id) => {
+          const v = rows.get(id) ?? null;
+          const load = loads?.get(id) ?? null;
+          const matched = waitMatch(v, a.until, { load, loadPct: a.load_pct, sold: !!s.soldVehicles?.get(`${company}:${id}`) });
+          return { id, state: v ? v.state : s.soldVehicles?.get(`${company}:${id}`) ? 'sold' : 'gone', matched, ...(v ? { x: v.x, y: v.y } : {}), ...(load ? { load_pct: load.pct } : {}) };
+        });
+      };
+      let info = first, vehicles = a.vehicles ? await check() : [];
+      const met = () => (a.days !== undefined ? info.date - first.date >= a.days : a.any ? vehicles.some((v) => v.matched) : vehicles.every((v) => v.matched));
+      const out = () => ({ until: a.until ?? null, ...(a.days !== undefined ? { days: a.days } : {}), waited_s: Math.round((Date.now() - started) / 100) / 10,
+        game_days: info.date - first.date, date: gameDate(info), ...(a.vehicles ? { vehicles } : {}) });
+      if (met()) return { ok: true, done: true, ...out() };
+      if (info.paused) return { ok: false, done: false, error: 'paused: the game is paused, so vehicles do not move and no game days pass; the host runs turn-advance (or unpause)', first_error: 'paused', ...out() };
+      while (Date.now() - started < a.timeout_s * 1000) {
+        await sleep(1000);
+        info = await s.gs.call('info');
+        if (a.vehicles) vehicles = await check();
+        if (met()) return { ok: true, done: true, ...out() };
+        if (info.paused) return { ok: false, done: false, error: 'paused: the game was paused while waiting', first_error: 'paused', ...out() };
+      }
+      return { ok: false, done: false, error: `wait_timeout: not done after ${a.timeout_s} s (${info.date - first.date} game days)${a.vehicles ? `; not yet: ${vehicles.filter((v) => !v.matched).map((v) => `${v.id} ${v.state}`).join(', ')}` : ''}`, first_error: 'wait_timeout', ...out() };
+    },
+  },
+  {
     name: 'vehicle-start', group: 'operate', session: true,
-    description: 'Start vehicles (comma-separated ids). Already running ones are left alone.',
-    args: z.object({ ...act, vehicles: ids() }),
-    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true }),
+    description: 'Start vehicles (comma-separated ids). Already running ones are left alone. A vehicle queued for sale (vehicle-sell, vehicle-replace) is refused with queued_for_sale: starting it would only send it round again; --cancel_sale true takes it off the queue and starts it.',
+    args: z.object({ ...act, vehicles: ids(), cancel_sale: bool().default(false).describe('take vehicles off the sale queue and start them') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const queued = a.vehicles.filter((v) => s.pendingSales.has(`${company}:${v}`));
+      if (queued.length && !a.cancel_sale) {
+        return { ok: false, dry_run: a.dry_run, error: `queued_for_sale: vehicle${queued.length > 1 ? 's' : ''} ${queued.join(', ')} ${queued.length > 1 ? 'are' : 'is'} queued for sale and will be sold in the depot; nothing was started. To keep ${queued.length > 1 ? 'them' : 'it'}: vehicle-start --vehicles ${queued.join(',')} --cancel_sale true`,
+          first_error: 'queued_for_sale', queued_for_sale: queued, results: [] };
+      }
+      if (queued.length && !a.dry_run) for (const v of queued) s.pendingSales.delete(`${company}:${v}`);
+      const res = await run(ctx, a, a.vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
+      const sold = [];
+      for (const r of res.results.filter((x) => !x.ok)) { const note = await soldNote(s, company, a.vehicles[r.step]); if (note) sold.push(note); }
+      return { ...res, ...(queued.length ? { sale_cancelled: a.dry_run ? [] : queued } : {}), ...(sold.length ? { already_sold: sold } : {}) };
+    },
   },
   {
     name: 'vehicle-stop', group: 'operate', session: true,
@@ -2611,12 +2888,15 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-depot', group: 'operate', session: true,
-    description: 'Send vehicles (comma-separated ids) to a depot: they stop there (needed before vehicle-sell). service=true = service only and carry on. Safe to repeat: vehicles already heading to a depot are left alone (already_heading; sending again would cancel their depot order in OpenTTD) and ones already stopped in a depot are reported (already_in_depot). Failures say why (failed[].error: not_found, broken_down, loading_full_load, no_depot). AgentBridge v11; older ones only skip vehicles already in a depot.',
-    args: z.object({ ...act, vehicles: ids(), service: bool().default(false) }),
+    description: 'Send vehicles (comma-separated ids) to a depot: they stop there (needed before vehicle-sell). service=true = service only and carry on. Safe to repeat: vehicles already heading to a depot are left alone (already_heading; sending again would cancel their depot order in OpenTTD) and ones already stopped in a depot are reported (already_in_depot). Failures say why (failed[].error: not_found, broken_down, loading_full_load, no_depot). --select "max_reliability_pct=50" --service true services the vehicles matching a filter (at most --max, default 20; selected lists them). AgentBridge v11; older ones only skip vehicles already in a depot.',
+    args: z.object({ ...act, vehicles: ids().optional(), service: bool().default(false), ...selectArgs('send', 20) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
+      if (a.vehicles && a.select) throw new Error('give --vehicles A,B or --select FILTER, not both');
+      const picked = a.select ? await selectVehicles(s, company, a.select, a.max) : null;
+      if (!a.vehicles && !picked) throw new Error('give --vehicles A,B or --select FILTER');
       const v11 = ((await s.gs.call('info')).bridge_version ?? 0) >= 11;
-      let send = a.vehicles;
+      let send = picked ? picked.ids : a.vehicles;
       const inDepot = [];
       if (!v11) {
         const rows = vehiclesFromRows(await s.gs.call('vehicles', { company }));
@@ -2627,16 +2907,57 @@ export const COMMANDS = [
       const res = send.length ? await run(ctx, a, send.map((v) => ['veh_depot', v, a.service]), { keepGoing: true })
         : { ok: true, error: null, dry_run: a.dry_run, steps_total: 0, steps_done: 0, cost: 0, results: [] };
       const by = (code) => res.results.filter((r) => r.ok && (v11 ? (r.value ?? 0) === code : code === 1)).map((r) => send[r.step]);
-      return { ...res, sent: by(1), already_heading: by(2), already_in_depot: [...inDepot, ...by(3)],
+      return { ...res, ...(picked ? { selected: picked } : {}), sent: by(1), already_heading: by(2), already_in_depot: [...inDepot, ...by(3)],
         failed: res.results.filter((r) => !r.ok).map((r) => ({ vehicle: send[r.step], error: r.error ?? 'failed' })),
         ...(v11 ? {} : { note: 'the running AgentBridge is older than v11: a vehicle already heading to a depot cannot be detected, and sending it again cancels its depot order' }) };
     },
   },
   {
     name: 'vehicle-sell', group: 'operate', session: true,
-    description: 'Sell vehicles (comma-separated ids). Each must be stopped inside a depot (vehicle-depot, then check `vehicles --state in_depot`). The negative cost is the sale income.',
-    args: z.object({ ...act, vehicles: ids() }),
-    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_sell', v]), { keepGoing: true }),
+    description: 'Sell vehicles (comma-separated ids) in one call: ones stopped in a depot are sold now (sold, income); the others are sent to a depot and queued (queued): the daemon (or relay) sells each when it stops there (checked every 20 s; status background_jobs, vehicle-problems pending_sale; kept in the jobs file). --send false sells only the ones in a depot and fails the rest (not_in_depot). A vehicle already sold through openttd-agent is already_sold (ok) with the sale date. The negative cost is the sale income.',
+    args: z.object({ ...act, vehicles: ids(), send: bool().default(true).describe('send vehicles that are not in a depot there and sell them on arrival (false = refuse them)') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const rows = new Map(vehiclesFromRows(await s.gs.call('vehicles', { company })).map((v) => [v.id, v]));
+      const now = [], toQueue = [], alreadyQueued = [], alreadySold = [], failed = [];
+      for (const id of [...new Set(a.vehicles)]) {
+        const v = rows.get(id);
+        if (!v) {
+          const note = await soldNote(s, company, id);
+          if (note) alreadySold.push({ vehicle: id, note }); else failed.push({ vehicle: id, error: `not_found: vehicle ${id} does not exist or is not yours` });
+        } else if (v.state === 'in_depot') now.push(v);
+        else if (s.pendingSales.has(`${company}:${id}`)) alreadyQueued.push(id);
+        else if (a.send) toQueue.push(v);
+        else failed.push({ vehicle: id, error: `not_in_depot: vehicle ${id} is ${v.state.replace('_', ' ')}; send it with vehicle-depot or use --send true` });
+      }
+      const info = { stations: new Map() };
+      for (const v of [...now, ...toQueue]) info.stations.set(v.id, a.dry_run ? [] : await orderStationIds(s, company, v.id));
+      const sell = now.length ? await run(ctx, a, now.map((v) => ['veh_sell', v.id]), { keepGoing: true }) : null;
+      const sold = [];
+      for (const r of sell?.results ?? []) {
+        const v = now[r.step];
+        if (!r.ok) { failed.push({ vehicle: v.id, error: r.error ?? 'failed' }); continue; }
+        sold.push(v.id);
+        if (!a.dry_run) await s.recordSold({ company, vehicle: v.id, income: -r.cost, unit_number: v.unit_number, name: v.name, stations: info.stations.get(v.id) });
+      }
+      const queued = [];
+      if (toQueue.length) {
+        const sent = await run(ctx, a, toQueue.map((v) => ['veh_depot', v.id, false]), { keepGoing: true });
+        for (const r of sent.results) {
+          const v = toQueue[r.step];
+          if (!r.ok && /^not_found/.test(r.error ?? '')) { failed.push({ vehicle: v.id, error: r.error }); continue; }
+          queued.push({ vehicle: v.id, sent: r.ok, ...(r.ok ? {} : { retrying: r.error ?? 'failed' }) });
+          if (!a.dry_run) s.pendingSales.set(`${company}:${v.id}`, { company, vehicle: v.id, send: true, sent: r.ok, since: new Date().toISOString(), unit_number: v.unit_number, name: v.name, stations: info.stations.get(v.id) });
+        }
+        if (!a.dry_run) s.watchSales();
+      }
+      const income = -(sell?.cost ?? 0);
+      return { ok: !failed.length, dry_run: a.dry_run, error: failed.length ? failed.map((f) => `vehicle ${f.vehicle}: ${f.error}`).join('; ') : null,
+        ...(failed.length ? { first_error: errorCode(failed[0].error) } : {}), cost: sell?.cost ?? 0, income,
+        sold, [a.dry_run ? 'would_queue' : 'queued']: queued, ...(alreadyQueued.length ? { already_queued: alreadyQueued } : {}),
+        ...(alreadySold.length ? { already_sold: alreadySold } : {}), failed, results: sell?.results ?? [],
+        ...(queued.length && !a.dry_run ? { note: 'queued vehicles are sold when they stop in a depot (the daemon checks every 20 s); wait --vehicles ... --until sold waits for it' } : {}) };
+    },
   },
   {
     name: 'vehicle-refit', group: 'operate', session: true,
@@ -2691,19 +3012,24 @@ export const COMMANDS = [
   },
   {
     name: 'build-rail-station', group: 'build', session: true,
-    description: 'Build a rail station with its lowest-x/y corner at x,y. axis=x: platforms run along x and are stacked along y (axis=y: the reverse). Trains enter at either end of a platform.',
-    args: z.object({ ...act, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(20).default(1), length: int().min(1).max(20).default(4), ...join, rail_type: int().optional() }),
-    run: (ctx, a) => run(ctx, a, [['rail_station', a.x, a.y, a.axis === 'y', a.platforms, a.length, joinArg(a.join)]], { railType: a.rail_type }),
+    description: 'Build a rail station with its lowest-x/y corner at x,y. axis=x: platforms run along x and are stacked along y (axis=y: the reverse). Trains enter at either end of a platform. A real build returns station {id, name} (the new or joined station).',
+    args: z.object({ ...act, ...borrow, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(20).default(1), length: int().min(1).max(20).default(4), ...join, rail_type: int().optional() }),
+    run: async (ctx, a) => {
+      const res = await run(ctx, a, [['rail_station', a.x, a.y, a.axis === 'y', a.platforms, a.length, joinArg(a.join)]], { railType: a.rail_type });
+      if (!res.ok || a.dry_run) return res;
+      const { s, company } = await mine(ctx, a);
+      return { ...res, station: await builtStationAt(s, company, a.x, a.y, 'rail', a.platforms + a.length) };
+    },
   },
   {
     name: 'build-rail-depot', group: 'build', session: true,
     description: 'Build a rail depot at x,y with its entrance facing front (a tile next to it that has or will get track). Connect it with build-rail using the front tile as an anchor. The result has exit_dir and (AgentBridge v9) front_joined: whether track on the front tile reaches the entrance, and front_leads (the ways a train leaving the depot can go from there); a warning when nothing joins it yet or when trains can leave in one direction only (every new train then runs that way first, e.g. to the far end of the line to turn).',
-    args: z.object({ ...act, ...point, ...front, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, ...point, ...front, rail_type: int().optional() }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const res = await run(ctx, a, [['rail_depot', a.x, a.y, a.front_x, a.front_y]], { railType: a.rail_type });
       const dir = TRACE_DIRS.findIndex(([dx, dy]) => a.x + dx === a.front_x && a.y + dy === a.front_y);
-      const out = { ...res, exit_dir: DIR_NAMES[dir] ?? null };
+      const out = { ...res, exit_dir: DIR_NAMES[dir] ?? null, ...(res.ok && !a.dry_run ? { depot: { x: a.x, y: a.y }, next: `vehicle-buy --depot_x ${a.x} --depot_y ${a.y} --engine <id>` } : {}) };
       if (dir < 0 || !res.ok) return out;
       let t = null;
       try { t = (await s.gs.call('rail_tiles', { x0: a.front_x, y0: a.front_y, x1: a.front_x, y1: a.front_y }))[0]; } catch { return out; }
@@ -2944,6 +3270,66 @@ export const COMMANDS = [
 
   // ---- build: road ---------------------------------------------------------------------
   {
+    name: 'road-stop-sites', group: 'build', session: true,
+    description: 'Where a bus or truck stop fits near a town (drive-through stops on straight town roads near the centre, then bay stops), an industry (bay stops within --radius, default 3, of its tiles) or a tile: each site dry-run checked as your company, with cost and build (the build-road-station command to run). --count N (default 3) sites at least --spacing tiles apart (Manhattan; e.g. 6 for a bus network across a town); --cargo C keeps only sites whose catchment accepts it (acceptance, radius 3); --with_depot true adds a depot spot beside a road near the first site (depot.build). rejected counts failed candidates by reason. Changes nothing. Example: --town Bigton --count 4 --spacing 5 --with_depot true',
+    args: z.object({ ...who, town: z.string().optional().describe('town id or name'), industry: int().optional(), x: int().optional(), y: int().optional(),
+      kind: z.enum(['bus', 'truck']).optional().describe('default: bus at a town, truck otherwise'), cargo: z.string().optional().describe('only sites that accept this cargo'),
+      count: int().min(1).max(10).default(3), spacing: int().min(0).max(30).default(0).describe('least tiles between two returned sites'),
+      radius: int().min(1).max(12).optional().describe('search radius; default 4 at a town, 3 at an industry or tile'),
+      with_depot: bool().default(false).describe('also find a road depot spot near the first site') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const [economy] = await Promise.all([s.economy(), s.ensureTiles()]);
+      const end = lineEnd(s, economy, { town: a.town, industry: a.industry, x: a.x, y: a.y });
+      const r = a.radius ?? (end.kind === 'town' ? 4 : 3);
+      const kind = a.kind ?? (end.kind === 'town' ? 'bus' : 'truck');
+      const xs = end.targets.map((t) => t[0]), ys = end.targets.map((t) => t[1]);
+      await s.refreshArea(Math.min(...xs) - r - 8, Math.min(...ys) - r - 8, Math.max(...xs) + r + 8, Math.max(...ys) + r + 8);
+      const cands = end.kind === 'town'
+        ? [...townStopCandidates(s.map, { cx: end.point[0], cy: end.point[1], radius: r, max: 40 }), ...truckStopCandidates(s.map, { targets: [end.point], catchment: r, max: 40 })]
+        : truckStopCandidates(s.map, { targets: end.targets, catchment: r, max: 40 });
+      const want = a.cargo !== undefined ? cargoId(s.cargos, a.cargo) : undefined;
+      const sites = [], rejected = {};
+      const reject = (why) => { rejected[why] = (rejected[why] ?? 0) + 1; };
+      let dryRuns = 0;
+      for (const c of cands) {
+        if (sites.length >= a.count || dryRuns >= Math.max(16, a.count * 8)) break;
+        if (sites.some((p) => p.x === c.x && p.y === c.y)) continue;
+        if (a.spacing && sites.some((p) => tileDistance(p, c) < a.spacing)) { reject('too_close'); continue; }
+        dryRuns++;
+        const steps = [['road_station', c.x, c.y, c.front_x, c.front_y, kind === 'truck', c.drive_through, -1], ...(c.drive_through ? [] : [['road', c.front_x, c.front_y, c.x, c.y]])];
+        const dry = await s.exec(company, steps, { dryRun: true });
+        if (!dry.ok) { reject(dry.first_error ?? 'failed'); continue; }
+        let acceptance;
+        if (want !== undefined) {
+          const lists = await acceptanceAt(s, [[c.x, c.y]], { radius: 3, cargos: [want] });
+          acceptance = lists ? (lists[0][0]?.acceptance ?? 0) : null;
+          if (acceptance !== null && acceptance < ACCEPTED) { reject('not_accepted'); continue; }
+        }
+        sites.push({ x: c.x, y: c.y, front_x: c.front_x, front_y: c.front_y, drive_through: c.drive_through, cost: dry.cost, ...(acceptance !== undefined ? { acceptance } : {}),
+          tiles_from_target: Math.min(...end.targets.map(([tx, ty]) => tileDistance(c, { x: tx, y: ty }))),
+          build: `build-road-station --x ${c.x} --y ${c.y} --front_x ${c.front_x} --front_y ${c.front_y} --kind ${kind}${c.drive_through ? ' --drive_through true' : ''}` });
+      }
+      let depot;
+      if (a.with_depot && sites.length) {
+        const f = sites[0];
+        const roads = [];
+        for (let y = f.y - 6; y <= f.y + 6; y++) for (let x = f.x - 6; x <= f.x + 6; x++) if (s.map.inBounds(x, y) && s.map.classAt(x, y) === 'd') roads.push([x, y]);
+        const skip = new Set(sites.map((p) => `${p.x},${p.y}`));
+        depot = null;
+        for (const d of roadDepotCandidates(s.map, roads, { x: f.x, y: f.y }, { skip })) {
+          const dry = await s.exec(company, [['road_depot', d.x, d.y, d.front_x, d.front_y], ['road', d.front_x, d.front_y, d.x, d.y]], { dryRun: true });
+          if (dry.ok) { depot = { x: d.x, y: d.y, front_x: d.front_x, front_y: d.front_y, cost: dry.cost, build: `build-road-depot --x ${d.x} --y ${d.y} --front_x ${d.front_x} --front_y ${d.front_y}` }; break; }
+        }
+      }
+      // Every candidate refused by the town: say who and why once (R8), not just a count.
+      const la = !sites.length && rejected.ERR_LOCAL_AUTHORITY_REFUSES ? await authorityDetail(s, company, ['road_station'], { x: end.point[0], y: end.point[1] }) : null;
+      return { target: end.what, kind, candidates_on_map: cands.length, dry_runs: dryRuns, rejected, ...listResult('sites', sites, sites), ...(la ? { local_authority: la } : {}),
+        ...(depot !== undefined ? { depot } : {}),
+        ...(sites.length < a.count ? { hint: `${sites.length} of ${a.count} sites found: try --radius ${Math.min(12, r + 3)}${a.spacing ? ', a smaller --spacing' : ''}${a.cargo ? ', or no --cargo' : ''}` } : {}) };
+    },
+  },
+  {
     name: 'build-road-path', group: 'build', session: true,
     description: 'Plan and build a road between two tiles (both included), reusing existing roads where that is cheaper, going round houses and industries, bridging water and rail where it must. dry_run=true for the cost first. road_type (see road-types) lays that road or tram type (tram track can go on existing roads).',
     args: z.object({ ...pathArgs, road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
@@ -2951,8 +3337,8 @@ export const COMMANDS = [
   },
   {
     name: 'build-road-station', group: 'build', session: true,
-    description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis; not on junctions). A normal (bay) stop also gets the road piece on front that joins its entrance. Returns connected (AgentBridge v11): true when the entrance (or one end of a drive-through stop) joins a road beyond it. connect=auto builds a road from the entrance to the nearest road when it does not. A refused drive-through stop says why where it can tell (junction, one_way_road, other_owner_road, slope).',
-    args: z.object({ ...act, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join,
+    description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis; not on junctions). A normal (bay) stop also gets the road piece on front that joins its entrance. Returns station {id, name} (the new or joined station) and connected (AgentBridge v11): true when the entrance (or one end of a drive-through stop) joins a road beyond it. connect=auto builds a road from the entrance to the nearest road when it does not. A refused drive-through stop says why where it can tell (junction, one_way_road, other_owner_road, slope).',
+    args: z.object({ ...act, ...borrow, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join,
       connect: z.enum(['none', 'auto']).default('none').describe('auto = when the entrance does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
       const res = await run(ctx, a, [
@@ -2965,18 +3351,22 @@ export const COMMANDS = [
         const why = await driveThroughRefusal(s, company, a);
         if (why.length) return { ...res, error: `drive_through_refused: ${why.join('; ')} (game: ${res.results[0].error ?? 'failed'})`, first_error: 'drive_through_refused', reasons: why };
       }
-      return withRoadJoin(s, company, a, res, a.drive_through ? 'drive_through' : 'bay');
+      const out = await withRoadJoin(s, company, a, res, a.drive_through ? 'drive_through' : 'bay');
+      if (!out.ok || a.dry_run) return out;
+      return { ...out, station: await builtStationAt(s, company, a.x, a.y, 'road') };
     },
   },
   {
     name: 'build-road-depot', group: 'build', session: true,
-    description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile), plus the road piece on front that joins the entrance. Returns connected (AgentBridge v11): true when the front tile joins a road beyond it. connect=auto builds a road from the front tile to the nearest road when it does not.',
-    args: z.object({ ...act, ...point, ...front,
+    description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile), plus the road piece on front that joins the entrance. Returns depot {x, y} and front for vehicle-buy, and connected (AgentBridge v11): true when the front tile joins a road beyond it. connect=auto builds a road from the front tile to the nearest road when it does not.',
+    args: z.object({ ...act, ...borrow, ...point, ...front,
       connect: z.enum(['none', 'auto']).default('none').describe('auto = when the front tile does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
       const res = await run(ctx, a, [['road_depot', a.x, a.y, a.front_x, a.front_y], ['road', a.front_x, a.front_y, a.x, a.y]], a.road_type !== undefined ? { roadType: a.road_type } : {});
       const { s, company } = await mine(ctx, a);
-      return withRoadJoin(s, company, a, res, 'depot');
+      const out = await withRoadJoin(s, company, a, res, 'depot');
+      if (!out.ok || a.dry_run) return out;
+      return { ...out, depot: { x: a.x, y: a.y }, front: { x: a.front_x, y: a.front_y }, next: `vehicle-buy --depot_x ${a.x} --depot_y ${a.y} --engine <id> (engines --type road)` };
     },
   },
 
@@ -2984,13 +3374,13 @@ export const COMMANDS = [
   {
     name: 'build-bridge', group: 'build', session: true,
     description: 'Build a rail, road or water (aqueduct) bridge between two tiles in a straight line (the ramps go on those tiles).',
-    args: z.object({ ...act, type: z.enum(['rail', 'road', 'water']).default('rail'), x1: int(), y1: int(), x2: int(), y2: int(), ...bridgeArg, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, type: z.enum(['rail', 'road', 'water']).default('rail'), x1: int(), y1: int(), x2: int(), y2: int(), ...bridgeArg, rail_type: int().optional() }),
     run: (ctx, a) => run(ctx, a, [['bridge', transport(a.type), a.x1, a.y1, a.x2, a.y2, bridgeType(a.bridge)]], { railType: a.rail_type }),
   },
   {
     name: 'build-tunnel', group: 'build', session: true,
     description: 'Build a rail or road tunnel starting at x,y, a tile at the foot of a slope; the game finds the other end straight through the hill.',
-    args: z.object({ ...act, type: z.enum(['rail', 'road']).default('rail'), ...point, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, type: z.enum(['rail', 'road']).default('rail'), ...point, rail_type: int().optional() }),
     run: (ctx, a) => run(ctx, a, [['tunnel', transport(a.type), a.x, a.y]], { railType: a.rail_type }),
   },
   {
@@ -3076,7 +3466,7 @@ export const COMMANDS = [
   {
     name: 'build-dock', group: 'build', session: true,
     description: 'Build a ship dock on the sloped coast tile x,y (the land half; the water half extends into the sea).',
-    args: z.object({ ...act, ...point, ...join }),
+    args: z.object({ ...act, ...borrow, ...point, ...join }),
     run: (ctx, a) => run(ctx, a, [['dock', a.x, a.y, joinArg(a.join)]]),
   },
   {
@@ -3094,7 +3484,7 @@ export const COMMANDS = [
   {
     name: 'build-airport', group: 'build', session: true,
     description: 'Build an airport with its lowest-x/y corner at x,y. airport = type name (see airport-types); find a spot with airport-sites.',
-    args: z.object({ ...act, ...point, airport: z.string().default('small'), ...join }),
+    args: z.object({ ...act, ...borrow, ...point, airport: z.string().default('small'), ...join }),
     run: async (ctx, a) => {
       const types = await (await ctx.session()).gs.call('airport_types');
       const at = types.find((t) => t.name === lc(a.airport));

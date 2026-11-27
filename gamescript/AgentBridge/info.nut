@@ -5,9 +5,9 @@ class AgentBridge extends GSInfo {
 	function GetAuthor()      { return "openttd-agent"; }
 	function GetName()        { return "AgentBridge"; }
 	function GetDescription() { return "Lets coding agents query the world and build for their company over the admin port."; }
-	function GetVersion()     { return 12; }
+	function GetVersion()     { return 13; }
 	function MinVersionToLoad() { return 5; }
-	function GetDate()        { return "2026-11-26"; }
+	function GetDate()        { return "2026-11-27"; }
 	function CreateInstance() { return "AgentBridge"; }
 	function GetShortName()   { return "AGBR"; }
 	function GetAPIVersion()  { return "15"; }

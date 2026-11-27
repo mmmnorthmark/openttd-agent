@@ -83,3 +83,13 @@ test('parked days in stopped_in_depot; loose wagons', () => {
   const loose = vehicleProblems(train({ state: 'in_depot', unit_number: -1 }), { today: 50 });
   assert.deepEqual(loose.map((p) => p.problem), ['loose_wagons']);
 });
+
+test('stuck_or_lost on a connected trace says not lost and never suggests a depot (L7)', async () => {
+  const { vehicleProblems } = await import('../src/problems.js');
+  const v = { id: 4, type: 'rail', state: 'running', order_count: 2, current_order: 1, dest: { x: 50, y: 5 }, dest_name: 'B', dist: 40, speed: 30, profit_last_year: 0, age_days: 10, age_pct: 1, reliability_pct: 90, x: 10, y: 5 };
+  const [p] = vehicleProblems(v, { today: 100, stuckDays: 30, progress: { since: 10, best: 40 }, reach: { connected: true } });
+  assert.equal(p.problem, 'stuck_or_lost');
+  assert.match(p.evidence, /not lost/);
+  assert.doesNotMatch(p.suggested_fix, /vehicle-depot/);
+  assert.match(p.suggested_fix, /loop-sites/);
+});

@@ -264,7 +264,7 @@ test('owned land commands explain an older AgentBridge; airport-sites still work
     await assert.rejects(run('owned-land', {}), /older than v10/);
     const res = await run('airport-sites', { town: 'Smallham', limit: 1 });
     assert.ok(res.sites.length && res.sites.every((st) => !('owned' in st)));
-  } finally { fake.state.gsVersion = 12; }
+  } finally { fake.state.gsVersion = 13; }
 });
 
 test('build-signal --remove: no_signal_here instead of ERR_PRECONDITION_FAILED', async () => {
@@ -369,7 +369,7 @@ test('build-hq: one hq step; refused on an older GameScript', async () => {
   assert.equal(res.ok, true);
   assert.deepEqual(fake.received.filter((q) => q.cmd === 'exec').at(-1).args.steps, [['hq', 20, 30]]);
   fake.state.gsVersion = 11;
-  try { await assert.rejects(run('build-hq', { x: 20, y: 30 }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
+  try { await assert.rejects(run('build-hq', { x: 20, y: 30 }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 13; }
 });
 
 test('road-types; --road_type reaches exec for road builds; engines --road_type', async () => {
