@@ -43,7 +43,7 @@ async function runLocal(ctx, name, args, { readOnly, oneShot }) {
     const result = await executeCommand(c, name, args, { readOnly });
     const jobs = oneShot ? backgroundJobs(c.peekSession?.()) : [];
     const warnings = jobs.length
-      ? [`background_job_not_kept: ${jobs.join(', ')} ran in this one-shot process and stop when it exits. Run without --no-daemon (the background daemon keeps them), or keep an MCP server or batch running`]
+      ? [`background_job_not_kept: ${jobs.join(', ')} ran in this one-shot process and stop when it exits; they are saved in the jobs file and resume only when a daemon or MCP server connects to this game again. Run without --no-daemon (the background daemon keeps them running)`]
       : [];
     return { result, warnings };
   } finally { if (own) c.close(); }

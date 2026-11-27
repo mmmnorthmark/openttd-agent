@@ -75,6 +75,9 @@ test('read-only: dry-runnable commands are forced to a dry run, reads run, other
   await assert.rejects(run('rate', { command_delay_ticks: 1 }, { readOnly: true }), /^Error: read_only: 'rate'/);
   const rcons = fake.state.rcons.length;
   await assert.rejects(run('pause', {}, { readOnly: true }), /read_only/);
+  for (const name of ['console', 'load', 'server-stop', 'company-new', 'install-gamescript', 'launch']) {
+    await assert.rejects(run(name, { ...(name === 'console' ? { command: 'quit' } : {}), ...(name === 'load' ? { name: 'x' } : {}) }, { readOnly: true }), /^Error: read_only/, name);
+  }
   assert.equal(fake.state.rcons.length, rcons, 'nothing sent');
 });
 

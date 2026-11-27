@@ -29,6 +29,9 @@ const CASES = {
   status: {}, companies: {}, rating: {}, chat: { message: 'hello' }, rate: {}, 'goal-status': {},
   'goal-set': { deadline_year: 1954, targets: 'wood:3000,VALUE:100000' }, pause: {}, unpause: {}, 'turn-advance': { days: 1 }, 'goal-clear': {},
   save: { name: 'parity' },
+  // Host server control (session: false, own admin connection to the configured admin port).
+  saves: {}, 'server-log': {}, console: { command: 'setting command_pause_level' }, load: { name: 'nope' },
+  'company-new': { ai: 'NoSuchAI' }, 'server-stop': { server: 'nope' },  // refusals: never quit the fake
   cargos: {}, 'industry-types': {}, towns: {}, industries: { id: 2 }, 'find-cargo-pairs': { cargo: 'wood', min_distance: 10, max_distance: 200 },
   acceptance: { x: 42, y: 12 }, 'town-gaps': { min_population: 0 }, 'route-effort': { x1: 10, y1: 20, x2: 50, y2: 20 },
   'airport-types': {}, 'airport-sites': { town: 'Smallham', limit: 2 }, tiles: { x0: 12, y0: 20, x1: 14, y1: 20 }, 'rail-tiles': { x0: 12, y0: 19, x1: 19, y1: 22 },
@@ -79,6 +82,8 @@ const EXTRA_CASES = [
   ['route-effort', { x1: '10', y1: '20', x2: 50, y2: 20 }],            // numeric strings
   ['route-effort', { x1: false, y1: 20, x2: 50, y2: 20 }],             // false is not 0
   ['vehicles', { fields: '' }],                                        // bad reserved value
+  ['launch', { server: 'side', game_port: 4979, admin_port: 4977, mode: 'dedicated', admin_password: 'pw', dry_run: true }],
+  ['install-gamescript', { reload: true }],
 ];
 
 const isRequired = (name) => (describeCommands().find((d) => d.name === name).args.required ?? []).length > 0;

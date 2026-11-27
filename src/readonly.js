@@ -13,6 +13,7 @@ export const READ_COMMANDS = new Set([
   'status', 'companies', 'rating', 'goal-status',
   'cargos', 'industry-types', 'towns', 'industries', 'find-cargo-pairs', 'acceptance', 'town-gaps', 'route-effort',
   'airport-types', 'airport-sites', 'tiles', 'rail-tiles', 'signs', 'owned-land',
+  'saves', 'server-log',
   'test-build-road', 'rail-types', 'road-types', 'bridge-types', 'station-sites', 'loop-sites',
   'stations', 'vehicles', 'vehicle', 'summary', 'vehicle-problems', 'verify-route', 'engines', 'groups', 'depots', 'events',
 ]);
@@ -20,10 +21,12 @@ export const READ_COMMANDS = new Set([
 /** Show-or-set commands: a read when only these arguments are given. */
 export const SHOW_OR_SET = { rate: [], autorenew: ['company'] };
 
-/** Commands that change something and have no dry run: refused in read-only mode. */
+/** Commands that change something: refused in read-only mode (checked before dry_run). */
 export const WRITE_COMMANDS = new Set([
   'install-gamescript', 'configure', 'scenario-prepare', 'relay-add-player', 'relay-set-company', 'relay-remove-player',
   'chat', 'goal-set', 'pause', 'unpause', 'turn-advance', 'goal-clear', 'save',
+  'load', 'server-stop', 'console', 'company-new',
+  'launch', // refused even as a dry run: a dry run still writes the launch profile files
 ]);
 
 /** Is read-only mode asked for by the environment? */
@@ -31,10 +34,10 @@ export const readOnlyFromEnv = (env = process.env) => ['1', 'true', 'yes'].inclu
 
 /** The class of a command: 'dry_run' | 'read' | 'show_or_set' | 'write' | null (unclassified). */
 export function commandClass(name, known) {
+  if (WRITE_COMMANDS.has(name)) return 'write';
   if (known.includes('dry_run')) return 'dry_run';
   if (READ_COMMANDS.has(name)) return 'read';
   if (name in SHOW_OR_SET) return 'show_or_set';
-  if (WRITE_COMMANDS.has(name)) return 'write';
   return null;
 }
 
