@@ -5,6 +5,53 @@ re-run `install-gamescript` when it changes.
 
 ## 0.8.0 (unreleased)
 
+Rail safety and build efficiency (batch 4):
+
+- **Breaking:** `vehicle-clone` on a train runs the passing-loop check of `add-train` and refuses
+  with `needs_loop` (`line_check`) when the line would run more trains than usable loops + 1.
+  `vehicle-clone` and `add-train` refuse to copy a vehicle that lost money last year and this
+  year (`source_unprofitable`). `--force true` skips both.
+- **Breaking:** loops count only when they are real loops: a second track that leaves the line at
+  points and rejoins it, with a signal on each side and room for the line's longest train. Depot
+  spurs, terminus throats and branches no longer count. `add-train` `check` gains `loops[]`,
+  `unusable_loops[]` (with `why`), `train_tiles`.
+- `build-signal --remove` refuses a passing loop's signal (`loop_signal`, with the loop's points);
+  `--force true` removes it anyway.
+- `ERR_VEHICLE_IN_THE_WAY`: results gain `transient: true`, `blocked_at`, `vehicles_in_the_way[]`
+  and, in a dry run, `blocked_by_vehicle: true`. `build-rail`, `build-track` and
+  `build-passing-loop` take `--wait_clear_s N` (wait for the vehicle, retry from the failed step).
+- **Breaking:** `build-passing-loop` without `--train_tiles`/`--for_vehicle` sizes the loop for
+  the longest of your trains on the line through x,y (`train_from_line`), so a `--length` too
+  short for it is refused (`loop_too_short`); `train_length_unknown` warns when there is none.
+- **Breaking:** `verify-route --from_station --to_station` traces both directions (`there`,
+  `back`; `connected` needs both); `--both_ways false` for one. `verify-route` gains
+  `legs_connected[]`.
+- `build-cargo-route`: a real build ends with `verify {connected, there, back, first_gap,
+  first_leg}` and fails with `route_broken` (`failed_step: verify`) when the line does not trace.
+  `first_leg.detour_ratio` (also in `add-train`'s `verify`) and warning `depot_exit_detour` when
+  the depot exit sends new trains the long way round.
+- `build-cargo-route`: industry ends get the wider/shorter/one-platform retries too; no site gives
+  `first_error: no_terminus_site` with `no_site {candidates_on_map, dry_runs, rejected (by error),
+  tried, own_station_near, hint}` (the hint lists only what was not tried).
+- `build-cargo-route --if_exists refuse|skip|add_train|build` (`--allow_existing true` = build):
+  skip returns `ok: true, action: "exists"`, add_train runs `add-train` on that line.
+- **Breaking:** `build-cargo-route --reuse_stations auto` (default) joins the new terminus to your
+  rail station within `--radius` of an end (`reused_station`; `reuse_failed` when it does not
+  fit); `never` builds new stations as before.
+- `build-cargo-route` refuses a source that does not make the cargo, or a secondary industry that
+  made none last month (`source_produces_nothing`, `feeder`); `--force true` builds anyway.
+- `build-cargo-route --trains K`: clones the first train after the loops, only as many as the
+  built line has usable loops + 1 (`more_trains`, warning `trains`).
+- `vehicle-clone --share` = `--share_orders` (and `orders-copy --share_orders` = `--share`). On
+  the CLI a lone whole number is the id: `vehicle 31`, `vehicle-clone 31 --count 2`.
+- `find-cargo-pairs`: `--source_id`, `--dest_id`, region `--x0 --y0 --x1 --y1`, `--sort
+  effort|revenue|distance|production`, `yours {from_station, to_station, served_by}` with
+  `--exclude_yours true` (default), `excluded` counts and a `hint` when nothing is left,
+  `--dry_run_top N` (`dry_run {ok, estimated_cost, line_tiles, failed_step}`), `--format lines`,
+  and a `build` command per pair.
+- Existing-route detection counts a just-built station (no cargo rating yet) and no longer takes
+  the reverse route for one-way cargo.
+
 Host tools (batch 3):
 
 - **Breaking:** `launch --mode dedicated` now waits until the admin port and AgentBridge answer
