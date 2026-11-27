@@ -1848,27 +1848,41 @@ export const COMMANDS = [
   },
   {
     name: 'tiles', group: 'world', session: true,
-    description: 'Raw terrain mirror for a small rectangle: height, slope and class per tile (water, clear, trees, other=houses/objects, rail, road, station, industry...), and (AgentBridge v12) who owns it: "*" = your company, "#" = another company (rail rows in an area are not necessarily yours). Max 40x40.',
-    args: z.object({ ...who, x0: int(), y0: int(), x1: int(), y1: int(), refresh: bool().default(true) }),
+    description: 'Terrain mirror for a rectangle (--x0 --y0 --x1 --y1, or --x --y --radius R): --format json (default, max 40x40): height, slope and class per tile (water, clear, trees, other=houses/objects, rail, road, station, industry...), and (AgentBridge v12) who owns it: "*" = your company, "#" = another company (rail rows in an area are not necessarily yours). --format text (max 80x80): one character per tile (the class letter, UPPER case = owned by your company), an x ruler (one line per digit, read downwards) and rows "y|chars"; heights are left out.',
+    args: z.object({ ...who, x0: int().optional(), y0: int().optional(), x1: int().optional(), y1: int().optional(),
+      x: int().optional().describe('centre x (with --y and --radius, instead of x0..y1)'), y: int().optional(), radius: int().min(0).max(40).optional().describe('tiles around x,y (default 5)'),
+      format: z.enum(['json', 'text']).default('json').describe('text = one character per tile with rulers (max 80x80)'),
+      refresh: bool().default(true) }),
     run: async (ctx, a) => {
-      if ((a.x1 - a.x0 + 1) * (a.y1 - a.y0 + 1) > 1600) throw new Error('area too large; max 40x40 tiles');
       const s = await ctx.session();
+      const box = tileBox(a, s.map.sizeX, s.map.sizeY);
+      const max = a.format === 'text' ? 80 : 40;
+      if (box.x1 - box.x0 + 1 > max || box.y1 - box.y0 + 1 > max) throw new Error(`area too large; max ${max}x${max} tiles${a.format === 'text' ? '' : ' (--format text takes up to 80x80)'}`);
       const me = a.company ?? s.cfg.company;
-      if (a.refresh) await s.refreshArea(a.x0, a.y0, a.x1, a.y1); else await s.ensureTiles();
-      let owners = null;
-      try { owners = new Map((await s.gs.call('tile_owners', { x0: a.x0, y0: a.y0, x1: a.x1, y1: a.y1 })).map(([x, y, o]) => [`${x},${y}`, o])); } catch (e) { if (!/unknown cmd/.test(e.message)) throw e; }
-      const mark = (x, y) => { const o = owners?.get(`${x},${y}`); return o === undefined ? '' : o === me ? '*' : '#'; };
+      if (a.refresh) await s.refreshArea(box.x0, box.y0, box.x1, box.y1); else await s.ensureTiles();
+      let owners = new Map();
+      try {
+        for (const part of splitBox(box, 40)) for (const [x, y, o] of await s.gs.call('tile_owners', part)) owners.set(`${x},${y}`, o);
+      } catch (e) { if (!/unknown cmd/.test(e.message)) throw e; owners = null; }
+      const ownerAt = owners ? (x, y) => owners.get(`${x},${y}`) : null;
+      const oldGs = owners ? {} : { owners: 'not shown: the running AgentBridge is older than v12' };
+      const classes = 'w water c coast i industry s station r rail d road t trees f farm k rocks h rough b clear o other(houses/objects)';
+      if (a.format === 'text') {
+        const text = tilesText(box, (x, y) => s.map.classAt(x, y), ownerAt, me);
+        return { legend: `one character per tile: ${classes}${owners ? '; UPPER case = owned by your company' : ''}. x ruler: one line per digit, read downwards; rows: "y|tiles"`,
+          ...oldGs, ...box, ...text };
+      }
+      const mark = (x, y) => { const o = ownerAt?.(x, y); return o === undefined ? '' : o === me ? '*' : '#'; };
       const rows = [];
-      for (let y = a.y0; y <= a.y1; y++) {
+      for (let y = box.y0; y <= box.y1; y++) {
         const r = [];
-        for (let x = a.x0; x <= a.x1; x++) r.push(`${s.map.classAt(x, y)}${s.map.heightAt(x, y)}${s.map.slopeAt(x, y) ? '/' : ''}${mark(x, y)}`);
+        for (let x = box.x0; x <= box.x1; x++) r.push(`${s.map.classAt(x, y)}${s.map.heightAt(x, y)}${s.map.slopeAt(x, y) ? '/' : ''}${mark(x, y)}`);
         rows.push({ y, tiles: r.join(' ') });
       }
-      return { legend: `class letter + height, "/" = sloped${owners ? ', "*" = owned by your company, "#" = by another company' : ''}. w water c coast i industry s station r rail d road t trees f farm k rocks h rough b clear o other(houses/objects)`,
-        ...(owners ? {} : { owners: 'not shown: the running AgentBridge is older than v12' }), x0: a.x0, rows };
+      return { legend: `class letter + height, "/" = sloped${owners ? ', "*" = owned by your company, "#" = by another company' : ''}. ${classes}`,
+        ...oldGs, x0: box.x0, rows };
     },
   },
-
   {
     name: 'rail-tiles', group: 'world', session: true,
     description: 'Exact rail on a small rectangle (max 32x32), one row per tile with rail: kind (track, station, waypoint, depot, crossing, bridge, tunnel), track pieces (x = along x, y = along y, n/s/e/w = the corner pieces), signals (facing trains that come from which side: from_sw/from_se/from_ne/from_nw, one_way true for one-way path signals), depot front, bridge/tunnel other end, station id, rail type and owner (mine true/false). --mine true keeps only your tiles. AgentBridge v9.',

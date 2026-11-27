@@ -86,6 +86,9 @@ Observation and output (batch 6):
   the list holds every company and ids need not start at your company. `summary` gets the same
   `date` and `me` header.
 - `companies` gains `date`; every row and `history` row gains `profit` (income + expenses).
+- `tiles --format text` (up to 80x80): one character per tile (class letter, upper case = owned by
+  your company), an x ruler and rows `"y|chars"`. `tiles --x --y --radius R` instead of the corners
+  (both formats). The box is clipped to the map.
 
 ## 0.7.0 (2026-11-26)
 

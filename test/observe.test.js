@@ -53,3 +53,26 @@ test('companies rows and history carry profit; the list carries date', async () 
   assert.ok(me.history.length >= 1);
   for (const h of me.history) assert.equal(h.profit, h.income + h.expenses);
 });
+
+test('tilesText: one char per tile, rulers, upper case for own tiles', () => {
+  const t = tilesText({ x0: 8, y0: 9, x1: 11, y1: 10 }, (x, y) => (x === 10 ? 'r' : 'b'), (x, y) => (x === 10 && y === 9 ? 0 : x === 10 ? 1 : undefined), 0);
+  assert.deepEqual(t.x_ruler, ['     11', '   8901']);
+  assert.deepEqual(t.rows, [' 9|bbRb', '10|bbrb']);
+  assert.equal(splitBox({ x0: 0, y0: 0, x1: 79, y1: 50 }, 40).length, 4);
+  assert.deepEqual(tileBox({ x: 2, y: 3, radius: 4 }, 64, 64), { x0: 0, y0: 0, x1: 6, y1: 7 });
+  assert.throws(() => tileBox({ x0: 1 }, 64, 64), /bad_arguments/);
+});
+
+test('tiles --format text and --radius', async () => {
+  const t = await run('tiles', { x: 13, y: 20, radius: 1, format: 'text' });
+  assert.equal(t.ok, true, JSON.stringify(t));
+  assert.equal(t.rows.length, 3);
+  assert.equal(t.rows[1].length, '20|'.length + 3);
+  assert.match(t.rows[1], /[A-Z]/, 'own tiles upper case');
+  assert.match(t.legend, /UPPER case/);
+  const big = await run('tiles', { x0: 0, y0: 0, x1: 63, y1: 63, format: 'text' });
+  assert.equal(big.rows.length, 64);
+  await assert.rejects(run('tiles', { x0: 0, y0: 0, x1: 63, y1: 63 }), /max 40x40/);
+  const json = await run('tiles', { x: 13, y: 20, radius: 1 });
+  assert.equal(json.rows.length, 3);
+});
