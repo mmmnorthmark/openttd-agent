@@ -1,7 +1,7 @@
 // IdleAI: owns a company and does nothing. Used only so a dedicated server
 // without human clients has a company for the AgentBridge GameScript to act as.
 class IdleAI extends AIInfo {
-	function GetAuthor()      { return "openttd-agent-research"; }
+	function GetAuthor()      { return "openttd-agent"; }
 	function GetName()        { return "IdleAI"; }
 	function GetDescription() { return "Does nothing; lets a GameScript build for this company."; }
 	function GetVersion()     { return 1; }

@@ -177,7 +177,7 @@ Each relay token can live in its own profile instead of the shared config, so ag
 to export a token on every call:
 
 ```sh
-openttd-agent --profile alice configure --relay http://192.168.1.20:47978 --token <alice's token>
+openttd-agent --profile alice configure --relay http://192.0.2.20:47978 --token <alice's token>
 openttd-agent --profile alice status                 # or: OPENTTD_AGENT_PROFILE=alice openttd-agent status
 OPENTTD_AGENT_PLAYER_FILE=/path/to/alice.json openttd-agent status   # any JSON file with relay + relay_token (or token)
 ```

@@ -116,8 +116,8 @@ test('adminHostForBind: wildcard and loopback -> 127.0.0.1, a LAN address -> its
   const { adminHostForBind } = await import('../src/commands.js');
   assert.equal(adminHostForBind('0.0.0.0'), '127.0.0.1');
   assert.equal(adminHostForBind('127.0.0.1'), '127.0.0.1');
-  assert.equal(adminHostForBind('10.0.0.5'), '10.0.0.5');
-  assert.equal(adminHostForBind('10.0.0.5,127.0.0.1'), '10.0.0.5');
+  assert.equal(adminHostForBind('192.0.2.5'), '192.0.2.5');
+  assert.equal(adminHostForBind('192.0.2.5,127.0.0.1'), '192.0.2.5');
 });
 
 test('findTown: id, exact name, then station-style names and unique prefixes (L13)', async () => {

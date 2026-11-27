@@ -227,7 +227,7 @@ export function profileDir(name) {
 
 /**
  * Where this machine's CLI reaches the admin port of a server bound to `bind`: 127.0.0.1 for a
- * wildcard or loopback bind, else the bound address itself (a server on 10.0.0.5 only does not
+ * wildcard or loopback bind, else the bound address itself (a server on 192.0.2.5 only does not
  * answer on 127.0.0.1). Several addresses: the first.
  */
 export function adminHostForBind(bind) {

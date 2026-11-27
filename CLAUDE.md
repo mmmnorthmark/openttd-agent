@@ -1,7 +1,7 @@
 # openttd-agent
 
 Shared package (public): CLI + MCP + AgentBridge GameScript for agent-driven OpenTTD companies on a LAN.
-Research and design history: ~/code-local/openttd-agent-research/FINDINGS.md.
+Design notes live outside this repo; this file is the project memory for agents working on it.
 
 - Access model (0.2.0): players never get the admin password. Host runs `openttd-agent relay` (`src/relay.js`, port 47978): the only admin-port client; per-player tokens (`src/relay-players.js`, SHA-256 only, `~/.openttd-agent/relay-players.json`), company forced per request, audit in `relay-audit.jsonl`. Commands run on the relay (shared map mirror); a player's `runCommand` forwards any `session: true` command when `cfg.relay` is set (`src/relay-client.js`).
 - Relay policy is `authorize()` in `src/relay.js`: groups game/world/build/operate only; a new group is host-only until added there. Every command that changes the game or reads company data must take `company` (use `who`/`act`) or the relay cannot force it; `test/relay.test.js` fails otherwise.
@@ -9,8 +9,8 @@ Research and design history: ~/code-local/openttd-agent-research/FINDINGS.md.
 - One command registry: `src/commands.js`. CLI (`bin/`), daemon (`src/daemon.js`) and MCP (`src/mcp.js`) are thin wrappers. Add commands only there.
 - GS ↔ admin protocol: `docs/PROTOCOL.md`. Keep GS replies < 1100 B; return arrays for big data.
 - Bump `GetVersion()` in `gamescript/AgentBridge/info.nut` whenever main.nut changes, and `bridge_version` in main.nut's `info` reply with it (clients gate features on it; a unit test checks they match).
-- Releases (Matthew, 2026-11-25): semver, one annotated tag `vX.Y.Z` per release. Release commit = package.json version + dated CHANGELOG section + README `#vX.Y.Z` references. `main` may run ahead under "(unreleased)". Agents commit and tag locally (NAS backup is automatic); Matthew pushes to GitHub with `--follow-tags`.
-- Public = generic mechanism only (explicit params, neutral defaults). Strategy, recipes, drivers and prompts belong to the private skills repo; never reference it here. No personal names, paths or IPs in code, tests or docs.
+- Releases (2026-11-25): semver, one annotated tag `vX.Y.Z` per release. Release commit = package.json version + dated CHANGELOG section + README `#vX.Y.Z` references. `main` may run ahead under "(unreleased)". Agents commit and tag locally; the maintainer pushes to GitHub with `--follow-tags`.
+- Public = generic mechanism only (explicit params, neutral defaults). Strategy, play recipes, drivers and prompts stay out of this repo. No personal names, paths or IPs in code, tests or docs (`tools/check_public.sh`, part of `npm run check`, enforces it; examples use RFC 5737 addresses 192.0.2.x / 198.51.100.x / 203.0.113.x).
 - Tests: `npm test` (fake admin server in test/fake-server.js mirrors GS commands; extend it with every new GS command).
 - Verified GS API names against OpenTTD 15.3 headers (src/script/api). Check new ones the same way before use.
 - State changes are **exec steps**: add an op to `ExecStep` in main.nut, mirror it in the fake server's `exec`, and build the step list in the command (`run(ctx, a, steps)`). Never add a one-off GS build handler.

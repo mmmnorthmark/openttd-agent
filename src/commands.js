@@ -1289,7 +1289,7 @@ export const COMMANDS = [
     name: 'configure', group: 'setup', session: false,
     description: `Save settings to ${CONFIG_FILE} (with the global --profile NAME or OPENTTD_AGENT_PROFILE: to ~/.openttd-agent/players/NAME.json instead, so several players or agents on one machine each keep their own relay token). PLAYER: relay (http://<host-LAN-IP>:<port>) and token, both from the host; game commands then go through the host's relay as the company the host bound you to. HOST: admin_password (stays on this machine), admin_port, relay_port. Either: max_builds_per_minute (0 = unlimited). relay "" switches back to the admin port directly.`,
     args: z.object({
-      relay: z.string().optional().describe('player: relay URL, e.g. http://192.168.1.20:47978 ("" = off)'),
+      relay: z.string().optional().describe('player: relay URL, e.g. http://192.0.2.20:47978 ("" = off)'),
       token: z.string().optional().describe('player: token from the host (relay-add-player)'),
       host: z.string().optional(), admin_port: int().optional(), admin_password: z.string().optional().describe('host only'),
       relay_port: int().min(1).max(65535).optional().describe('host: port the relay listens on'),
@@ -1299,7 +1299,7 @@ export const COMMANDS = [
     run: (_ctx, { token, ...a }) => {
       if (a.relay) {
         let url;
-        try { url = new URL(a.relay); } catch { throw new Error(`relay must be a URL like http://192.168.1.20:47978, got '${a.relay}'`); }
+        try { url = new URL(a.relay); } catch { throw new Error(`relay must be a URL like http://192.0.2.20:47978, got '${a.relay}'`); }
         if (url.protocol !== 'http:') throw new Error('relay must be an http:// URL (the relay speaks plain HTTP on the LAN)');
         a.relay = url.origin;
       }
