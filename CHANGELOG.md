@@ -79,6 +79,13 @@ CLI/MCP parity and the output contract (batches 1 and 2):
   timeouts off); one overall timeout `OPENTTD_AGENT_CALL_TIMEOUT_S` (default 3600 s).
 - `test/parity.test.js`: every command through the CLI and MCP against identical fake servers.
 
+Observation and output (batch 6):
+
+- `status` gains `date` ("YYYY-MM-DD") and `me` (your company's row: money, loan, max_loan, value,
+  cargo_delivered, performance, profit of the last full quarter). Read `me`, never `companies[0]`:
+  the list holds every company and ids need not start at your company. `summary` gets the same
+  `date` and `me` header.
+
 ## 0.7.0 (2026-11-26)
 
 AgentBridge GameScript v12: hosts must run `install-gamescript` and reload the game. Older GameScripts get clear refusals or fallbacks. List outputs and `first_error` changed shape (below), so scripts that parse them need updating.

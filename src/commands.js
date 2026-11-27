@@ -26,6 +26,8 @@ import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhatt
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
 import { takeOutputArgs, shapeResult } from './output.js';
+import { dateString, meFromCompanies, companyProfit, tilesText, splitBox, tileBox, filterStations, wordList, filterEvents, eventLine,
+  shortStationLine, shortVehicleLine, fleetLine, goalLine, problemLine, rivalLine } from './observe.js';
 import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
@@ -1516,7 +1518,7 @@ export const COMMANDS = [
   // ---- game -------------------------------------------------------------------
   {
     name: 'status', group: 'game', session: true,
-    description: 'Game date, map size, pause state, your company, rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge), background_jobs (queued vehicle sales and wagon jobs, the periodic save; kept in ~/.openttd-agent/jobs-<host>-<port>.json per game, so they survive a daemon restart) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
+    description: 'Game date (`date` "YYYY-MM-DD"; raw in info), map size, pause state, your company (`me`: money, loan, max_loan, value, cargo_delivered, performance, profit of the last full quarter; never read companies[0], it is not necessarily you), rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge), background_jobs (queued vehicle sales and wagon jobs, the periodic save; kept in ~/.openttd-agent/jobs-<host>-<port>.json per game, so they survive a daemon restart) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
     args: z.object({}),
     run: async (ctx) => {
       const s = await ctx.session();
@@ -1528,7 +1530,7 @@ export const COMMANDS = [
       if (bundled !== null && running !== null && running < bundled) {
         warnings.push(`the game runs AgentBridge v${running}; this openttd-agent ${VERSION} ships v${bundled}. Host: openttd-agent install-gamescript, then load or launch the game again (a running game keeps its GameScript); until then newer features say so or fall back`);
       }
-      return { info, my_company: s.cfg.company, companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
+      return { date: dateString(info), info, my_company: s.cfg.company, me: meFromCompanies(companies, s.cfg.company), companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
         tile_mirror: { rows_loaded: loaded, rows_total: s.map.sizeY, load_ms: s.tileLoadMs ?? null },
         versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, background_jobs: s.backgroundJobs(), warnings };
     },
@@ -2023,17 +2025,18 @@ export const COMMANDS = [
   },
   {
     name: 'summary', group: 'operate', session: true,
-    description: 'One compact text line per vehicle and per station, for a quick look without big JSON: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination"; stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
+    description: 'One compact text line per vehicle and per station, for a quick look without big JSON. Header: date and me (money, loan, max_loan, value, performance, profit of the last quarter). Lines: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination"; stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
     args: z.object({ ...who, group: int().optional(), vehicles: ids().optional(), stations: z.string().optional().describe('comma-separated station ids or names'),
       what: z.enum(['all', 'vehicles', 'stations']).default('all'), limit: int().min(1).default(200) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const [stationRows, info, companyRows] = await Promise.all([s.gs.call('stations', { company }), s.gs.call('info'), s.gs.call('companies')]);
+      const stations = stationsFromRows(stationRows, s.cargos);
       const names = new Map(stations.map((st) => [st.id, st.name]));
       const picked = a.group !== undefined || a.vehicles || a.stations;
       const wantV = a.what !== 'stations' && (!picked || a.group !== undefined || a.vehicles);
       const wantS = a.what !== 'vehicles' && (!picked || a.stations);
-      const out = { company };
+      const out = { company, date: dateString(info), me: meFromCompanies(companyRows, company) };
       if (wantV) {
         const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
         const hit = all.filter((v) => (a.group === undefined || v.group === a.group) && (!a.vehicles || a.vehicles.includes(v.id))).sort((p, q) => p.profit_last_year - q.profit_last_year);
