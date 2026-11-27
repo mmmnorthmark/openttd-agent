@@ -21,7 +21,7 @@ import { ratingTable, vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMat
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, spreadLoops, plannedRail, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
-import { traceRail, traceRoad, trackExits, findLoops, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
+import { traceRail, traceRoad, trackExits, trackEdges, findLoops, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
@@ -1171,6 +1171,37 @@ async function signalRemoveRefusal(s, a) {
   if (t.signals & (1 << (4 + d))) return null;
   const others = [0, 1, 2, 3].filter((k) => t.signals & (1 << (4 + k))).map((k) => `(${a.x + TRACE_DIRS[k][0]},${a.y + TRACE_DIRS[k][1]})`);
   return `no_signal_here: no signal on (${a.x},${a.y}) facing trains from (${a.front_x},${a.front_y})${others.length ? `; it has one facing trains from ${others.join(' and ')}: give that as --front_x/--front_y` : '; the tile has no signals'}`;
+}
+
+/**
+ * The passing loop whose track holds the signal tile (x, y), or null: walk the track both ways to
+ * the nearest points, then findLoops on that stretch (AgentBridge v9). Used to refuse removing a
+ * loop's signal (without it both trains enter the loop from opposite ends and crash or jam).
+ */
+async function loopOfTile(s, x, y) {
+  const getTile = railTileSource(s);
+  const t = await getTile(x, y);
+  if (!t || t.kind !== 't') return null;
+  const edges = [...trackEdges(t.tracks)];
+  if (edges.length !== 2) return null;
+  const toPoints = async (edge) => {
+    const out = [];
+    let cx = x + TRACE_DIRS[edge][0], cy = y + TRACE_DIRS[edge][1], entry = (edge + 2) % 4;
+    for (let n = 0; n < 60; n++) {
+      const u = await getTile(cx, cy);
+      if (!u || !['t', 's', 'w'].includes(u.kind) || !trackEdges(u.tracks).has(entry)) return null;
+      out.push({ x: u.x, y: u.y });
+      if (trackEdges(u.tracks).size >= 3) return out;
+      const ex = trackExits(u.tracks, entry);
+      if (ex.length !== 1) return null;
+      cx += TRACE_DIRS[ex[0]][0]; cy += TRACE_DIRS[ex[0]][1]; entry = (ex[0] + 2) % 4;
+    }
+    return null;
+  };
+  const back = await toPoints(edges[0]), ahead = await toPoints(edges[1]);
+  if (!back || !ahead) return null;
+  const path = [...back.reverse(), { x, y }, ...ahead];
+  return (await findLoops({ path, getTile })).find((l) => l.from_index === 0 && l.to_index === path.length - 1) ?? null;
 }
 
 /**
@@ -2714,13 +2745,19 @@ export const COMMANDS = [
   },
   {
     name: 'build-signal', group: 'build', session: true,
-    description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it (refused with no_signal_here when there is none facing that way). The track must exist; in a template\'s dry run, signals on track it lays show skipped_in_dry_run.',
-    args: z.object({ ...act, ...point, ...front, type: z.enum(Object.keys(SIGNAL_TYPES)).default('path'), two_way: bool().default(false), remove: bool().default(false) }),
+    description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it (refused with no_signal_here when there is none facing that way, and with loop_signal when the tile is on a passing loop: without that signal two trains can enter the loop from both ends; --force true removes it anyway). The track must exist; in a template\'s dry run, signals on track it lays show skipped_in_dry_run.',
+    args: z.object({ ...act, ...point, ...front, type: z.enum(Object.keys(SIGNAL_TYPES)).default('path'), two_way: bool().default(false), remove: bool().default(false),
+      force: bool().default(false).describe('remove: also remove a passing loop\'s signal') }),
     run: async (ctx, a) => {
       if (a.remove) {
         const { s } = await mine(ctx, a);
         const why = await signalRemoveRefusal(s, a);
         if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: why.split(':')[0], steps_done: 0, results: [] };
+        const loop = a.force ? null : await loopOfTile(s, a.x, a.y);
+        if (loop) {
+          return { ok: false, dry_run: a.dry_run, first_error: 'loop_signal', steps_done: 0, results: [], loop: { x: loop.at.x, y: loop.at.y, end: loop.end, clear_tiles: loop.clear_tiles },
+            error: `loop_signal: (${a.x},${a.y}) is on the passing loop between the points at (${loop.at.x},${loop.at.y}) and (${loop.end.x},${loop.end.y}); without this signal trains from both ends can enter the loop and crash or jam. Nothing was removed. To take the whole loop out use build-passing-loop --remove true; to remove only this signal pass --force true` };
+        }
         return run(ctx, a, [['signal_remove', a.x, a.y, a.front_x, a.front_y]]);
       }
       return run(ctx, a, [['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]);

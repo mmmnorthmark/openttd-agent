@@ -281,6 +281,22 @@ test('build-signal --remove: no_signal_here instead of ERR_PRECONDITION_FAILED',
   assert.equal((await run('build-signal', { x: 5, y: 5, front_x: 7, front_y: 5, remove: true })).first_error, 'front_not_adjacent');
 });
 
+test('build-signal --remove: a passing loop\'s signal is refused (loop_signal) unless --force', async () => {
+  fake.state.railLoop = true; // points (15,20) and (20,20), loop track (15..20,19), signals (18,20) and (17,19)
+  try {
+    const before = execs().length;
+    for (const [x, y, fx, fy] of [[18, 20, 19, 20], [17, 19, 16, 19]]) {
+      const res = await run('build-signal', { x, y, front_x: fx, front_y: fy, remove: true });
+      assert.deepEqual([res.ok, res.first_error, res.loop.x, res.loop.y, res.loop.end], [false, 'loop_signal', 15, 20, { x: 20, y: 20 }], `(${x},${y})`);
+      assert.match(res.error, /--force true/);
+    }
+    assert.equal(execs().length, before, 'nothing was sent');
+    const forced = await run('build-signal', { x: 17, y: 19, front_x: 16, front_y: 19, remove: true, force: true });
+    assert.equal(forced.ok, true);
+    assert.deepEqual(lastExec().steps, [['signal_remove', 17, 19, 16, 19]]);
+  } finally { fake.state.railLoop = false; }
+});
+
 test('road stops and depots: connected, --connect auto, decoded drive-through refusals', async () => {
   const dep = await run('build-road-depot', { x: 38, y: 12, front_x: 38, front_y: 11, connect: 'auto' });
   assert.equal(dep.ok, true);
