@@ -16,6 +16,7 @@ import { GSRpc } from './gs-rpc.js';
 import { CONFIG_DIR } from './config.js';
 import { profileDir, adminHostForBind, iniValue, SERVER_STATE_FILE, bundledGsVersion, installGamescript, checkSaveName } from './setup.js';
 import { log } from './log.js';
+import { loadProblem, loadProblemText } from './preflight.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const LOG_TAIL_LINES = 20;
@@ -283,7 +284,7 @@ async function setPausedConsole(admin, gs, want) {
  * Load a save by name on the running server (H1): `ls` to refresh the list, load by index,
  * wait for the new game and for AgentBridge. pause: true/false sets the pause state after; undefined keeps the save's.
  */
-export async function loadSave(admin, gs, name, { pause, timeoutMs = 60000, minVersion } = {}) {
+export async function loadSave(admin, gs, name, { pause, timeoutMs = 60000, minVersion, dir } = {}) {
   const started = Date.now();
   const want = String(name).replace(/\.sav$/i, '');
   const list = parseLs(await admin.rcon('ls', 15000));
@@ -295,8 +296,15 @@ export async function loadSave(admin, gs, name, { pause, timeoutMs = 60000, minV
   const loaded = nextWelcome(admin, timeoutMs);
   loaded.catch(() => {});
   const out = await admin.rcon(`load ${entry.index}`, 30000);
+  const problem = loadProblem(out.join(' '));
+  if (problem) throw new Error(`${loadProblemText(problem)} (console: ${out.join(' ').slice(0, 300)})`);
   if (out.some((l) => /cannot be found|is not a|failed/i.test(l))) throw new Error(`load_failed: server refused 'load ${entry.index}' (${entry.name}): ${out.join(' ')}`);
-  const welcome = await loaded;
+  let welcome;
+  try { welcome = await loaded; } catch (e) {
+    // A refused load shows only in the server log (the console stays quiet): name the cause when it is known.
+    const why = dir ? loadProblem(logTail(dir, { lines: 30 }).lines.join(' ')) : null;
+    throw why ? new Error(`${loadProblemText(why)} (${entry.name})`) : e;
+  }
   const info = await waitGs(gs, 30000, minVersion);
   if (!info) throw new Error(`gs_timeout: loaded ${entry.name} but AgentBridge did not answer within 30 s (the save may run another GameScript or none; see server-log --errors true)`);
   const now = pause === undefined ? info : await setPausedConsole(admin, gs, pause);
@@ -372,7 +380,7 @@ export async function reloadGamescript(target, { saveName } = {}) {
     const rescan = await admin.rcon('rescan_game', 30000);
     const name = saveName ?? `gs-reload-${new Date().toISOString().replace(/[-:]/g, '').replace(/\..*$/, '').replace('T', '-')}`;
     const saved = await saveAndWait(admin, target, name);
-    const loaded = await loadSave(admin, gs, name, { pause: before ? before.paused : undefined, minVersion: want ?? undefined });
+    const loaded = await loadSave(admin, gs, name, { pause: before ? before.paused : undefined, minVersion: want ?? undefined, dir: target.dir });
     const ok = want === null || (loaded.bridge_version ?? 0) >= want;
     log.info('host', 'gamescript reloaded', { server: target.server, before: before?.bridge_version, now: loaded.bridge_version });
     return { ok, ...(ok ? {} : { error: `gs_version: the game still runs AgentBridge v${loaded.bridge_version} after the reload (v${want} installed); check server-log --errors true` }),

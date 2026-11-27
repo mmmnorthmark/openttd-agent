@@ -8,10 +8,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import * as z from 'zod/v4';
-import { doctor, installGamescript, launch, findExecutable, checkSaveName, bundledGsVersion, adminHostForBind, profileDir, TERRAIN_TYPES } from './setup.js';
+import { doctor, installGamescript, launch, findExecutable, findPersonalDir, checkSaveName, bundledGsVersion, adminHostForBind, profileDir, TERRAIN_TYPES } from './setup.js';
 import { serverTarget, serverStates, profilePorts, serverPids, waitReady, notReadyDetail, stopServer, withAdmin, loadSave, listSaves, companyNew, reloadGamescript, logTail, portOpen } from './host.js';
 import { VERSION } from './version.js';
-import { connectionHint, diagnoseAddress, hostCheck, playerCheck } from './netcheck.js';
+import { connectionHint, diagnoseAddress, hostCheck, playerCheck, listeners } from './netcheck.js';
+import { installOpenGfx, findBasesets, freeBytes, diskWarning, keepAwakeHint, portHolderText } from './preflight.js';
 import { classifyVersion, versionRefusal, acceptUntested, detectInstalledVersion, compareHostClient, installHint } from './versions.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
@@ -1913,6 +1914,12 @@ export const COMMANDS = [
     run: async (ctx, a) => (a.reload ? reloadGamescript(serverTarget(ctx.cfg, a.server), { saveName: a.save_name !== undefined ? checkSaveName(a.save_name) : undefined }) : installGamescript()),
   },
   {
+    name: 'install-opengfx', group: 'setup', session: false,
+    description: 'Download the free OpenGFX base graphics (official release from cdn.openttd.org, sha256 checked against its manifest) into your OpenTTD baseset folder. Needed when OpenTTD has no base graphics (doctor: base_graphics.found false); a dedicated server does not start without one. Does nothing when OpenGFX is already there. --dry_run true says what it would download.',
+    args: z.object({ dry_run: bool().default(false).describe('true = only say what it would download and where') }),
+    run: (_ctx, a) => installOpenGfx(findPersonalDir(), { dryRun: a.dry_run }),
+  },
+  {
     name: 'configure', group: 'setup', session: false,
     description: `Save settings to ${CONFIG_FILE} (with the global --profile NAME or OPENTTD_AGENT_PROFILE: to ~/.openttd-agent/players/NAME.json instead, so several players or agents on one machine each keep their own relay token). PLAYER: relay (http://<host-LAN-IP>:<port>) and token, both from the host; game commands then go through the host's relay as the company the host bound you to. HOST: admin_password (stays on this machine), admin_port, relay_port. Either: max_builds_per_minute (0 = unlimited). relay "" switches back to the admin port directly.`,
     args: z.object({
@@ -2033,9 +2040,16 @@ export const COMMANDS = [
       if (hosting) {
         const busy = [];
         for (const p of [adminPort, gamePort]) if (await portOpen(host, p)) busy.push(p);
-        if (busy.length) throw new Error(`port_in_use: port ${busy.join(' and ')} on ${host} is taken by another program or server (not profile '${server}'). Pick others: launch --server ${server === a.mode ? 'NAME' : server} --game_port N --admin_port M`);
+        if (busy.length) throw new Error(`port_in_use: ${busy.map((p) => portHolderText(p, listeners(p))).join(' and ')} on ${host} is taken by another program or server (not profile '${server}'). Pick others: launch --server ${server === a.mode ? 'NAME' : server} --game_port N --admin_port M`);
       }
       const { result, child } = launch(opts);
+      result.openttd = { version: ottd.version, class: ottd.class };
+      const notes = [];
+      if (hosting && !findBasesets(findPersonalDir()).length) notes.push('no base graphics found: a dedicated server will not start without one. Run openttd-agent install-opengfx, then launch again');
+      const low = diskWarning(freeBytes(dir), `saves in ${dir}`);
+      if (low) notes.push(low);
+      if (hosting) { const awake = keepAwakeHint(result.pid); if (awake) result.keep_awake = awake; }
+      if (notes.length) result.warnings = notes;
       let exitCode;
       child.on('exit', (code, signal) => { exitCode = code ?? signal; });
       // The relay and the CLI on this machine read the password and admin address from the config, so keep them in step
@@ -2086,7 +2100,7 @@ export const COMMANDS = [
     args: z.object({ ...serverArg, name: z.string().describe('save name as `saves` lists it (with or without .sav)'), pause: bool().optional().describe('true = pause after loading, false = unpause; default as saved') }),
     run: async (ctx, a) => {
       const t = serverTarget(ctx.cfg, a.server);
-      return { server: t.server, ...(await withAdmin(t, (admin, gs) => loadSave(admin, gs, checkSaveName(a.name), { pause: a.pause }))) };
+      return { server: t.server, ...(await withAdmin(t, (admin, gs) => loadSave(admin, gs, checkSaveName(a.name), { pause: a.pause, dir: t.dir }))) };
     },
   },
   {

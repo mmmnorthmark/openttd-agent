@@ -14,6 +14,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { CONFIG_DIR } from './config.js';
 import { log } from './log.js';
+import { nodeProblem, findBasesets, freeBytes, diskWarning } from './preflight.js';
 import { detectInstalledVersion, classifyVersion, installHint, TESTED_VERSIONS } from './versions.js';
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -87,6 +88,17 @@ export function doctor() {
   report.openttd = { version: detected.version, class: exe ? cls.class : 'not_installed', tested: cls.tested, tested_versions: TESTED_VERSIONS,
     source: detected.source, ...(exe ? (cls.tested ? {} : { message: detected.version ? cls.message : `version not detected (${detected.error})` }) : { message: installHint() }) };
   report.next_steps = [];
+  const nodeIssue = nodeProblem();
+  report.node_ok = !nodeIssue;
+  if (nodeIssue) report.next_steps.push(nodeIssue);
+  const sets = findBasesets(personal);
+  report.base_graphics = { sets, found: sets.length > 0 };
+  if (!sets.length) report.next_steps.push('No base graphics found: run openttd-agent install-opengfx (downloads the free OpenGFX set from cdn.openttd.org into your OpenTTD baseset folder), or open OpenTTD once and accept its offer to download OpenGFX');
+  if (!report.personal_dir_exists) report.next_steps.push(`OpenTTD has never run on this machine (no ${personal}): open it once from your apps menu, then quit; it creates its folders`);
+  const free = freeBytes(CONFIG_DIR);
+  report.disk_free_mb = free === null ? null : Math.round(free / 1024 / 1024);
+  const low = diskWarning(free, `saves in ${CONFIG_DIR}`);
+  if (low) report.next_steps.push(low);
   if (!exe) report.next_steps.push(installHint());
   else if (detected.version && !cls.tested) report.next_steps.push(cls.message);
   const q = exe ? quarantine(exe) : null;

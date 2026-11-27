@@ -121,8 +121,11 @@ starts nothing and prints no secrets; agents should run it first.
 1. **Same OpenTTD version everywhere** (a tested one: 14.0-15.3): `openttd-agent doctor` prints
    `openttd.version` and its class; `status` compares the server's version with this machine's.
 2. **Node 20+**, and the same openttd-agent tag as the host (`guide` on a player compares them).
-3. **Graphics:** OpenGFX is fine. To use the original TTD graphics, put your own original files in
-   `Documents/OpenTTD/baseset`. Run OpenTTD once on each machine.
+3. **Graphics:** OpenGFX is fine: `openttd-agent install-opengfx` downloads the official release
+   (sha256 checked) when `doctor` says `base_graphics.found: false`. To use the original TTD graphics,
+   put your own original files in `Documents/OpenTTD/baseset`. Run OpenTTD once on each machine.
+4. **First time?** `openttd-agent guide` checks Node, the OpenTTD version, that OpenTTD was opened
+   once, the base graphics and free disk space before anything else.
 
 ### Host
 
@@ -232,6 +235,13 @@ refusal: time, player, company, command, arguments, outcome).
   save runs the GameScript stored in it. `first_error: gs_died` means the server log shows the script
   died: `server-log --errors true` shows why.
 - **`admin_auth`:** the server refused the admin login (wrong password, or none set on the server).
+- **`port_in_use`:** the error names the program holding the port; stop it or launch with other ports
+  (`--server NAME --game_port N --admin_port M`).
+- **`save_too_new` / `newgrf_missing` on `load`:** the save comes from a newer OpenTTD, or uses NewGRFs the
+  server lacks. Players who see "NewGRF mismatch" when joining need the same NewGRFs: OpenTTD offers to
+  download them from online content in the join dialog.
+- **Everyone dropped at once:** the host went to sleep. `launch` prints `keep_awake` (macOS:
+  `caffeinate -dims -w <pid>`).
 
 ### Security notes
 

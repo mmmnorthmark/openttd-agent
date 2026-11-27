@@ -21,7 +21,7 @@ const BIN = path.resolve('bin/openttd-agent.js');
 // One case per command: args that run against the fake world (dry runs for builds, so both
 // servers stay identical), or a refusal where a real run would leave the machine.
 const CASES = {
-  doctor: {}, guide: {}, 'net-check': { role: 'player', target: '127.0.0.1', relay_port: 1, game_port: 1, fields: 'role,target,network,ports.port,ports.reachable' }, 'install-gamescript': {}, configure: { max_builds_per_minute: 0 }, 'show-config': {},
+  doctor: {}, guide: {}, 'net-check': { role: 'player', target: '127.0.0.1', relay_port: 1, game_port: 1, fields: 'role,target,network,ports.port,ports.reachable' }, 'install-gamescript': {}, 'install-opengfx': { dry_run: true }, configure: { max_builds_per_minute: 0 }, 'show-config': {},
   launch: { mode: 'dedicated', admin_password: 'pw', dry_run: true },
   'scenario-prepare': {},                       // refused: needs --content_id or --search (never downloads here)
   'relay-add-player': { name: 'bad name!' },    // refused: a real one prints a random token

@@ -29,6 +29,12 @@ Hardening (batch 8):
   connection now answers with `hint` and `network`; `configure --relay` with a private address on
   another network adds them too. README: "Playing over a network".
 - README "Bonus": a link to John Broomhall's 2014 re-recorded Transport Tycoon soundtrack (no audio bundled).
+- First-run checks: the CLI stops with `node_too_old` on Node < 20; `doctor` adds `node_ok`,
+  `base_graphics` (OpenGFX / original / other), `disk_free_mb` and next steps for a missing base set,
+  OpenTTD never opened and low disk; `install-opengfx` (new) downloads the official OpenGFX
+  (sha256 checked); `guide` starts with node / openttd-version / opened-once / base-graphics / disk
+  steps. `launch` names the program holding a busy port, warns about missing graphics and low disk,
+  and prints `keep_awake` (macOS `caffeinate`). `load` names `save_too_new` and `newgrf_missing`.
 - Public hygiene: `tools/check_public.sh` (part of `npm run check`) fails on personal names,
   paths, private IPs and hostnames; examples use RFC 5737 addresses.
 

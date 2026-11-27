@@ -16,6 +16,7 @@
 // Output: one-line JSON when stdout is not a terminal (or --compact true), else indented.
 // Exit code 0 when the result has ok: true, else 1 (failures print {"ok": false, "error": ..., "first_error": ...}).
 
+import '../src/node-check.js'; // first: a clear message on a too-old Node
 import readline from 'node:readline';
 import { COMMANDS_BY_NAME, describeCommands } from '../src/commands.js';
 import { loadConfig } from '../src/config.js';
