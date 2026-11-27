@@ -3235,7 +3235,9 @@ export const COMMANDS = [
           if (dry.ok) { depot = { x: d.x, y: d.y, front_x: d.front_x, front_y: d.front_y, cost: dry.cost, build: `build-road-depot --x ${d.x} --y ${d.y} --front_x ${d.front_x} --front_y ${d.front_y}` }; break; }
         }
       }
-      return { target: end.what, kind, candidates_on_map: cands.length, dry_runs: dryRuns, rejected, ...listResult('sites', sites, sites),
+      // Every candidate refused by the town: say who and why once (R8), not just a count.
+      const la = !sites.length && rejected.ERR_LOCAL_AUTHORITY_REFUSES ? await authorityDetail(s, company, ['road_station'], { x: end.point[0], y: end.point[1] }) : null;
+      return { target: end.what, kind, candidates_on_map: cands.length, dry_runs: dryRuns, rejected, ...listResult('sites', sites, sites), ...(la ? { local_authority: la } : {}),
         ...(depot !== undefined ? { depot } : {}),
         ...(sites.length < a.count ? { hint: `${sites.length} of ${a.count} sites found: try --radius ${Math.min(12, r + 3)}${a.spacing ? ', a smaller --spacing' : ''}${a.cargo ? ', or no --cargo' : ''}` } : {}) };
     },

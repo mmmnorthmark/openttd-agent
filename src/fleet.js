@@ -18,8 +18,11 @@ export function authorityNeed(op) {
   if (['rail_station', 'road_station', 'airport', 'dock'].includes(op)) {
     return { needed: -199, needed_text: 'a new station needs a rating above -200 (better than very_poor)' };
   }
-  if (op === 'road_remove' || op === 'demolish') {
-    return { needed: null, needed_text: 'removing town road needs 16 / 64 / 112 (lenient / neutral / hostile town_council_tolerance); town buildings lower the rating when removed' };
+  if (op === 'demolish') {
+    return { needed: null, needed_text: 'removing a town building needs a rating above what removing it costs (that house\'s rating penalty, often 100 or more); removing town road needs 16 / 64 / 112 (lenient / neutral / hostile town_council_tolerance). Cutting trees is never refused but lowers the rating' };
+  }
+  if (op === 'road_remove') {
+    return { needed: null, needed_text: 'removing town road needs 16 / 64 / 112 (lenient / neutral / hostile town_council_tolerance)' };
   }
   return { needed: null, needed_text: 'removing a town bridge or tunnel needs 144 / 208 / 400 (lenient / neutral / hostile town_council_tolerance)' };
 }
