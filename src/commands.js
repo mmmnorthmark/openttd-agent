@@ -188,7 +188,20 @@ async function loanState(s, company) {
 }
 
 /** Town by id or exact name (case-insensitive). */
-const findTown = (towns, v) => towns.find((t) => String(t.id) === String(v) || t.name.toLowerCase() === String(v).toLowerCase());
+/**
+ * Town by id or exact name (case-insensitive); else (L13) the longest town name a station-style
+ * name starts with ("Bigton Woods" -> Bigton), else the one town whose name starts with the text.
+ * A fallback match carries matched_from (what was asked).
+ */
+export function findTown(towns, v) {
+  const want = String(v).trim().toLowerCase();
+  const exact = towns.find((t) => String(t.id) === want || t.name.toLowerCase() === want);
+  if (exact || !want) return exact;
+  const prefixOf = towns.filter((t) => want.startsWith(`${t.name.toLowerCase()} `)).sort((p, q) => q.name.length - p.name.length)[0];
+  const startsWith = towns.filter((t) => t.name.toLowerCase().startsWith(want));
+  const hit = prefixOf ?? (startsWith.length === 1 ? startsWith[0] : undefined);
+  return hit ? { ...hit, matched_from: String(v) } : undefined;
+}
 
 /**
  * One end of a line: { industry } | { town } | { x, y } -> { targets: tiles to be near, catchment, what, point: [x,y] }.
@@ -205,7 +218,8 @@ function lineEnd(s, { towns, industries }, end) {
   if (end.town !== undefined) {
     const t = findTown(towns, end.town);
     if (!t) throw new Error(`town '${end.town}' not found; run: openttd-agent towns`);
-    return { targets: [[t.x, t.y]], catchment: 4, what: `${t.name} centre ${t.x},${t.y}`, point: [t.x, t.y], kind: 'town', town: t };
+    const matched = t.matched_from ? ` (matched_town: '${t.matched_from}' -> ${t.name})` : '';
+    return { targets: [[t.x, t.y]], catchment: 4, what: `${t.name} centre ${t.x},${t.y}${matched}`, point: [t.x, t.y], kind: 'town', town: t };
   }
   if (end.x !== undefined && end.y !== undefined) return { targets: [[end.x, end.y]], catchment: 2, what: `tile ${end.x},${end.y}`, point: [end.x, end.y], kind: 'tile' };
   throw new Error('give --industry, --town, or --x and --y');

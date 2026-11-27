@@ -119,3 +119,14 @@ test('adminHostForBind: wildcard and loopback -> 127.0.0.1, a LAN address -> its
   assert.equal(adminHostForBind('10.0.0.5'), '10.0.0.5');
   assert.equal(adminHostForBind('10.0.0.5,127.0.0.1'), '10.0.0.5');
 });
+
+test('findTown: id, exact name, then station-style names and unique prefixes (L13)', async () => {
+  const { findTown } = await import('../src/commands.js');
+  const towns = [{ id: 1, name: 'Bigton' }, { id: 2, name: 'Bigton Falls' }, { id: 3, name: 'Smallham' }];
+  assert.equal(findTown(towns, '3').name, 'Smallham');
+  assert.equal(findTown(towns, 'bigton').matched_from, undefined);
+  assert.deepEqual([findTown(towns, 'Bigton Falls Halt').name, findTown(towns, 'Bigton Falls Halt').matched_from], ['Bigton Falls', 'Bigton Falls Halt']);
+  assert.equal(findTown(towns, 'Bigton Woods').name, 'Bigton');
+  assert.equal(findTown(towns, 'small').name, 'Smallham');
+  assert.equal(findTown(towns, 'Big'), undefined, 'two towns start with Big');
+});

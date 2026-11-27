@@ -62,6 +62,8 @@ CLI/MCP parity and the output contract (batches 1 and 2):
 - A JSON number works for a text argument (`join: 12`). Read commands and dry runs clamp an
   out-of-range number (`clamped`); read commands ignore `--dry_run`/`--list`, `vehicle-depot`
   ignores `--depot auto` (`ignored_args`). CLI: a bare word after a value joins it with a space.
+  Town arguments of line ends (`build-cargo-route`, `build-truck-route`, `station-sites`) accept a
+  station-style name ("Bigton Woods" -> Bigton) or a unique prefix; the target says `matched_town`.
 - Read-only mode: `OPENTTD_AGENT_READ_ONLY=1` or `mcp --read_only true` forces dry runs
   (`forced_dry_run: true`) and refuses other actions. `OPENTTD_AGENT_TOOLS=a,b` limits the CLI and
   `help` like `mcp --tools`. A relay player's MCP server lists only the tools the relay serves.
