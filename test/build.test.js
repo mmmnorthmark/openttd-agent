@@ -488,3 +488,23 @@ test('ERR_VEHICLE_IN_THE_WAY: transient, vehicles_in_the_way, blocked_by_vehicle
     assert.deepEqual(loop.results.map((r) => r.step), [...Array(loop.steps_total).keys()]);
   } finally { fake.state.inTheWay = null; }
 });
+
+test('build-cargo-route --if_exists: refuse (default), skip, add_train, build (L2)', async () => {
+  // Train 13 runs Bigton Woods (3, by the forest) -> Sawmill Yard (21, by the sawmill): the route exists.
+  fake.state.lostTrain = true;
+  fake.state.newStations = [[21, 'Sawmill Yard', 50, 22, 1, [], 1]];
+  fake.state.train13To = { id: 21, x: 50, y: 22, name: 'Sawmill Yard' };
+  const args = { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true };
+  try {
+    const refused = await run('build-cargo-route', args);
+    assert.deepEqual([refused.ok, refused.failed_step, refused.first_error, refused.existing.served_by], [false, 'existing_route', 'existing_route', 13]);
+    assert.match(refused.hint, /--if_exists add_train/);
+    const skip = await run('build-cargo-route', { ...args, if_exists: 'skip' });
+    assert.deepEqual([skip.ok, skip.action, skip.existing.served_by, skip.cost], [true, 'exists', 13, 0]);
+    const add = await run('build-cargo-route', { ...args, if_exists: 'add_train' });
+    assert.deepEqual([add.action, add.first_error], ['add_train', 'source_unprofitable'], 'add-train ran on train 13 (which loses money)');
+    const build = await run('build-cargo-route', { ...args, if_exists: 'build', reuse_stations: 'never' });
+    assert.equal(build.ok, true);
+    assert.equal(build.action, undefined);
+  } finally { fake.state.lostTrain = false; fake.state.newStations = null; fake.state.train13To = null; }
+});

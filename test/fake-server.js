@@ -272,7 +272,7 @@ const GS = {
           profit_this_year: -200, profit_last_year: -900, value: 9000, running_cost: 800, state: 0, x: 30, y: 40, speed: 40, group: 2,
           wagons: 5, length: 80, capacity: [[7, 120, 0]], shared_orders: false, order_count: 2, current_order: 0, unit_number: 2, rail_type: 0 },
         [0, 'station', 12, 20, 96, 3, 'Bigton Woods', -1],
-        [1, 'station', 24, 20, 4, 5, 'Sawmill Halt', -1],
+        state.train13To ? [1, 'station', state.train13To.x, state.train13To.y, 4, state.train13To.id, state.train13To.name, -1] : [1, 'station', 24, 20, 4, 5, 'Sawmill Halt', -1],
       ];
     }
     if (a.vehicle !== 11) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${a.company}; run: openttd-agent vehicles`);
@@ -369,7 +369,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, railLoop: false, inTheWay: null, stationError: null, newStations: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, railLoop: false, inTheWay: null, stationError: null, newStations: null, train13To: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
   const server = net.createServer((sock) => {
     state.openConnections++;
     sock.on('close', () => { state.openConnections--; });
