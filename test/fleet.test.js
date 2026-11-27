@@ -182,3 +182,24 @@ test('vehicle-problems: --type and --problem filters', async () => {
   const only = await run('vehicle-problems', { problem: 'no_income', trace: false });
   assert.deepEqual([...new Set(only.problems.map((p) => p.problem))], ['no_income']);
 });
+
+// ---- G5 / C11: wait -----------------------------------------------------------------------
+
+test('wait: until a state, until loaded, game days, timeout and a paused game', async () => {
+  fake.state.trainInDepot = true;
+  try {
+    const d = await run('wait', { vehicles: '11', until: 'in_depot' });
+    assert.deepEqual([d.ok, d.done, d.vehicles[0].matched], [true, true, true]);
+  } finally { fake.state.trainInDepot = false; }
+  const l = await run('wait', { vehicles: '12', until: 'loaded', load_pct: 30 });
+  assert.deepEqual([l.ok, l.vehicles[0].load_pct], [true, 32]);
+  const days = await run('wait', { days: 2 });
+  assert.equal(days.ok, true);
+  assert.ok(days.game_days >= 2);
+  const t = await run('wait', { vehicles: '11', until: 'at_station', timeout_s: 1 });
+  assert.deepEqual([t.ok, t.first_error], [false, 'wait_timeout']);
+  assert.match(t.error, /not yet: 11 running/);
+  await assert.rejects(run('wait', { vehicles: '11' }), /--until/);
+  Object.assign(fake.state, { paused: true });
+  try { assert.equal((await run('wait', { days: 1 })).first_error, 'paused'); } finally { fake.state.paused = false; fake.state.runningSince = Date.now(); }
+});

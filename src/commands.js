@@ -29,7 +29,7 @@ import { takeOutputArgs, shapeResult } from './output.js';
 import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
-import { townRatingFromRow, authorityNeed, RATING_HINT, moneyDetail, soldText } from './fleet.js';
+import { townRatingFromRow, authorityNeed, RATING_HINT, moneyDetail, soldText, loadsFromRows, waitMatch, WAIT_STATES } from './fleet.js';
 
 // Strict numbers (0.8.0): plain z.number(); runCommand (parseArgs) turns a numeric string ("12", " -3 ")
 // into its number. null, "", false and [] are no longer 0 (company 0 is a real company).
@@ -2660,6 +2660,51 @@ export const COMMANDS = [
       if (((await s.gs.call('info')).bridge_version ?? 0) < 12) throw new Error('refused: vehicle-reverse needs AgentBridge v12 (the running GameScript is older); the host re-runs install-gamescript and loads the game again. Meanwhile vehicle-depot also turns a train round');
       const res = await run(ctx, a, a.vehicles.map((v) => ['veh_reverse', v]), { keepGoing: true });
       return { ...res, reversed: res.results.filter((r) => r.ok).map((r) => a.vehicles[r.step]), failed: res.results.filter((r) => !r.ok).map((r) => ({ vehicle: a.vehicles[r.step], error: r.error ?? 'failed' })) };
+    },
+  },
+  {
+    name: 'wait', group: 'operate', session: true,
+    description: `Wait in one call instead of polling: --vehicles A,B --until ${WAIT_STATES.join('|')} returns when every listed vehicle is there (--any true: the first one); loaded = cargo on board >= --load_pct (default 100) of capacity (AgentBridge v13); stopped includes stopped in a depot; sold = gone after a queued sale (vehicle-sell). --days N waits N game days (about 2 s each) instead. Checks once a second; --timeout_s (default 60, max 280: one call must answer within 5 minutes) ends it with first_error wait_timeout and where each vehicle is. A paused game refuses at once (paused: game days do not pass; the host runs turn-advance). Changes nothing.`,
+    args: z.object({ ...who, vehicles: ids().optional(), until: z.enum(WAIT_STATES).optional(), days: int().min(1).max(120).optional(),
+      any: bool().default(false).describe('done when any one vehicle matches'), load_pct: int().min(1).max(100).default(100).describe('until loaded: share of capacity'),
+      timeout_s: int().min(1).max(280).default(60) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      if ((a.vehicles === undefined) !== (a.until === undefined)) throw new Error('give --vehicles A,B with --until STATE, or --days N');
+      if (a.days === undefined && a.until === undefined) throw new Error('give --vehicles A,B --until STATE, or --days N');
+      const started = Date.now();
+      const first = await s.gs.call('info');
+      const check = async () => {
+        if (a.until === 'sold') await s.finishSales();
+        const rows = new Map(vehiclesFromRows(await s.gs.call('vehicles', { company })).map((v) => [v.id, v]));
+        let loads = null;
+        if (a.until === 'loaded') {
+          try { loads = loadsFromRows(await s.gs.call('vehicle_loads', { company, vehicles: a.vehicles })); } catch (e) {
+            if (/unknown cmd/.test(e.message)) throw new Error('refused: wait --until loaded needs AgentBridge v13; the host re-runs install-gamescript and loads the game again');
+            throw e;
+          }
+        }
+        return a.vehicles.map((id) => {
+          const v = rows.get(id) ?? null;
+          const load = loads?.get(id) ?? null;
+          const matched = waitMatch(v, a.until, { load, loadPct: a.load_pct, sold: !!s.soldVehicles?.get(`${company}:${id}`) });
+          return { id, state: v ? v.state : s.soldVehicles?.get(`${company}:${id}`) ? 'sold' : 'gone', matched, ...(v ? { x: v.x, y: v.y } : {}), ...(load ? { load_pct: load.pct } : {}) };
+        });
+      };
+      let info = first, vehicles = a.vehicles ? await check() : [];
+      const met = () => (a.days !== undefined ? info.date - first.date >= a.days : a.any ? vehicles.some((v) => v.matched) : vehicles.every((v) => v.matched));
+      const out = () => ({ until: a.until ?? null, ...(a.days !== undefined ? { days: a.days } : {}), waited_s: Math.round((Date.now() - started) / 100) / 10,
+        game_days: info.date - first.date, date: gameDate(info), ...(a.vehicles ? { vehicles } : {}) });
+      if (met()) return { ok: true, done: true, ...out() };
+      if (info.paused) return { ok: false, done: false, error: 'paused: the game is paused, so vehicles do not move and no game days pass; the host runs turn-advance (or unpause)', first_error: 'paused', ...out() };
+      while (Date.now() - started < a.timeout_s * 1000) {
+        await sleep(1000);
+        info = await s.gs.call('info');
+        if (a.vehicles) vehicles = await check();
+        if (met()) return { ok: true, done: true, ...out() };
+        if (info.paused) return { ok: false, done: false, error: 'paused: the game was paused while waiting', first_error: 'paused', ...out() };
+      }
+      return { ok: false, done: false, error: `wait_timeout: not done after ${a.timeout_s} s (${info.date - first.date} game days)${a.vehicles ? `; not yet: ${vehicles.filter((v) => !v.matched).map((v) => `${v.id} ${v.state}`).join(', ')}` : ''}`, first_error: 'wait_timeout', ...out() };
     },
   },
   {

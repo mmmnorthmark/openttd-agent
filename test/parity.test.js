@@ -47,6 +47,7 @@ const CASES = {
   'orders-copy': { vehicles: '12,13', from: 11, dry_run: true },
   'vehicle-buy': { depot_x: 5, depot_y: 5, engine: 1, dry_run: true }, 'vehicle-clone': { vehicle: 11, dry_run: true },
   'vehicle-replace': { vehicles: '11', dry_run: true }, 'add-train': { vehicle: 11, dry_run: true }, 'train-add-wagons': { vehicle: 11, wagons: 2, dry_run: true },
+  wait: { days: 1 },                            // the fake is paused between cases: refused with paused
   'vehicle-reverse': { vehicles: '11,12', dry_run: true }, 'vehicle-start': { vehicles: '11', dry_run: true }, 'vehicle-stop': { vehicles: '11', dry_run: true },
   'vehicle-depot': { vehicles: '5', dry_run: true }, 'vehicle-sell': { vehicles: '5,404,6', dry_run: true }, 'vehicle-refit': { vehicle: 11, cargo: 'wood', dry_run: true },
   'vehicle-rename': { vehicle: 11, name: 'Woody', dry_run: true },

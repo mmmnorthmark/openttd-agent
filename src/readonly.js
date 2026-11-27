@@ -16,6 +16,7 @@ export const READ_COMMANDS = new Set([
   'saves', 'server-log',
   'test-build-road', 'rail-types', 'road-types', 'bridge-types', 'station-sites', 'loop-sites',
   'stations', 'vehicles', 'vehicle', 'summary', 'vehicle-problems', 'verify-route', 'engines', 'groups', 'depots', 'events',
+  'wait', 'road-stop-sites',
 ]);
 
 /** Show-or-set commands: a read when only these arguments are given. */
