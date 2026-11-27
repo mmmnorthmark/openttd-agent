@@ -119,7 +119,10 @@ starts nothing and prints no secrets; agents should run it first.
 
 1. `openttd-agent install-gamescript` (again after every openttd-agent update).
 2. `openttd-agent launch --mode dedicated --map_bits 9`: a headless server bound to `0.0.0.0`
-   (game 3979, admin 3977). It generates the admin password and keeps it in your config.
+   (game 3979, admin 3977). It generates the admin password and keeps it in your config, and waits
+   until AgentBridge answers (`ready`, `bridge_version`). If that server already runs, it says
+   `already_running` (`--restart true` starts it again). A test server beside it:
+   `launch --server test --game_port 3989 --admin_port 3987`; host commands then take `--server test`.
    Optional rate limit for everyone: `--command_delay_ticks 2 --max_builds_per_day 50`.
 3. `openttd-agent relay` in its own terminal; leave it running (port 47978).
 4. Allow incoming **TCP 3979** (game) and **TCP 47978** (relay) in the firewall (macOS asks the
@@ -212,9 +215,12 @@ refusal: time, player, company, command, arguments, outcome).
 - **`not bound to a company yet`:** the host runs `relay-set-company` (step 8).
 - **`unknown command` through the relay:** player and host run different openttd-agent versions
   (`status` warns about it, and about a game running an older AgentBridge).
-- **AgentBridge did not answer:** the host runs `install-gamescript` and launches the game again with
-  `openttd-agent launch` (`doctor` lists launch profiles whose `[game_scripts]` is wrong). A loaded
-  save runs the GameScript stored in it.
+- **AgentBridge did not answer:** the host runs `install-gamescript --reload true` (installs, saves and
+  loads the game again so the new AgentBridge starts), or launches again with `openttd-agent launch`
+  (`doctor` lists launch profiles whose `[game_scripts]` is wrong, and each server's state). A loaded
+  save runs the GameScript stored in it. `first_error: gs_died` means the server log shows the script
+  died: `server-log --errors true` shows why.
+- **`admin_auth`:** the server refused the admin login (wrong password, or none set on the server).
 
 ### Security notes
 
@@ -235,7 +241,7 @@ refusal: time, player, company, command, arguments, outcome).
 | setup | `guide` (what to do next, host or player), `doctor`, `install-gamescript`, `configure`, `show-config`, `launch`, `scenario-prepare` (host) |
 | relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player`, `relay-stats` (is each player still calling?) |
 | game | `status`, `companies`, `rating` (performance rating by component), `chat`, `rate`, `goal-status` |
-| host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance`, `save` |
+| host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance`, `save`; server control on this machine (each takes `--server NAME`): `load` (a save, waits for AgentBridge), `saves`, `company-new` (an AI test company), `server-stop [--save NAME]`, `server-log [--errors true]`, `console --command` (raw console, the escape hatch) |
 | world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns; town to town for passengers and mail), `acceptance`, `route-effort`, `airport-types`, `airport-sites` (with your company: `owned` per site), `tiles` (owner marks: `*` yours, `#` another company), `rail-tiles` (exact track, signals and owner per tile), `signs` (your map signs; `sign`, `sign-remove` to place and remove them), `owned-land` (your owned land as rectangles; GameScript v10) |
 | operate: look | `summary` (one line per vehicle and station), `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
 | operate: diagnose | `vehicle-problems` (one row per problem, including `stalled_on_line` and `deadlock`: `problem`, `severity` (`action` or `info`; `--severity action` for only what needs a command), `evidence`, `suggested_fix`, with the id and the unit number the game shows as "Train #4"), `verify-route` (`--vehicle ID`, or `--from_station A --to_station B`: is there a rail or road path (road: GameScript v11), and if not, the last reachable tile and the first gap) |

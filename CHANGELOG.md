@@ -3,6 +3,40 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
+## 0.8.0 (unreleased)
+
+Host tools (batch 3):
+
+- **Breaking:** `launch --mode dedicated` now waits until the admin port and AgentBridge answer
+  (default 60 s, `--wait_s`; `--wait false` returns at once) and returns `ready`, `bridge_version`,
+  `seconds`. Not ready: `ok: false`, `first_error: not_ready`, with `process` (pid, running,
+  exit_code) and `log_tail`.
+- **Breaking:** `launch` on a profile whose server already runs returns `already_running: true`
+  and starts nothing; `--restart true` stops it (console quit, then SIGTERM to the processes
+  started with that profile's cfg only) and starts again.
+- **Breaking:** `launch --dry_run true` writes nothing (it used to write the profile files); it
+  lists them in `would_write`.
+- `launch` rotates the profile's `openttd.log` (keeps `.1`-`.3`).
+- `launch --server NAME --game_port N --admin_port M`: a second server on its own launch profile
+  (`profiles/NAME/server.json` keeps its ports). A server on another admin port than the
+  configured one leaves the config alone (`side_server` says how to reach it). `--server` is not
+  `--profile`: the global `--profile` picks a player profile.
+- New host commands (group `host`, refused by the relay), each with `--server NAME`: `load --name N
+  [--pause true|false]`, `saves [--match --limit]`, `company-new [--ai IdleAI]`, `server-stop [--save N]`,
+  `console --command "<console line>"`, `server-log [--lines --errors true --grep]`.
+- `install-gamescript --reload true [--server --save_name]`: install, rescan, save, load that save,
+  wait for the bundled bridge version, restore the pause state.
+- `doctor` reports a macOS quarantine flag on OpenTTD.app (with the `xattr` fix) and `servers`:
+  every launch profile with running, ports and whether its log shows the GameScript died.
+- GS timeouts carry a code: `gs_died` (the server log shows the script died after its last start;
+  the lines are in the error) or `gs_timeout` (with the last error lines). Connecting to a game
+  whose GameScript does not answer gives `no_gamescript` / `gs_died`.
+- Admin logins the server drops before welcome fail at once with `first_error: admin_auth`
+  (they used to wait for the 10 s timeout).
+- Background jobs (queued vehicle sales, train-add-wagons jobs, the periodic save) are kept in
+  `~/.openttd-agent/jobs-<host>-<port>.json` per game (seed and start date) and resume when the
+  daemon or relay reconnects to that game. `status` gains `background_jobs`.
+
 ## 0.7.0 (2026-11-26)
 
 AgentBridge GameScript v12: hosts must run `install-gamescript` and reload the game. Older GameScripts get clear refusals or fallbacks. List outputs and `first_error` changed shape (below), so scripts that parse them need updating.
