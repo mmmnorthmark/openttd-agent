@@ -197,7 +197,11 @@ test('build-cargo-route stops at a failed step and reports what was built', asyn
     assert.equal(execs().slice(before).filter((e) => e.args.steps.some((st) => st[0] === 'demolish')).length, 0);
   } finally { fake.state.failOps = []; }
   await assert.rejects(run('build-cargo-route', { from_industry: 1, from_town: 'Bigton', to_industry: 2, cargo: 'wood' }), /exactly one of --from_industry, --from_town/);
-  const refused = await run('build-cargo-route', { from_industry: 2, to_town: 'Smallham', cargo: 'goods', dry_run: true });
+  const idle = await run('build-cargo-route', { from_industry: 2, to_town: 'Smallham', cargo: 'goods', dry_run: true });
+  assert.deepEqual([idle.failed_step, idle.first_error, idle.feeder.accepts], ['source', 'source_produces_nothing', ['Wood']], 'the sawmill gets no wood yet');
+  assert.match(idle.hint, /find-cargo-pairs --cargo "Wood" --dest_id 2/);
+  assert.equal((await run('build-cargo-route', { from_industry: 1, to_town: 'Smallham', cargo: 'goods', dry_run: true })).first_error, 'source_produces_nothing', 'a forest makes no goods');
+  const refused = await run('build-cargo-route', { from_industry: 2, to_town: 'Smallham', cargo: 'goods', dry_run: true, force: true });
   assert.equal(refused.failed_step, 'dest_station');
   assert.match(refused.error, /accepts Goods \(acceptance \d/);
 });

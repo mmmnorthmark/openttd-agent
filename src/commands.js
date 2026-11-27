@@ -460,6 +460,21 @@ async function buildCargoRoute(s, company, a, ctx) {
   if (!from || !to) throw new Error('give one source (--from_industry <id> or --from_town <name>) and one destination (--to_industry <id> or --to_town <name>)');
   const cargo = cargoId(s.cargos, a.cargo);
   const cargoInfo = s.cargos.get(cargo);
+  // L14: a source that makes nothing of this cargo (a sawmill before any wood arrives) gives an empty line.
+  if (from.industry !== undefined && !a.force) {
+    const ind = (await s.economy()).industries.find((i) => i.id === from.industry);
+    const prod = ind?.produces.find((p) => p.cargo === cargo);
+    const what = ind ? `${ind.type_name} ${ind.id}` : `industry ${from.industry}`;
+    if (ind && !prod) {
+      return fail('source', `source_produces_nothing: ${what} does not produce ${cargoInfo?.name ?? a.cargo} (it produces ${ind.produces.map((p) => p.cargo_name).join(', ') || 'nothing'})`,
+        { first_error: 'source_produces_nothing', hint: `pick a producer of ${cargoInfo?.name ?? a.cargo}: find-cargo-pairs --cargo ${a.cargo}` });
+    }
+    if (ind?.secondary && prod.last_month === 0) {
+      const inputs = ind.accepts.join(', ') || 'its input cargo';
+      return fail('source', `source_produces_nothing: ${what} made no ${prod.cargo_name} last month; it makes it only from deliveries of ${inputs}`,
+        { first_error: 'source_produces_nothing', feeder: { accepts: ind.accepts }, hint: `feed it first: find-cargo-pairs --cargo "${ind.accepts[0] ?? ''}" --dest_id ${ind.id} lists producers of its input; or pass --force true to build anyway` });
+    }
+  }
   const railTypes = await s.gs.call('rail_types', { company });
   // Default: the cheapest track (the plain build-rail default is the game's first listed type, often electrified).
   const railType = a.rail_type ?? [...railTypes].sort((p, q) => p[3] - q[3])[0]?.[0];
@@ -2915,7 +2930,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-cargo-route', group: 'build', session: true,
-    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. --passing_loops N lays N passing loops on straight stretches spread along the line, each sized for the train (length = train tiles + 2), so more trains can run on the single track (passing_loops in the result; a loop that does not fit is a warning, not a failure). An end (town or industry) with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked); when nothing fits, first_error no_terminus_site with no_site {candidates_on_map, dry_runs, rejected (counts by error), tried, own_station_near, hint (only what was not tried)}. warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). When your rail stations near both ends are already served by one of your vehicles, --if_exists decides: refuse (default; failed_step existing_route), skip (ok, action exists), add_train (runs add-train on that line), build. Stations nobody serves (e.g. after selling the fleet) do not block it. A real build ends by tracing the line both ways: verify {connected, there, back, first_gap, first_leg (depot to source: detour_ratio, warning depot_exit_detour)}; failed_step verify with first_error route_broken when it does not trace (the train is already running). A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
+    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. --passing_loops N lays N passing loops on straight stretches spread along the line, each sized for the train (length = train tiles + 2), so more trains can run on the single track (passing_loops in the result; a loop that does not fit is a warning, not a failure). An end (town or industry) with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked); when nothing fits, first_error no_terminus_site with no_site {candidates_on_map, dry_runs, rejected (counts by error), tried, own_station_near, hint (only what was not tried)}. warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). When your rail stations near both ends are already served by one of your vehicles, --if_exists decides: refuse (default; failed_step existing_route), skip (ok, action exists), add_train (runs add-train on that line), build. Stations nobody serves (e.g. after selling the fleet) do not block it. Refused with source_produces_nothing when --from_industry does not produce the cargo, or is a secondary industry (sawmill, factory...) that made none last month (feed it first; --force true builds anyway). A real build ends by tracing the line both ways: verify {connected, there, back, first_gap, first_leg (depot to source: detour_ratio, warning depot_exit_detour)}; failed_step verify with first_error route_broken when it does not trace (the train is already running). A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
     args: z.object({
       ...act,
       from_industry: int().optional().describe('source industry id (see industries / find-cargo-pairs)'), from_town: z.string().optional().describe('source town id or name'),
@@ -2930,6 +2945,7 @@ export const COMMANDS = [
       allow_existing: bool().default(false).describe('same as --if_exists build'),
       if_exists: z.enum(['refuse', 'skip', 'add_train', 'build']).default('refuse').describe('when one of your vehicles already serves your stations at both ends: refuse (failed_step existing_route), skip (ok: true, action: exists), add_train (add-train on that line: loop and profit checks, clone, start), build (a second line anyway)'),
       passing_loops: int().min(0).max(6).default(0).describe('passing loops to build on the line, spread along it on straight stretches (loop-sites logic), sized for the train'),
+      force: bool().default(false).describe('build from a source that produces none of the cargo now (source_produces_nothing: a secondary industry before its input arrives)'),
       reuse_stations: z.enum(['auto', 'never']).default('auto').describe('auto: at an end within --radius of one of your rail stations, the new terminus joins that station (reused_station; reuse_failed when it does not fit); never: always a new station'),
     }),
     run: async (ctx, a) => {
