@@ -95,6 +95,8 @@ Observation and output (batch 6):
 - `events --type a,b` takes a list (any matches), `--exclude a,b` leaves types out, and
   `--companies A,B` (alias `--company N`) keeps events about those companies. The argument is
   not `company` on purpose: the relay forces `company` to the player's own, and news is public.
+- `airport-sites --towns A,B`: several towns in one call (`towns[{town, sites}]`; a town that is
+  not found gets `error`). `--town` alone keeps the old result.
 
 ## 0.7.0 (2026-11-26)
 

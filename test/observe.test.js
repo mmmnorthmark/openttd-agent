@@ -110,3 +110,12 @@ test('events --type list, --exclude, --company', async () => {
   assert.deepEqual((await run('events', { company: 0 })).events.map((e) => e.seq), [2]);
   assert.equal((await run('events', { companies: '5' })).events.length, 0);
 });
+
+test('airport-sites --towns checks several towns in one call', async () => {
+  const res = await run('airport-sites', { towns: 'Smallham,Bigton,Nowhere', limit: 1 });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(res.towns.map((t) => t.town.name), ['Smallham', 'Bigton', 'Nowhere']);
+  assert.ok(res.towns[0].sites.length >= 1);
+  assert.match(res.towns[2].error, /no town matching/);
+  await assert.rejects(run('airport-sites', {}), /--town NAME or --towns/);
+});

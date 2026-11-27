@@ -1005,6 +1005,26 @@ async function depotForRoute(s, company, a, id, { cmd }) {
 }
 
 /** "1951 Q2" for the quarter `back` quarters before the running one (GS quarter numbering: 0 = running). */
+/** airport-sites for one town name: flat, noise-checked and (with your company) dry-run checked sites. */
+async function airportSitesNear(s, towns, name, at, a) {
+  const town = towns.find((t) => t.name.toLowerCase().includes(name.toLowerCase()));
+  if (!town) throw new Error(`no town matching '${name}'`);
+  const company = s.cfg.company;
+  const hasCompany = company !== null && company !== undefined;
+  // Own owned land counts as buildable (airports clear it); company from the config, so the relay binds it.
+  const pad = Math.max(at.width, at.height);
+  const box = { x0: town.x - a.radius, y0: town.y - a.radius, x1: town.x + a.radius + pad, y1: town.y + a.radius + pad };
+  const owned = hasCompany ? await ownedLandAt(s, company, ownedLandCandidates(s.map, box)) : null;
+  const sites = findFlatSites(s.map, { cx: town.x, cy: town.y, width: at.width, height: at.height, radius: a.radius, maxHeightSpread: a.max_height_spread, limit: a.limit * 3, owned });
+  const checked = [];
+  for (const site of sites) {
+    const chk = await s.gs.call('check_airport', { x: site.x, y: site.y, type: at.type, ...(hasCompany ? { company } : {}) });
+    checked.push({ ...site, ...chk, noise_ok: chk.noise_increase <= chk.town_allowed_noise });
+    if (checked.filter((c) => c.noise_ok && c.buildable !== false).length >= a.limit) break;
+  }
+  return { town: { name: town.name, x: town.x, y: town.y, population: town.population, pax_unserved: town.pax_unserved, allowed_noise: town.allowed_noise }, sites: checked };
+}
+
 export function quarterLabel(info, back) {
   const idx = info.year * 4 + Math.floor((info.month - 1) / 3) - back;
   return `${Math.floor(idx / 4)} Q${(idx % 4) + 1}`;
@@ -1817,33 +1837,26 @@ export const COMMANDS = [
   },
   {
     name: 'airport-sites', group: 'world', session: true,
-    description: 'Find places to build an airport near a town: flat buildable rectangles of the airport size within radius, each checked for town noise limit and (with your company) a dry-run build with cost. With your company (AgentBridge v10), your owned land counts as buildable and each site has owned: true when its whole footprint is your owned land; those sites come first.',
+    description: 'Find places to build an airport near a town: flat buildable rectangles of the airport size within radius, each checked for town noise limit and (with your company) a dry-run build with cost. With your company (AgentBridge v10), your owned land counts as buildable and each site has owned: true when its whole footprint is your owned land; those sites come first. --towns A,B checks several towns in one call.',
     args: z.object({
-      town: z.string().describe('town name (substring)'), airport: z.string().default('small').describe('airport type name, see airport-types'),
-      radius: int().default(20), max_height_spread: int().default(0), limit: int().default(5),
+      town: z.string().optional().describe('town name (substring)'),
+      towns: z.string().optional().describe('comma-separated town names: one call checks several towns (result: towns[{town, sites}])'),
+      airport: z.string().default('small').describe('airport type name, see airport-types'),
+      radius: int().default(20), max_height_spread: int().default(0), limit: int().default(5).describe('sites per town'),
     }),
     run: async (ctx, a) => {
       const s = await ctx.session();
+      const names = a.towns !== undefined ? a.towns.split(',').map((t) => t.trim()).filter(Boolean) : a.town !== undefined ? [a.town] : [];
+      if (!names.length) throw new Error('bad_arguments: give --town NAME or --towns A,B');
       const [{ towns }, types] = await Promise.all([s.economy(), s.gs.call('airport_types'), s.ensureTiles()]);
-      const town = towns.find((t) => t.name.toLowerCase().includes(a.town.toLowerCase()));
-      if (!town) throw new Error(`no town matching '${a.town}'`);
       const at = types.find((t) => t.name === a.airport.toLowerCase());
       if (!at) throw new Error(`unknown airport '${a.airport}'. Available: ${types.map((t) => t.name).join(', ')}`);
-      const company = s.cfg.company;
-      const hasCompany = company !== null && company !== undefined;
-      // Own owned land counts as buildable (airports clear it); company from the config, so the relay binds it.
-      const pad = Math.max(at.width, at.height);
-      const box = { x0: town.x - a.radius, y0: town.y - a.radius, x1: town.x + a.radius + pad, y1: town.y + a.radius + pad };
-      const owned = hasCompany ? await ownedLandAt(s, company, ownedLandCandidates(s.map, box)) : null;
-      const sites = findFlatSites(s.map, { cx: town.x, cy: town.y, width: at.width, height: at.height, radius: a.radius, maxHeightSpread: a.max_height_spread, limit: a.limit * 3, owned });
-      const checked = [];
-      for (const site of sites) {
-        const chk = await s.gs.call('check_airport', { x: site.x, y: site.y, type: at.type, ...(hasCompany ? { company } : {}) });
-        checked.push({ ...site, ...chk, noise_ok: chk.noise_increase <= chk.town_allowed_noise });
-        if (checked.filter((c) => c.noise_ok && c.buildable !== false).length >= a.limit) break;
+      if (a.towns === undefined) return { ...(await airportSitesNear(s, towns, names[0], at, a)), airport: at };
+      const out = [];
+      for (const name of names) {
+        try { out.push(await airportSitesNear(s, towns, name, at, a)); } catch (e) { out.push({ town: { name }, error: e.message, sites: [] }); }
       }
-      return { town: { name: town.name, x: town.x, y: town.y, population: town.population, pax_unserved: town.pax_unserved, allowed_noise: town.allowed_noise },
-        airport: at, sites: checked };
+      return { airport: at, towns: out };
     },
   },
   {
