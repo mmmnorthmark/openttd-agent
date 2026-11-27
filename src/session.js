@@ -1,6 +1,7 @@
 // A live connection to one game: admin client + GS RPC + world mirror.
 // Used in-process by the daemon and by the MCP server.
 
+import { classifyVersion, versionRefusal, acceptUntested } from './versions.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { AdminClient, UPDATE, FREQ } from './admin-client.js';
@@ -75,6 +76,10 @@ export class Session {
     await this.admin.connect().catch((e) => {
       throw new Error(`${e.message}. Is the server running (openttd-agent launch) and are host/admin_port right? run: openttd-agent guide`);
     });
+    // The welcome carries the server's OpenTTD version (revision): refuse an untested one unless accepted.
+    this.openttd = classifyVersion(this.admin.welcome?.revision);
+    const refusal = versionRefusal(this.openttd, acceptUntested({ cfg: this.cfg.accept_untested }), `the server at ${host}:${port}`);
+    if (refusal) { this.close(); throw new Error(refusal); }
     this.admin.subscribe(UPDATE.CHAT, FREQ.AUTOMATIC);
     this.gs = new GSRpc(this.admin);
     this.gs.diagnose = () => diagnoseGs(this.cfg);

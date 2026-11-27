@@ -56,3 +56,66 @@ test('installHint links the official download page; detection of a missing exe d
   assert.equal(detectInstalledVersion(null).version, null);
   assert.equal(detectInstalledVersion('/nonexistent/openttd').version, null);
 });
+
+// ---- the server's version from the admin welcome ------------------------------------------------
+import { startFakeServer } from './fake-server.js';
+import { Session } from '../src/session.js';
+
+async function connectTo(revision, cfgExtra = {}, env = {}) {
+  const fake = await startFakeServer({ password: 'pw' });
+  fake.state.revision = revision;
+  const saved = process.env.OPENTTD_AGENT_ACCEPT_UNTESTED;
+  if ('OPENTTD_AGENT_ACCEPT_UNTESTED' in env) process.env.OPENTTD_AGENT_ACCEPT_UNTESTED = env.OPENTTD_AGENT_ACCEPT_UNTESTED; else delete process.env.OPENTTD_AGENT_ACCEPT_UNTESTED;
+  const s = new Session({ host: '127.0.0.1', admin_port: fake.port, admin_password: 'pw', company: 0, tile_refresh_rows_per_sec: 0, daemon_port: 1, ...cfgExtra });
+  try { await s.connect(); return s.openttd; } finally {
+    s.close(); fake.server.close();
+    if (saved === undefined) delete process.env.OPENTTD_AGENT_ACCEPT_UNTESTED; else process.env.OPENTTD_AGENT_ACCEPT_UNTESTED = saved;
+  }
+}
+
+test('session: a tested server version connects; an untested one is refused unless accepted', async () => {
+  assert.equal((await connectTo('15.3')).class, 'tested');
+  await assert.rejects(connectTo('16.0-RC1'), /^Error: untested_openttd_version: the server at 127\.0\.0\.1:\d+: OpenTTD 16\.0-RC1 is a beta/);
+  assert.equal((await connectTo('16.0-RC1', { accept_untested: true })).class, 'beta');
+  assert.equal((await connectTo('20261101-master-gabc', {}, { OPENTTD_AGENT_ACCEPT_UNTESTED: '1' })).class, 'custom');
+  await assert.rejects(connectTo('13.4', { accept_untested: true }), /unsupported_openttd_version/);
+});
+
+// ---- launch refuses an untested installed OpenTTD -------------------------------------------------
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+
+const BIN = path.resolve('bin/openttd-agent.js');
+const cliRaw = (env, ...args) => new Promise((resolve) => execFile(process.execPath, [BIN, ...args], { env: { ...process.env, ...env } }, (_e, stdout) => resolve(JSON.parse(stdout))));
+
+test('launch: an untested installed version is refused (first_error untested_openttd_version) unless --accept_untested', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ottd-ver-'));
+  const exe = path.join(dir, 'openttd');
+  fs.writeFileSync(exe, '#!/bin/sh\necho "OpenTTD 16.0-beta1"\nexit 0\n', { mode: 0o755 });
+  const env = { OPENTTD_AGENT_HOME: path.join(dir, 'home'), OPENTTD_AGENT_LOG: 'error', OPENTTD_EXE: exe, OPENTTD_PERSONAL_DIR: path.join(dir, 'personal'), OPENTTD_AGENT_ACCEPT_UNTESTED: '' };
+  const refused = await cliRaw(env, 'launch', '--no-daemon', '--admin_password', 'pw', '--game_port', '45991', '--admin_port', '45992', '--wait', 'false');
+  assert.equal(refused.ok, false);
+  assert.equal(refused.first_error, 'untested_openttd_version');
+  assert.ok(!fs.existsSync(path.join(dir, 'home', 'profiles', 'dedicated', 'openttd.cfg')), 'nothing written');
+  const dry = await cliRaw(env, 'launch', '--no-daemon', '--admin_password', 'pw', '--dry_run', 'true');
+  assert.equal(dry.openttd.class, 'beta');
+  assert.match(dry.openttd.would_refuse, /^untested_openttd_version/);
+  const accepted = await cliRaw(env, 'launch', '--no-daemon', '--admin_password', 'pw', '--dry_run', 'true', '--accept_untested', 'true');
+  assert.equal(accepted.openttd.would_refuse, undefined);
+  const doc = await cliRaw(env, 'doctor', '--no-daemon');
+  assert.equal(doc.openttd.version, '16.0-beta1');
+  assert.equal(doc.openttd.class, 'beta');
+});
+
+test('doctor and launch without OpenTTD: install guidance, no stack trace', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ottd-none-'));
+  const env = { OPENTTD_AGENT_HOME: path.join(dir, 'home'), OPENTTD_AGENT_LOG: 'error', OPENTTD_EXE: path.join(dir, 'missing-openttd'), OPENTTD_PERSONAL_DIR: path.join(dir, 'personal') };
+  const doc = await cliRaw(env, 'doctor', '--no-daemon');
+  assert.equal(doc.openttd.class, 'not_installed');
+  assert.match(doc.openttd.message, /openttd\.org\/downloads/);
+  const launch = await cliRaw(env, 'launch', '--no-daemon', '--admin_password', 'pw', '--wait', 'false');
+  assert.equal(launch.first_error, 'openttd_not_found');
+  assert.doesNotMatch(launch.error, /at .*\.js:\d+/);
+});

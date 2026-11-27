@@ -14,6 +14,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { CONFIG_DIR } from './config.js';
 import { log } from './log.js';
+import { detectInstalledVersion, classifyVersion, installHint, TESTED_VERSIONS } from './versions.js';
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const GS_NAME = 'AgentBridge';
@@ -37,7 +38,7 @@ export function findPersonalDir() {
 }
 
 export function findExecutable() {
-  if (process.env.OPENTTD_EXE) return process.env.OPENTTD_EXE;
+  if (process.env.OPENTTD_EXE) return fs.existsSync(process.env.OPENTTD_EXE) ? process.env.OPENTTD_EXE : null; // a wrong OPENTTD_EXE = not installed
   const candidates = {
     darwin: ['/Applications/OpenTTD.app/Contents/MacOS/openttd', path.join(os.homedir(), 'Applications/OpenTTD.app/Contents/MacOS/openttd')],
     win32: ['C:\\Program Files\\OpenTTD\\openttd.exe', 'C:\\Program Files (x86)\\OpenTTD\\openttd.exe',
@@ -71,7 +72,7 @@ export function doctor() {
   const report = {
     platform: process.platform,
     node: process.version,
-    openttd_executable: exe ?? 'NOT FOUND (install from https://www.openttd.org or set OPENTTD_EXE)',
+    openttd_executable: exe ?? 'NOT FOUND (see openttd.message)',
     personal_dir: personal,
     personal_dir_exists: fs.existsSync(personal),
     original_graphics: ORIGINAL_BASESET.every((f) => baseFiles.includes(f)) ? 'found' : `missing (${ORIGINAL_BASESET.filter((f) => !baseFiles.includes(f)).join(', ')}); OpenGFX will be used instead`,
@@ -80,14 +81,14 @@ export function doctor() {
     gamescript_installed_version: readGsVersion(installedGs),
     gamescript_needed: 'host only',
   };
-  if (exe && process.platform === 'darwin') {
-    // Read the bundle version; never run the binary here (it would open the game window).
-    const plist = path.resolve(path.dirname(exe), '..', 'Info.plist');
-    const m = fs.existsSync(plist) && fs.readFileSync(plist, 'utf8').match(/CFBundleShortVersionString<\/key>\s*<string>([^<]+)/);
-    if (m) report.openttd_version = m[1];
-  }
+  const detected = detectInstalledVersion(exe);
+  const cls = classifyVersion(detected.version);
+  if (detected.version) report.openttd_version = detected.version;
+  report.openttd = { version: detected.version, class: exe ? cls.class : 'not_installed', tested: cls.tested, tested_versions: TESTED_VERSIONS,
+    source: detected.source, ...(exe ? (cls.tested ? {} : { message: detected.version ? cls.message : `version not detected (${detected.error})` }) : { message: installHint() }) };
   report.next_steps = [];
-  if (!exe) report.next_steps.push('Install OpenTTD 15.x');
+  if (!exe) report.next_steps.push(installHint());
+  else if (detected.version && !cls.tested) report.next_steps.push(cls.message);
   const q = exe ? quarantine(exe) : null;
   if (q) {
     report.quarantine = q;
@@ -332,7 +333,7 @@ export function rotateLogs(logFile, keep = LOG_KEEP) {
 export function launch(opts) {
   const { mode = 'dedicated', dryRun = false, adminPort = 3977, gamePort = 3979, bind = '0.0.0.0' } = opts;
   const exe = findExecutable();
-  if (!exe) throw new Error('OpenTTD executable not found; install it or set OPENTTD_EXE');
+  if (!exe) throw new Error(`openttd_not_found: ${installHint()}`);
   const plan = planLaunch(opts);
   const result = { mode, server: opts.server ?? mode, profile_dir: plan.dir, executable: exe, args: plan.args, log: plan.logFile,
     admin_port: mode === 'join' ? null : adminPort, game_port: gamePort };

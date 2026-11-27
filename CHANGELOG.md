@@ -9,6 +9,14 @@ Hardening (batch 8):
 
 - **AgentBridge v14** runs on OpenTTD 14.0 and 14.1 too: info.nut declares script API 14
   (15.x loads it through its compat script); the two 15.0+ calls are chosen at run time.
+- OpenTTD version awareness (`src/versions.js`): `doctor` reports `openttd` (version, class
+  tested / older_unsupported / newer_untested / beta / custom, tested_versions). **Breaking:**
+  `launch` and every game connection refuse an untested OpenTTD (`first_error:
+  untested_openttd_version`; the server's version comes from the admin welcome) unless
+  `--accept_untested true` (launch), `configure --accept_untested true` or
+  `OPENTTD_AGENT_ACCEPT_UNTESTED=1`; older than 14.0 is refused (`unsupported_openttd_version`).
+  `status` shows `openttd` (server, local, match) and warns on a host/client mismatch. No OpenTTD
+  installed: `openttd_not_found` with the official download link instead of a stack trace.
 - Public hygiene: `tools/check_public.sh` (part of `npm run check`) fails on personal names,
   paths, private IPs and hostnames; examples use RFC 5737 addresses.
 

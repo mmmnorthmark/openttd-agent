@@ -8,9 +8,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import * as z from 'zod/v4';
-import { doctor, installGamescript, launch, checkSaveName, bundledGsVersion, adminHostForBind, profileDir, TERRAIN_TYPES } from './setup.js';
+import { doctor, installGamescript, launch, findExecutable, checkSaveName, bundledGsVersion, adminHostForBind, profileDir, TERRAIN_TYPES } from './setup.js';
 import { serverTarget, serverStates, profilePorts, serverPids, waitReady, notReadyDetail, stopServer, withAdmin, loadSave, listSaves, companyNew, reloadGamescript, logTail, portOpen } from './host.js';
 import { VERSION } from './version.js';
+import { classifyVersion, versionRefusal, acceptUntested, detectInstalledVersion, compareHostClient, installHint } from './versions.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
@@ -1439,6 +1440,21 @@ async function execExplained(s, company, steps, opts, a = {}) {
   return res;
 }
 
+/**
+ * OpenTTD versions for status: the server's (admin welcome) and, when this process runs on a
+ * machine with OpenTTD, the local one. A mismatch matters to anyone joining from here.
+ */
+function openttdVersions(s, warnings) {
+  const server = s.admin?.welcome?.revision ?? null;
+  const cls = s.openttd ?? classifyVersion(server);
+  let local = null;
+  try { local = detectInstalledVersion(findExecutable()).version; } catch { /* no local OpenTTD */ }
+  const cmp = compareHostClient(server, local);
+  if (!cls.tested && cls.class !== 'unknown') warnings.push(cls.message);
+  if (cmp.match === false) warnings.push(cmp.message);
+  return { server, server_class: cls.class, local, match: cmp.match };
+}
+
 export const COMMANDS = [
   // ---- setup ------------------------------------------------------------------
   {
@@ -1478,6 +1494,7 @@ export const COMMANDS = [
       relay_port: int().min(1).max(65535).optional().describe('host: port the relay listens on'),
       company: int().optional().describe('direct mode only; with a relay the host decides your company'),
       max_builds_per_minute: int().min(0).optional(), tile_refresh_rows_per_sec: int().min(0).optional(),
+      accept_untested: bool().optional().describe('true = connect to / launch an OpenTTD version openttd-agent was not tested with (beta, nightly, newer release); also OPENTTD_AGENT_ACCEPT_UNTESTED=1'),
     }),
     run: (_ctx, { token, ...a }) => {
       if (a.relay) {
@@ -1515,10 +1532,16 @@ export const COMMANDS = [
       restart: bool().default(false).describe('true = stop a server already running from this profile (console quit, then SIGTERM by its cfg path) and start again'),
       wait: bool().optional().describe('wait until ready (default true for mode=dedicated; host/join open a window and are not waited for)'),
       wait_s: int().min(1).max(280).default(60).describe('how long to wait for ready'),
+      accept_untested: bool().optional().describe('true = start an OpenTTD version openttd-agent was not tested with (beta, nightly, newer release); default: config accept_untested or OPENTTD_AGENT_ACCEPT_UNTESTED=1'),
       dry_run: bool().default(false).describe('true = show the command line and the files it would write; writes and starts nothing'),
     }),
     run: async (ctx, a) => {
       const hosting = a.mode !== 'join';
+      const exe = findExecutable();
+      const ottd = classifyVersion(exe ? detectInstalledVersion(exe).version : null);
+      const refusal = exe ? versionRefusal(ottd, acceptUntested({ arg: a.accept_untested, cfg: ctx.cfg.accept_untested }), `installed OpenTTD (${exe})`) : null;
+      if (!exe && !a.dry_run) throw new Error(`openttd_not_found: ${installHint()}`);
+      if (refusal && !a.dry_run) throw new Error(refusal);
       const server = a.server ?? a.mode;
       const dir = profileDir(server);
       const prev = a.server ? profilePorts(dir) : {};
@@ -1539,7 +1562,7 @@ export const COMMANDS = [
       };
       if (a.dry_run) {
         const { result } = launch(opts);
-        return { ...result, ...(running?.length ? { running_now: running } : {}), ...(generated ? { admin_password: 'would be generated' } : {}),
+        return { ...result, openttd: { version: ottd.version, class: ottd.class, ...(refusal ? { would_refuse: refusal } : {}) }, ...(running?.length ? { running_now: running } : {}), ...(generated ? { admin_password: 'would be generated' } : {}),
           ...(primary && host !== ctx.cfg.host ? { admin_host: `would be saved as host: ${host}` } : {}) };
       }
       let restarted = null;
@@ -1713,7 +1736,7 @@ export const COMMANDS = [
       }
       return { date: dateString(info), info, my_company: s.cfg.company, me: meFromCompanies(companies, s.cfg.company), companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
         tile_mirror: { rows_loaded: loaded, rows_total: s.map.sizeY, load_ms: s.tileLoadMs ?? null },
-        versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, background_jobs: s.backgroundJobs(), warnings };
+        versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, openttd: openttdVersions(s, warnings), background_jobs: s.backgroundJobs(), warnings };
     },
   },
   {
