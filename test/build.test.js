@@ -412,3 +412,33 @@ test('build-truck-route: dry run picks stops, road, depot and trucks; a real bui
   assert.ok(last.some((x) => x[0] === 'orders_copy'));
   assert.equal(last.filter((x) => x[0] === 'veh_start_stop').length, 2);
 });
+
+test('ERR_VEHICLE_IN_THE_WAY: transient, vehicles_in_the_way, blocked_by_vehicle in a dry run; --wait_clear_s retries from that step', async () => {
+  fake.state.inTheWay = { x: 14, y: 20, times: 1 }; // train 11 is at (14,20)
+  try {
+    const dry = await run('build-track', { x: 14, y: 20, from_x: 13, from_y: 20, to_x: 15, to_y: 20, dry_run: true });
+    assert.deepEqual([dry.ok, dry.transient, dry.blocked_by_vehicle, dry.first_error], [false, true, true, 'ERR_VEHICLE_IN_THE_WAY']);
+    assert.deepEqual(dry.vehicles_in_the_way.map((v) => [v.id, v.tiles_away]), [[11, 0]]);
+    const now = await run('build-track', { x: 14, y: 20, from_x: 13, from_y: 20, to_x: 15, to_y: 20 });
+    assert.deepEqual([now.ok, now.transient, now.blocked_by_vehicle], [false, true, undefined]);
+    fake.state.inTheWay.times = 1;
+    const before = execs().length;
+    const waited = await run('build-rail', { x1: 10, y1: 25, x2: 20, y2: 25, wait_clear_s: 10 });
+    assert.equal(waited.ok, true, 'the rail step under no vehicle passes at once');
+    assert.equal(execs().length, before + 1);
+    fake.state.inTheWay.times = 1;
+    const a = await run('build-track', { x: 14, y: 20, from_x: 13, from_y: 20, to_x: 15, to_y: 20, wait_clear_s: 10 });
+    assert.deepEqual([a.ok, a.transient, a.steps_done, a.steps_total], [true, undefined, 1, 1]);
+    assert.ok(a.waited_s >= 0 && a.waited_s <= 4);
+    // A blocked step in the middle of a template: the steps before it are not sent again.
+    fake.state.inTheWay = { x: 13, y: 31, times: 1 };
+    const n0 = execs().length;
+    const loop = await run('build-passing-loop', { x: 10, y: 30, dir: 'sw', length: 4, wait_clear_s: 10, steps: 'all' });
+    assert.equal(loop.ok, true, JSON.stringify(loop).slice(0, 300));
+    const real = execs().slice(n0).filter((e) => !e.args.dry_run);
+    assert.equal(real.length, 2);
+    assert.equal(real[0].args.steps.length, loop.steps_total);
+    assert.equal(real[1].args.steps.length, loop.steps_total - (real[0].args.steps.findIndex((st) => st[0] === 'rail' && st[4] === 31 && st[3] <= 13 && st[5] >= 13)));
+    assert.deepEqual(loop.results.map((r) => r.step), [...Array(loop.steps_total).keys()]);
+  } finally { fake.state.inTheWay = null; }
+});

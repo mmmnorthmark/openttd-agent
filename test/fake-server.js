@@ -340,6 +340,14 @@ const GS = {
         if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
         continue;
       }
+      // state.inTheWay = { x, y, times }: a rail step over that tile fails with ERR_VEHICLE_IN_THE_WAY (real runs count down).
+      const w = state.inTheWay;
+      if (w && w.times > 0 && st[0] === 'rail' && Math.min(st[3], st[5]) <= w.x && w.x <= Math.max(st[3], st[5]) && Math.min(st[4], st[6]) <= w.y && w.y <= Math.max(st[4], st[6])) {
+        if (!a.dry_run) w.times--;
+        rows.push([false, 0, 'ERR_VEHICLE_IN_THE_WAY', 0]);
+        if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+        continue;
+      }
       const bad = st[0] === 'bogus' || (st[0] === 'veh_sell' && st[1] === 404) || (!a.dry_run && state.failOps.includes(st[0]));
       rows.push(bad ? [false, 0, 'Vehicle not available', 0] : [true, 10, '', 100 + rows.length]);
       if (bad && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
@@ -352,7 +360,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, railLoop: false, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, railLoop: false, inTheWay: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
   const server = net.createServer((sock) => {
     state.openConnections++;
     sock.on('close', () => { state.openConnections--; });

@@ -125,7 +125,8 @@ async function buildPath(ctx, a, mode) {
   const out = { reachable: true, ...plan.stats, ...(a.show_path ? { path: plan.tiles } : {}) };
   if (a.plan_only) return { ...out, steps_total: steps.length, steps };
   if (!a.dry_run) s.throttleBuild();
-  const res = await s.exec(company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) });
+  const opts = { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) };
+  const res = await vehiclesInTheWay(s, company, steps, await execWaitClear(s, company, steps, opts, a.wait_clear_s ?? 0));
   if (!a.dry_run) await s.refreshArea(...box);
   return { ...out, ...res };
 }
@@ -1305,6 +1306,77 @@ async function run(ctx, a, steps, opts = {}) {
   if (!a.dry_run) s.throttleBuild();
   return s.exec(company, steps, { dryRun: a.dry_run, ...opts });
 }
+
+// ---- vehicles in the way (C5) ------------------------------------------------------------
+
+const IN_THE_WAY = /ERR_VEHICLE_IN_THE_WAY/;
+const blockedByVehicle = (res) => (res.results ?? []).some((r) => !r.ok && IN_THE_WAY.test(r.error ?? ''));
+
+/** Tile box an exec step works on: { x0, y0, x1, y1 }. */
+function stepBox(st) {
+  const box = (ax, ay, bx = ax, by = ay) => ({ x0: Math.min(ax, bx), y0: Math.min(ay, by), x1: Math.max(ax, bx), y1: Math.max(ay, by) });
+  if (st[0] === 'rail' || st[0] === 'rail_remove') return box(st[3], st[4], st[5], st[6]);
+  if (st[0] === 'road' || st[0] === 'road_remove') return box(st[1], st[2], st[3], st[4]);
+  if (st[0] === 'bridge') return box(st[2], st[3], st[4], st[5]);
+  if (st[0] === 'tunnel') return box(st[2], st[3]);
+  return box(st[1], st[2]);
+}
+
+/**
+ * ERR_VEHICLE_IN_THE_WAY on an exec result: add transient: true, blocked_at (the failed steps' tiles),
+ * vehicles_in_the_way (your vehicles within 6 tiles of them; a train's position is its front) and,
+ * in a dry run, blocked_by_vehicle: true. Other results come back unchanged.
+ */
+async function vehiclesInTheWay(s, company, steps, res) {
+  if (!blockedByVehicle(res)) return res;
+  const boxes = res.results.filter((r) => !r.ok && IN_THE_WAY.test(r.error ?? '')).map((r) => stepBox(steps[r.step]));
+  const off = (v, b) => Math.max(b.x0 - v.x, 0, v.x - b.x1) + Math.max(b.y0 - v.y, 0, v.y - b.y1);
+  let near = [];
+  try {
+    near = vehiclesFromRows(await s.gs.call('vehicles', { company }))
+      .map((v) => ({ id: v.id, type: v.type, state: v.state, x: v.x, y: v.y, ...(v.speed !== undefined ? { speed: v.speed } : {}), tiles_away: Math.min(...boxes.map((b) => off(v, b))) }))
+      .filter((v) => v.tiles_away <= 6).sort((p, q) => p.tiles_away - q.tiles_away).slice(0, 8);
+  } catch { near = []; }
+  return { ...res, transient: true, ...(res.dry_run ? { blocked_by_vehicle: true } : {}), blocked_at: boxes, vehicles_in_the_way: near,
+    hint: 'a vehicle is on the tiles: wait until it has passed and run the same command again (or pass --wait_clear_s 30); a dry run cannot reserve the tiles' };
+}
+
+/**
+ * s.exec that, when a step fails with ERR_VEHICLE_IN_THE_WAY, waits up to waitS seconds (real
+ * time, game running) and retries from the failed step every 2 s; earlier steps are not repeated.
+ * Returns an exec result over all steps, plus waited_s (and wait_note when the game is paused).
+ */
+async function execWaitClear(s, company, steps, opts, waitS) {
+  let res = await s.exec(company, steps, opts);
+  if (opts.dryRun || !waitS || res.ok || !blockedByVehicle(res)) return res;
+  if ((await s.gs.call('info')).paused) return { ...res, waited_s: 0, wait_note: 'the game is paused, so the vehicle will not move: unpause (or turn-advance) and run it again' };
+  const t0 = Date.now();
+  const done = [];
+  let offset = 0, rest = steps;
+  while (!res.ok && blockedByVehicle(res) && Date.now() - t0 < waitS * 1000) {
+    const failed = res.results.find((r) => !r.ok);
+    done.push(...res.results.filter((r) => r.step < failed.step).map((r) => ({ ...r, step: r.step + offset })));
+    offset += failed.step;
+    rest = rest.slice(failed.step);
+    await sleep(2000);
+    s.throttleBuild();
+    res = await s.exec(company, rest, opts);
+  }
+  const results = [...done, ...res.results.map((r) => ({ ...r, step: r.step + offset }))];
+  const bad = results.find((r) => !r.ok);
+  return { ...res, results, cost: done.reduce((n, r) => n + (r.cost ?? 0), 0) + res.cost, steps_total: steps.length, steps_done: results.filter((r) => r.ok).length,
+    error: bad ? `step ${bad.step} (${bad.op}): ${bad.error ?? 'failed'}` : res.error, waited_s: Math.round((Date.now() - t0) / 1000) };
+}
+
+/** run() for track builds: --wait_clear_s and the vehicles-in-the-way report. */
+async function runClear(ctx, a, steps, opts = {}) {
+  const { s, company } = await mine(ctx, a);
+  if (!a.dry_run) s.throttleBuild();
+  const res = await execWaitClear(s, company, steps, { dryRun: a.dry_run, ...opts }, a.wait_clear_s ?? 0);
+  return vehiclesInTheWay(s, company, steps, res);
+}
+
+const waitClear = { wait_clear_s: int().min(0).max(300).default(0).describe('when a vehicle is in the way (ERR_VEHICLE_IN_THE_WAY), wait up to this many seconds for it to pass and retry from that step') };
 
 export const COMMANDS = [
   // ---- setup ------------------------------------------------------------------
@@ -2649,8 +2721,8 @@ export const COMMANDS = [
   },
   {
     name: 'build-rail', group: 'build', session: true,
-    description: 'Plan and build a rail line between two anchor tiles. Anchors are where the line connects (a station end tile, the tile in front of a depot, existing track, or connect_at from build-terminus): track is laid on every tile strictly between them. The planner prefers flat and straight, avoids houses, industries and stations, crosses roads on the level and bridges water, rail and roads where it must. Use dry_run=true first for the cost; each step reports ok/error. On failure nothing after the failed step is built: fix (terraform, demolish, other anchors) and run again; already-built track is kept.',
-    args: z.object({ ...pathArgs, rail_type: int().optional().describe('see rail-types; default: first available') }),
+    description: 'Plan and build a rail line between two anchor tiles. Anchors are where the line connects (a station end tile, the tile in front of a depot, existing track, or connect_at from build-terminus): track is laid on every tile strictly between them. The planner prefers flat and straight, avoids houses, industries and stations, crosses roads on the level and bridges water, rail and roads where it must. Use dry_run=true first for the cost; each step reports ok/error. On failure nothing after the failed step is built: fix (terraform, demolish, other anchors) and run again; already-built track is kept. A vehicle on the tiles (ERR_VEHICLE_IN_THE_WAY) gives transient: true and vehicles_in_the_way (blocked_by_vehicle in a dry run); --wait_clear_s N waits for it to pass and retries from that step.',
+    args: z.object({ ...pathArgs, rail_type: int().optional().describe('see rail-types; default: first available'), ...waitClear }),
     run: (ctx, a) => buildPath(ctx, a, 'rail'),
   },
   {
@@ -2739,9 +2811,9 @@ export const COMMANDS = [
   },
   {
     name: 'build-track', group: 'build', session: true,
-    description: 'Lay (or with remove=true, remove) one rail piece on tile x,y joining its neighbour from_x,from_y to its neighbour to_x,to_y. Existing track on the tile is kept, so this makes junctions: e.g. connect a depot or a branch onto an existing line. Neighbours may be straight across (straight piece) or at right angles (curve).',
-    args: z.object({ ...act, ...point, from_x: int(), from_y: int(), to_x: int(), to_y: int(), remove: bool().default(false), rail_type: int().optional() }),
-    run: (ctx, a) => run(ctx, a, [[a.remove ? 'rail_remove' : 'rail', a.from_x, a.from_y, a.x, a.y, a.to_x, a.to_y]], { railType: a.rail_type }),
+    description: 'Lay (or with remove=true, remove) one rail piece on tile x,y joining its neighbour from_x,from_y to its neighbour to_x,to_y. Existing track on the tile is kept, so this makes junctions: e.g. connect a depot or a branch onto an existing line. Neighbours may be straight across (straight piece) or at right angles (curve). A vehicle on the tiles (ERR_VEHICLE_IN_THE_WAY) gives transient: true and vehicles_in_the_way (blocked_by_vehicle in a dry run); --wait_clear_s N waits for it to pass and retries from that step.',
+    args: z.object({ ...act, ...point, from_x: int(), from_y: int(), to_x: int(), to_y: int(), remove: bool().default(false), rail_type: int().optional(), ...waitClear }),
+    run: (ctx, a) => runClear(ctx, a, [[a.remove ? 'rail_remove' : 'rail', a.from_x, a.from_y, a.x, a.y, a.to_x, a.to_y]], { railType: a.rail_type }),
   },
   {
     name: 'build-signal', group: 'build', session: true,
@@ -2760,7 +2832,7 @@ export const COMMANDS = [
         }
         return run(ctx, a, [['signal_remove', a.x, a.y, a.front_x, a.front_y]]);
       }
-      return run(ctx, a, [['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]);
+      return runClear(ctx, a, [['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]);
     },
   },
   {
@@ -2794,12 +2866,12 @@ export const COMMANDS = [
   },
   {
     name: 'build-passing-loop', group: 'build', session: true,
-    description: 'Template: passing loop for a single-track line. The main track runs length+2 tiles from x,y in direction dir (sw=+x, se=+y, ne=-x, nw=-y); a second track is laid beside it (side=1 or -1) with one-way path signals: trains heading dir use the main track, the others the loop. Both sides have length-1 clear tiles between the points and the exit signal (fits trains up to length-2 tiles). Give --train_tiles N or --for_vehicle ID (the longest train on that vehicle\'s line is used): length then defaults to train+2, and a loop with fewer than train+1 clear tiles is refused (loop_too_short). Checked first (AgentBridge v9): every main-line tile must be straight track along dir, or free land (not_straight_at / blocked_at / signal_at {x,y}); loop tiles must be free (loop_side_occupied_at). After a real build: loop_check (both directions through the loop) and, with --for_vehicle, route_after (connected|broken with first_gap). remove=true with the same x,y,dir,length,side takes the loop track and both signals (including the one on the main track) out again; the main track stays.',
+    description: 'Template: passing loop for a single-track line. The main track runs length+2 tiles from x,y in direction dir (sw=+x, se=+y, ne=-x, nw=-y); a second track is laid beside it (side=1 or -1) with one-way path signals: trains heading dir use the main track, the others the loop. Both sides have length-1 clear tiles between the points and the exit signal (fits trains up to length-2 tiles). Give --train_tiles N or --for_vehicle ID (the longest train on that vehicle\'s line is used): length then defaults to train+2, and a loop with fewer than train+1 clear tiles is refused (loop_too_short). Checked first (AgentBridge v9): every main-line tile must be straight track along dir, or free land (not_straight_at / blocked_at / signal_at {x,y}); loop tiles must be free (loop_side_occupied_at). After a real build: loop_check (both directions through the loop) and, with --for_vehicle, route_after (connected|broken with first_gap). remove=true with the same x,y,dir,length,side takes the loop track and both signals (including the one on the main track) out again; the main track stays. A vehicle on the tiles (ERR_VEHICLE_IN_THE_WAY) gives transient: true and vehicles_in_the_way (blocked_by_vehicle in a dry run); --wait_clear_s N waits for it to pass and retries from that step.',
     args: z.object({ ...act, ...point, dir: z.enum(DIR_NAMES).default('sw').describe('sw=+x, se=+y, ne=-x, nw=-y'), length: int().min(2).max(30).optional().describe('default: train tiles + 2, else 6'),
       side: int().default(1), rail_type: int().optional(),
       train_tiles: int().min(1).max(40).optional().describe('longest train that must wait in the loop, in tiles'),
       for_vehicle: int().optional().describe('a train of this line: its longest train sets train_tiles; also traces its route after the build'),
-      remove: bool().default(false).describe('take out a loop built with the same arguments') }),
+      remove: bool().default(false).describe('take out a loop built with the same arguments'), ...waitClear }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const info = await s.gs.call('info');
@@ -2832,7 +2904,7 @@ export const COMMANDS = [
         }
         siteCheck = 'ok';
       }
-      const res = await run(ctx, a, t.steps, { railType: a.rail_type });
+      const res = await runClear(ctx, a, t.steps, { railType: a.rail_type });
       const out = { ...res, ...geometry, site_check: siteCheck };
       if (a.dry_run || !res.ok) return out;
       await s.refreshArea(a.x - length - 3, a.y - length - 3, a.x + length + 3, a.y + length + 3);
