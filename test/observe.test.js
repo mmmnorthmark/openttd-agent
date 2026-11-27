@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { startFakeServer } from './fake-server.js';
-import { meFromCompanies, tilesText, splitBox, tileBox, filterStations, filterEvents, eventLine, shortMoney } from '../src/observe.js';
+import { meFromCompanies, tilesText, splitBox, tileBox, filterStations, filterEvents, eventLine, shortMoney, problemGroups, depotsLine } from '../src/observe.js';
 
 let fake, ctx, runCommand;
 const run = (name, args) => runCommand(ctx, name, args);
@@ -157,4 +157,13 @@ test('overview shows the goal in one line', async () => {
   try {
     assert.match((await run('overview', { problems: false })).goal, /^active: WOOD 0\/3k \(0%\), VALUE .*deadline 1954/);
   } finally { await run('goal-clear', {}); }
+});
+
+test('problemGroups and depotsLine', () => {
+  const rows = [{ id: 50, problem: 'stopped_in_depot', suggested_fix: 'vehicle-start --vehicles 50' }, { id: 42, problem: 'stopped_in_depot', suggested_fix: 'vehicle-start --vehicles 42' },
+    { id: 9, problem: 'no_orders', evidence: 'no orders' }];
+  assert.deepEqual(problemGroups(rows), ['stopped_in_depot x2: 50 42; e.g. vehicle-start --vehicles 50', 'no_orders x1: 9; e.g. no orders']);
+  const v = [{ type: 'rail', state: 'in_depot', x: 1, y: 2 }, { type: 'rail', state: 'running', x: 1, y: 2 }];
+  assert.equal(depotsLine([['rail', [[1, 2, 0], [5, 5, 0]]], ['road', []], ['air', [[9, 9, 0]]]], v), 'rail 2 (1 vehicles inside), air 1');
+  assert.equal(depotsLine([['rail', []]], []), 'none');
 });

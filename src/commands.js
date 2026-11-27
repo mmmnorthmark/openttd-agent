@@ -27,7 +27,7 @@ import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, accept
 import { envelope, errorCode, listResult } from './envelope.js';
 import { takeOutputArgs, shapeResult } from './output.js';
 import { dateString, meFromCompanies, companyProfit, tilesText, splitBox, tileBox, filterStations, wordList, filterEvents, eventLine,
-  shortStationLine, shortVehicleLine, fleetLine, goalLine, problemLine, rivalLine } from './observe.js';
+  shortStationLine, shortVehicleLine, fleetLine, goalLine, problemGroups, depotsLine, rivalLine } from './observe.js';
 import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
@@ -2266,9 +2266,9 @@ export const COMMANDS = [
 
   {
     name: 'overview', group: 'operate', session: true,
-    description: 'One small per-turn snapshot instead of status + goal-status + companies + stations + vehicles + depots + events + vehicle-problems: date, paused, money/loan/max_loan/value/profit (last quarter), goal (one line), fleet (one line: counts per type and state, profit, loss makers), vehicle_lines (worst by profit last year), station_lines (lowest rating first), depots, problems (vehicle-problems rows with severity action, one line each), rivals (one line per other company), events since --since (yours, world news and company news; one line each) and latest_seq (pass it as --since next turn). Lines are capped (*_total says how many there are); use the full commands for detail.',
+    description: 'One small per-turn snapshot instead of status + goal-status + companies + stations + vehicles + depots + events + vehicle-problems: date, paused, money/loan/max_loan/value/profit (last quarter), goal (one line), fleet (one line: counts per type and state, profit, loss makers), vehicle_lines (worst by profit last year), station_lines (lowest rating first), depots, problems (vehicle-problems rows with severity action, one line per problem kind with the vehicle ids), rivals (one line per other company), events since --since (yours, world news and company news; one line each) and latest_seq (pass it as --since next turn). Lines are capped (*_total says how many there are); use the full commands for detail.',
     args: z.object({ ...who, since: int().min(0).default(0).describe('events after this seq (latest_seq of the last overview); 0 = the newest only'),
-      vehicle_lines: int().min(0).default(6), station_lines: int().min(0).default(10), event_lines: int().min(0).default(8),
+      vehicle_lines: int().min(0).default(5), station_lines: int().min(0).default(6), event_lines: int().min(0).default(5), problem_lines: int().min(0).default(6).describe('most problem kinds shown (one line per kind with the vehicle ids)'),
       problems: bool().default(true).describe('run the vehicle-problems checks (rail/road traces; about 1 s on a mid-size company)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
@@ -2281,8 +2281,8 @@ export const COMMANDS = [
       const names = new Map(stations.map((st) => [st.id, st.name]));
       const vehicles = vehiclesFromRows(vehicleRows);
       const minRating = (st) => Math.min(101, ...st.cargo.map((c) => c.rating_pct));
-      const depots = VEHICLE_TYPES.map((t, i) => [t, depotRows[i]]).filter(([, rows]) => rows.length)
-        .map(([t, rows]) => `${t} ${rows.length}${rows.some((r) => r[2] > 0) ? ` (${rows.reduce((n, r) => n + r[2], 0)} vehicles inside)` : ''}`).join(', ') || 'none';
+      // Vehicles inside from the vehicle list: the GS depots count (GSVehicleList_Depot) read 0 for stopped trains in a live 15.3 game.
+      const depots = depotsLine(VEHICLE_TYPES.map((t, i) => [t, depotRows[i]]), vehicles);
       let problems = null;
       if (a.problems) {
         const vp = COMMANDS_BY_NAME.get('vehicle-problems');
@@ -2301,7 +2301,7 @@ export const COMMANDS = [
         stations_total: stations.length,
         station_lines: [...stations].sort((p, q) => minRating(p) - minRating(q)).slice(0, a.station_lines).map(shortStationLine),
         depots,
-        ...(problems ? { problems_total: problems.length, problems: problems.slice(0, 8).map((p) => problemLine(p)) } : {}),
+        ...(problems ? { problems_total: problems.length, problems: problemGroups(problems).slice(0, a.problem_lines) } : {}),
         rivals: companyRows.filter((c) => c.id !== company).slice(0, 8).map(rivalLine),
         events_new: seen.length, events: cap(seen, a.since === 0 ? Math.min(3, a.event_lines) : a.event_lines).map(eventLine),
         latest_seq: events.length ? events.at(-1).seq : a.since,

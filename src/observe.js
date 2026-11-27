@@ -157,10 +157,34 @@ export function goalLine(g) {
   return `${g.status}: ${targets}; deadline ${g.deadline_year}${typeof g.days_left === 'number' ? `, ${g.days_left} days left` : ''}`;
 }
 
-/** Vehicle problem row -> "11 #1 stuck_or_lost: <fix>" (cut to `max` characters). */
-export function problemLine(p, max = 140) {
-  const text = `${p.id} #${p.unit_number} ${p.problem}: ${p.suggested_fix ?? p.evidence ?? ''}`;
-  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+/**
+ * Problem rows grouped by problem: "stopped_in_depot x4: 50 42 34 26; e.g. vehicle-start ..."
+ * (one line per problem kind, the first row's suggested fix cut to `max` characters).
+ */
+export function problemGroups(rows, max = 90) {
+  const groups = new Map();
+  for (const p of rows) {
+    if (!groups.has(p.problem)) groups.set(p.problem, []);
+    if (!groups.get(p.problem).includes(p.id)) groups.get(p.problem).push(p.id);
+  }
+  return [...groups].map(([problem, idList]) => {
+    const first = rows.find((p) => p.problem === problem);
+    const fix = String(first.suggested_fix ?? first.evidence ?? '');
+    const shown = idList.length > 12 ? `${idList.slice(0, 12).join(' ')} +${idList.length - 12}` : idList.join(' ');
+    return `${problem} x${idList.length}: ${shown}${fix ? `; e.g. ${fix.length > max ? `${fix.slice(0, max - 3)}...` : fix}` : ''}`;
+  });
+}
+
+/** Depot rows per type + decoded vehicles -> "rail 2 (4 vehicles inside), road 1" (inside = vehicles in_depot on a depot tile). */
+export function depotsLine(byType, vehicles) {
+  const parts = [];
+  for (const [type, rows] of byType) {
+    if (!rows.length) continue;
+    const tiles = new Set(rows.map((r) => `${r[0]},${r[1]}`));
+    const inside = vehicles.filter((v) => v.type === type && v.state === 'in_depot' && tiles.has(`${v.x},${v.y}`)).length;
+    parts.push(`${type} ${rows.length}${inside ? ` (${inside} vehicles inside)` : ''}`);
+  }
+  return parts.join(', ') || 'none';
 }
 
 /** Rival company row -> "1 Name: money 100k value 50k perf 210 profit 3k". */

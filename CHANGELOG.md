@@ -106,8 +106,9 @@ Observation and output (batch 6):
   max_loan, value, profit of the last quarter, the goal in one line, a fleet line, the worst
   vehicles, the lowest-rated stations, depots, action problems, rivals, new events (yours, world
   and company news) and `latest_seq` for the next call. Lines are capped (`--vehicle_lines`,
-  `--station_lines`, `--event_lines`; `*_total` gives the full counts); `--problems false` skips
-  the vehicle-problems traces. Not named `brief`: that is a reserved output argument.
+  `--station_lines`, `--event_lines`, `--problem_lines`; `*_total` gives the full counts);
+  problems come one line per kind with the vehicle ids; `--problems false` skips the
+  vehicle-problems traces. Live (6 trains, 4 stations, 2 companies): 0.9-1.3 KB, 0.6 s. Not named `brief`: that is a reserved output argument.
 
 ## 0.7.0 (2026-11-26)
 
