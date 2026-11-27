@@ -5,6 +5,13 @@ re-run `install-gamescript` when it changes.
 
 ## 0.8.0 (unreleased)
 
+Hardening (batch 8):
+
+- **AgentBridge v14** runs on OpenTTD 14.0 and 14.1 too: info.nut declares script API 14
+  (15.x loads it through its compat script); the two 15.0+ calls are chosen at run time.
+- Public hygiene: `tools/check_public.sh` (part of `npm run check`) fails on personal names,
+  paths, private IPs and hostnames; examples use RFC 5737 addresses.
+
 Road and fleet operations (batch 5; AgentBridge v13):
 
 - **AgentBridge v13** (host: `install-gamescript`, then load the game again): `town_rating` and

@@ -44,7 +44,7 @@ test('towns: my_rating per town (GS v13); an older GameScript says so', async ()
     assert.equal(old.ok, true);
     assert.equal(old.towns[0].my_rating, undefined);
     assert.match(old.my_rating_note, /v13/);
-  } finally { fake.state.gsVersion = 13; }
+  } finally { fake.state.gsVersion = 14; }
 });
 
 test('a local-authority refusal names the town, the rating and what is needed', async () => {

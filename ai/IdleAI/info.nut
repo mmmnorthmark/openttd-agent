@@ -8,6 +8,6 @@ class IdleAI extends AIInfo {
 	function GetDate()        { return "2026-11-24"; }
 	function CreateInstance() { return "IdleAI"; }
 	function GetShortName()   { return "IDLE"; }
-	function GetAPIVersion()  { return "15"; }
+	function GetAPIVersion()  { return "14"; }
 }
 RegisterAI(IdleAI());

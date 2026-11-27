@@ -363,7 +363,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 13, townRatings: { 1: ['good', 450] }, cashNeed: 0, refuseOps: [], slopeOps: [], dryMoney: null, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 14, townRatings: { 1: ['good', 450] }, cashNeed: 0, refuseOps: [], slopeOps: [], dryMoney: null, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
   const server = net.createServer((sock) => {
     state.openConnections++;
     sock.on('close', () => { state.openConnections--; });

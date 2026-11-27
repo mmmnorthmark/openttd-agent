@@ -5,12 +5,12 @@ class AgentBridge extends GSInfo {
 	function GetAuthor()      { return "openttd-agent"; }
 	function GetName()        { return "AgentBridge"; }
 	function GetDescription() { return "Lets coding agents query the world and build for their company over the admin port."; }
-	function GetVersion()     { return 13; }
+	function GetVersion()     { return 14; }
 	function MinVersionToLoad() { return 5; }
 	function GetDate()        { return "2026-11-27"; }
 	function CreateInstance() { return "AgentBridge"; }
 	function GetShortName()   { return "AGBR"; }
-	function GetAPIVersion()  { return "15"; }
+	function GetAPIVersion()  { return "14"; } // 14.x loads it as is; 15.x through compat_14.nut (see main.nut StationOwner/IsHouse)
 	function GetURL()         { return "https://github.com/mmmnorthmark/openttd-agent"; }
 	function IsDeveloperOnly() { return false; }
 

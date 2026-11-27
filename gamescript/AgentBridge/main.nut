@@ -235,7 +235,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 13,
+		bridge_version = 14,
 		event_seq = this.event_seq,
 		goals = this.goals.len(),
 	};
@@ -805,7 +805,7 @@ function AgentBridge::RecordEvent(ev) {
 			break;
 		case GSEvent.ET_STATION_FIRST_VEHICLE: {
 			local e = GSEventStationFirstVehicle.Convert(ev);
-			d = { type = "station_first_vehicle", station = e.GetStationID(), vehicle = e.GetVehicleID(), company = GSBaseStation.GetOwner(e.GetStationID()) };
+			d = { type = "station_first_vehicle", station = e.GetStationID(), vehicle = e.GetVehicleID(), company = this.StationOwner(e.GetStationID()) };
 			break;
 		}
 		case GSEvent.ET_TOWN_FOUNDED:
@@ -1309,6 +1309,25 @@ function AgentBridge::LoanStep(company, kind, n) {
 
 function AgentBridge::T(x, y) { return GSMap.GetTileIndex(x, y); }
 
+// ---- OpenTTD 14.x compatibility (v14) ------------------------------------------------
+// info.nut declares API "14": 14.x loads it as is, 15.x loads it through compat_14.nut (string
+// wrappers only). Two calls used here are newer than 14.x; pick them at run time.
+// GSBaseStation.GetOwner is 15.0+; 14.x has GSStation.GetOwner (removed in 15.0).
+function AgentBridge::StationOwner(station) {
+	if ("GetOwner" in GSBaseStation) return GSBaseStation.GetOwner(station); // gs-api-compat: 15.0+
+	return GSStation.GetOwner(station); // gs-api-compat: 14.x only
+}
+
+// GSTile.IsHouseTile is 15.0+. On 14.x: a town-authority tile owned by nobody that is not
+// transport, water, station, industry or clear land (an unowned object such as a transmitter also matches).
+function AgentBridge::IsHouse(tile) {
+	if ("IsHouseTile" in GSTile) return GSTile.IsHouseTile(tile); // gs-api-compat: 15.0+
+	if (GSTile.GetOwner(tile) != GSCompany.COMPANY_INVALID || GSTile.IsBuildable(tile) || GSTile.IsWaterTile(tile) || GSTile.IsStationTile(tile)) return false;
+	if (GSIndustry.IsValidIndustry(GSIndustry.GetIndustryID(tile))) return false;
+	if (GSTile.HasTransportType(tile, GSTile.TRANSPORT_RAIL) || GSTile.HasTransportType(tile, GSTile.TRANSPORT_ROAD) || GSTile.HasTransportType(tile, GSTile.TRANSPORT_WATER)) return false;
+	return GSTown.IsValidTown(GSTile.GetTownAuthority(tile));
+}
+
 // Building something that is already there counts as success (paths may reuse track/road).
 function AgentBridge::OrBuilt(ok) { return ok || GSError.GetLastError() == GSError.ERR_ALREADY_BUILT; }
 
@@ -1337,7 +1356,7 @@ function AgentBridge::PickBridge(length, fastest) {
 function AgentBridge::DemolishRefusal(company, tile, allow_houses) {
 	if (!GSMap.IsValidTile(tile)) return "is outside the map";
 	if (GSIndustry.IsValidIndustry(GSIndustry.GetIndustryID(tile))) return "is part of an industry";
-	if (GSTile.IsHouseTile(tile)) return allow_houses ? null : "is a town building (allow_houses=true permits it; the town's opinion of you drops)";
+	if (this.IsHouse(tile)) return allow_houses ? null : "is a town building (allow_houses=true permits it; the town's opinion of you drops)";
 	local owner = GSTile.GetOwner(tile);
 	if (owner != GSCompany.COMPANY_INVALID && owner != company) return "belongs to company " + owner;
 	if (owner == GSCompany.COMPANY_INVALID && (GSRoad.IsRoadTile(tile) || GSTile.IsStationTile(tile) || GSBridge.IsBridgeTile(tile) || GSTunnel.IsTunnelTile(tile))) return "is town or public infrastructure";
@@ -1364,7 +1383,7 @@ function AgentBridge::IsOwnLand(company, tile) {
 function AgentBridge::BuyLandRefusal(company, tile) {
 	if (!GSMap.IsValidTile(tile)) return "is outside the map";
 	if (GSIndustry.IsValidIndustry(GSIndustry.GetIndustryID(tile))) return "is part of an industry";
-	if (GSTile.IsHouseTile(tile)) return "is a town building";
+	if (this.IsHouse(tile)) return "is a town building";
 	local owner = GSTile.GetOwner(tile);
 	if (owner == company) return this.IsOwnLand(company, tile) ? "is already your owned land" : "is already your property";
 	if (owner != GSCompany.COMPANY_INVALID) return "belongs to company " + owner;
