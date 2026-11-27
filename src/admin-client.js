@@ -97,7 +97,7 @@ export class AdminClient extends EventEmitter {
           for (const [type, body] of splitter.push(chunk)) this._dispatch(type, new Reader(body));
         } catch (e) { log.error('admin', 'packet handling failed', { error: String(e) }); }
       });
-      this.sock.on('error', (e) => { if (!this.welcome) fail(connected ? authError() : new Error(`admin connect to ${this.host}:${this.port} failed: ${e.message}`)); else log.error('admin', 'socket error', { error: e.message }); });
+      this.sock.on('error', (e) => { if (!this.welcome) fail(connected ? authError() : new Error(`admin connect to ${this.host}:${this.port} failed: ${e.message}`)); else if (!this.closed) log.error('admin', 'socket error', { error: e.message }); });
       this.sock.on('close', () => {
         // Closed before welcome: the server refused the login (wrong or empty server admin password,
         // allow_insecure_admin_login off, admin slots full). Fail now instead of waiting for the timeout.
