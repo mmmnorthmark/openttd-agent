@@ -276,9 +276,14 @@ export function terminusSteps({ x, y, axis = 'x', platforms = 2, length = 5, exi
 }
 
 /**
- * Passing loop on a single line: main track on `length + 2` tiles from (x,y) in direction dir,
- * a parallel loop track beside it (side +1/-1), and one-way path signals so each direction
- * uses its own track. Track that already exists is kept.
+ * Passing loop on a single line, `length` >= 2, in frame P(along, lane) from (x,y) in direction dir:
+ * main track on P(-1..length+2, 0); points on P(0, 0) and P(length+1, 0); the loop track on
+ * P(0..length+1, 1) (curves at both ends). Trains heading `dir` use the main track, trains heading
+ * the other way the loop: one-way path signals on P(length, 0) (facing trains from P(length-1, 0))
+ * and P(2, 1) (facing trains from P(3, 1)). Each side then has `length - 1` clear tiles between the
+ * points a train comes in by and its exit signal, so a train of up to length - 2 tiles waits there
+ * with a tile to spare, clear of both points. Track that already exists is kept.
+ * Returns { steps, ends, clear_tiles, main: [[x,y]...], lane: [[x,y]...], signals: [[x,y,fx,fy]...], axis_bit }.
  */
 export function passingLoopSteps({ x, y, dir = 0, length = 6, side = 1 }) {
   if (length < 2) throw new Error('passing loop length must be at least 2');
@@ -288,12 +293,148 @@ export function passingLoopSteps({ x, y, dir = 0, length = 6, side = 1 }) {
   const loop = [P(-1, 0), P(0, 0)];
   for (let a = 0; a <= length + 1; a++) loop.push(P(a, 1));
   loop.push(P(length + 1, 0), P(length + 2, 0));
+  const signals = [[...P(length, 0), ...P(length - 1, 0)], [...P(2, 1), ...P(3, 1)]];
+  const lane = [];
+  for (let a = 0; a <= length + 1; a++) lane.push(P(a, 1));
   return {
     steps: [...railSteps({ tiles: main, bridges: [] }), ...railSteps({ tiles: loop, bridges: [] }),
-      ['signal', ...P(length, 0), ...P(length - 1, 0), SIGNAL_TYPES.path_oneway],
-      ['signal', ...P(1, 1), ...P(2, 1), SIGNAL_TYPES.path_oneway]],
+      ...signals.map((g) => ['signal', ...g, SIGNAL_TYPES.path_oneway])],
+    loopSteps: railSteps({ tiles: loop, bridges: [] }),
     ends: [{ x: P(0, 0)[0], y: P(0, 0)[1] }, { x: P(length + 1, 0)[0], y: P(length + 1, 0)[1] }],
+    clear_tiles: length - 1, main, lane, signals,
+    // GSRail track bit of a straight piece along dir: RAILTRACK_NE_SW (1) along x, RAILTRACK_NW_SE (2) along y.
+    axis_bit: dir % 2 === 0 ? 1 : 2,
   };
+}
+
+/** Steps that take a passingLoopSteps() loop out again: both signals, then the loop track and its points. The main track stays. */
+export function passingLoopRemoveSteps(loop) {
+  return [...loop.signals.map((g) => ['signal_remove', ...g]), ...loop.loopSteps.slice().reverse().map((st) => ['rail_remove', ...st.slice(1)])];
+}
+
+const LOOP_OK_CLASSES = new Set(['b', 't', 'f', 'k', 'h']); // buildable after auto-clearing
+
+/**
+ * First reason a passing loop cannot go here, or null. Main tiles must be straight plain track
+ * along the loop's axis (no points, crossings, stations or signals), or free land when the line is
+ * not built yet; loop tiles must be free land. railAt(x, y) -> rail_tiles tile or null; classAt from
+ * the map mirror. Returns { code, x, y, detail }.
+ */
+export function loopSiteProblem(loop, railAt, classAt) {
+  for (const [tx, ty] of loop.main) {
+    const t = railAt(tx, ty);
+    if (t) {
+      if (t.kind !== 't' || t.tracks !== loop.axis_bit) {
+        return { code: 'not_straight_at', x: tx, y: ty, detail: t.kind === 't' ? `track bits ${t.tracks} (points, a curve or crossing track), not one straight piece along the loop` : `a ${{ s: 'station', d: 'depot', w: 'waypoint', x: 'level crossing', b: 'bridge head', u: 'tunnel portal' }[t.kind] ?? t.kind} tile` };
+      }
+      if (t.signals) return { code: 'signal_at', x: tx, y: ty, detail: 'the main line already has a signal under the loop; remove it or move the loop' };
+      continue;
+    }
+    const c = classAt(tx, ty);
+    if (c === 'r') return { code: 'not_straight_at', x: tx, y: ty, detail: 'rail of another shape here' };
+    if (!LOOP_OK_CLASSES.has(c)) return { code: 'blocked_at', x: tx, y: ty, detail: `map class '${c}' (not free land or straight track)` };
+  }
+  for (const [tx, ty] of loop.lane) {
+    if (railAt(tx, ty) || classAt(tx, ty) === 'r') return { code: 'loop_side_occupied_at', x: tx, y: ty, detail: 'track already there; pick the other --side or another place' };
+    const c = classAt(tx, ty);
+    if (!LOOP_OK_CLASSES.has(c)) return { code: 'loop_side_occupied_at', x: tx, y: ty, detail: `map class '${c}' (not free land); pick the other --side or another place` };
+  }
+  return null;
+}
+
+// ---- passing-loop site search (loop-sites) ----------------------------------------------------
+
+/**
+ * Straight runs of a traced line: consecutive path tiles that are plain straight track along the
+ * direction of travel, without signals. path: [{x, y}] in order (traceRail `path`); railAt(x, y)
+ * -> rail_tiles tile. Returns [{ tiles: [[x, y]...], axis: 'x'|'y', from_index }] in path order.
+ */
+export function straightRuns(path, railAt) {
+  const runs = [];
+  let cur = null;
+  for (let i = 0; i < path.length; i++) {
+    const p = path[i];
+    const t = railAt(p.x, p.y);
+    const next = path[i + 1] ?? null, prev = path[i - 1] ?? null;
+    const step = next ?? prev;
+    const axis = step ? (step.x !== p.x ? 'x' : 'y') : null;
+    const straight = t && t.kind === 't' && !t.signals && axis && t.tracks === (axis === 'x' ? 1 : 2)
+      && (!prev || (axis === 'x' ? prev.y === p.y : prev.x === p.x)) && (!next || (axis === 'x' ? next.y === p.y : next.x === p.x));
+    if (straight && cur && cur.axis === axis) { cur.tiles.push([p.x, p.y]); continue; }
+    if (cur) runs.push(cur);
+    cur = straight ? { tiles: [[p.x, p.y]], axis, from_index: i } : null;
+  }
+  if (cur) runs.push(cur);
+  return runs;
+}
+
+/**
+ * Passing-loop sites on a traced line. Each straight run long enough for the loop footprint
+ * (length + 4 tiles) gets a candidate per side centred in the run, so the gap to the nearest
+ * bend, points, signal or station is as large as the run allows (`gap`); long runs also get
+ * positions every length + 6 tiles that keep minGap. Lane tiles are checked
+ * with loopSiteProblem. Returns candidates [{ x, y, dir, side, length, gap, path_index, problem }]
+ * sorted: no problem first, then gap >= minGap, then nearest the middle of the line.
+ */
+export function loopSites(path, railAt, classAt, { length = 6, minGap = 8 } = {}) {
+  const need = length + 4;
+  const out = [];
+  for (const run of straightRuns(path, railAt)) {
+    const R = run.tiles.length;
+    if (R < need) continue;
+    // The centred position, plus (on long runs) positions every need + 2 tiles that keep minGap,
+    // so a long straight line can take several loops.
+    const offsets = new Set([Math.floor((R - need) / 2)]);
+    for (let off = minGap; off + need <= R - minGap; off += need + 2) offsets.add(off);
+    for (const offset of [...offsets].sort((p, q) => p - q)) {
+      const gap = Math.min(offset, R - need - offset);
+      const [x0, y0] = run.tiles[offset];
+      const [x1, y1] = run.tiles[offset + need - 1];
+      // Anchor (x, y) is footprint tile 1 (the main track starts one tile behind it), pointing along the run.
+      const dir = run.axis === 'x' ? (x1 > x0 ? 0 : 2) : (y1 > y0 ? 1 : 3);
+      const [ax, ay] = run.tiles[offset + 1];
+      for (const side of [1, -1]) {
+        const loop = passingLoopSteps({ x: ax, y: ay, dir, length, side });
+        const problem = loopSiteProblem(loop, railAt, classAt);
+        out.push({ x: ax, y: ay, dir: DIR_NAMES[dir], side, length, gap, run_tiles: R, path_index: run.from_index + offset + 1, problem });
+      }
+    }
+  }
+  const mid = path.length / 2;
+  return out.sort((a, b) => (!!a.problem - !!b.problem) || ((b.gap >= minGap) - (a.gap >= minGap)) || (Math.abs(a.path_index - mid) - Math.abs(b.path_index - mid)) || (b.gap - a.gap));
+}
+
+/**
+ * Pick n loop sites spread along a line: for target positions (i+1)/(n+1) of the path, the free
+ * candidate (loopSites, no problem) nearest to it, keeping chosen loops at least length + 6 path
+ * tiles apart (footprints of length + 4 never overlap). Returns the chosen candidates (may be fewer than n).
+ */
+export function spreadLoops(cands, n, pathLen, length) {
+  const free = cands.filter((c) => !c.problem);
+  const chosen = [];
+  for (let i = 0; i < n; i++) {
+    const target = ((i + 1) * pathLen) / (n + 1);
+    const pick = free.filter((c) => chosen.every((q) => Math.abs(q.path_index - c.path_index) >= length + 6))
+      .sort((p, q) => Math.abs(p.path_index - target) - Math.abs(q.path_index - target))[0];
+    if (pick) chosen.push(pick);
+  }
+  return chosen.sort((p, q) => p.path_index - q.path_index);
+}
+
+/** rail_tiles-like tiles for a planned (not yet built) rail plan, so loopSites can run on it. Returns { path, railAt }. */
+export function plannedRail({ tiles, bridges }) {
+  const heads = new Set();
+  for (const i of bridges) { heads.add(i); heads.add(i + 1); }
+  const map = new Map();
+  const path = [];
+  for (let i = 1; i < tiles.length - 1; i++) {
+    const [x, y] = tiles[i];
+    const [px, py] = tiles[i - 1], [nx, ny] = tiles[i + 1];
+    const tracks = px === x && nx === x ? 2 : py === y && ny === y ? 1 : 4;
+    map.set(`${x},${y}`, { x, y, kind: heads.has(i) ? 'b' : 't', tracks: heads.has(i) ? 0 : tracks, signals: 0 });
+    path.push({ x, y });
+  }
+  return { path, railAt: (x, y) => map.get(`${x},${y}`) ?? null };
 }
 
 // ---- terminus site search -------------------------------------------------------------------

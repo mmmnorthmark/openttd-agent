@@ -7,9 +7,10 @@ import { PKT, PacketSplitter, Reader, encodePacket, cstr } from '../src/admin-cl
 export const FAKE_MAP = 64;
 
 // 64x64 world: flat clear land height 2, a water column at x=30 (y 0..63) except
-// a land bridge at y=50..52, a "town" block of houses at 40..44,10..14.
+// a land bridge at y=50..52, a "town" block of houses at 40..44,10..14, a road at y=9 (35..47).
 export function fakeTileClass(x, y) {
   if (x === 30 && !(y >= 50 && y <= 52)) return 'w';
+  if (y === 9 && x >= 35 && x <= 47) return x === 41 || x === 47 ? 's' : 'd'; // the road world of fakeRoadRows
   if (x >= 40 && x <= 44 && y >= 10 && y <= 14) return 'o';
   return 'b';
 }
@@ -101,12 +102,40 @@ function goalView(g, state) {
 function fakeRailRows(state) {
   const rows = [];
   for (let x = 10; x <= 12; x++) rows.push([x, 20, 's', 1, 3, -1, -1, 0, 0, 0]);
-  for (let x = 13; x <= 23; x++) rows.push([x, 20, 't', x === 13 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, 0]);
+  for (let x = 13; x <= 23; x++) rows.push([x, 20, 't', x === 13 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, x === 18 ? 1 << 4 : 0]); // (18,20): a path signal facing trains from (19,20)
   for (let x = 24; x <= 26; x++) rows.push([x, 20, 's', 1, 5, -1, -1, 0, 0, 0]);
   for (let x = 28; x <= 34; x++) rows.push([x, 40, 't', x === 31 ? 1 | 8 | 32 : 1, -1, -1, -1, 0, 0, 0]);
   rows.push([13, 21, 't', 2, -1, -1, -1, 0, 0, 0], [13, 22, 'd', 0, -1, 13, 21, 0, 0, 0],
     [12, 22, 'd', 0, -1, 12, 23, 0, 0, 0], [31, 41, 'd', 0, -1, 31, 40, 0, 0, 0]);
   return rows.filter((r) => `${r[0]},${r[1]}` !== state.railGap);
+}
+
+// Road world for road_tiles (AgentBridge v11), as [x, y, kind, links, station, a, b, owner]: road (35..46,9)
+// through drive-through stop 4 "Bigton Central" at (41,9), to bay stop 7 "Smallham Stop" at (47,9)
+// (front (46,9)); depot (36,8) facing (36,9). Bus 12 runs 4 -> 7. state.roadGap ("x,y") removes a
+// tile; state.roadOneWay ("x,y") lets vehicles on that tile drive only toward +x.
+function fakeRoadRows(state) {
+  const tiles = new Map(); // "x,y" -> { kind, edges, station, a, b }
+  const put = (x, y, kind, edges, extra = {}) => tiles.set(`${x},${y}`, { x, y, kind, edges: new Set(edges), station: -1, a: -1, b: -1, ...extra });
+  for (let x = 35; x <= 46; x++) put(x, 9, 'r', x === 35 ? [0] : [0, 2]);
+  tiles.get('36,9').edges.add(3);
+  put(41, 9, 't', [0, 2], { station: 4 });
+  put(47, 9, 's', [2], { station: 7, a: 46, b: 9 });
+  put(36, 8, 'd', [1], { a: 36, b: 9 });
+  if (state.roadGap) tiles.delete(state.roadGap);
+  const DX = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+  const rows = [];
+  for (const t of tiles.values()) {
+    let links = 0;
+    for (let d = 0; d < 4; d++) {
+      const n = tiles.get(`${t.x + DX[d][0]},${t.y + DX[d][1]}`);
+      if (!t.edges.has(d) || !n || !n.edges.has((d + 2) % 4)) continue;
+      if (state.roadOneWay === `${n.x},${n.y}` && d === 2) continue; // entering the one-way tile against it
+      links |= 1 << d;
+    }
+    rows.push([t.x, t.y, t.kind, links, t.station, t.a, t.b, 0]);
+  }
+  return rows;
 }
 
 const fakeDays = (state) => state.daysRun + (state.paused ? 0 : Math.floor((Date.now() - state.runningSince) / state.dayMs));
@@ -155,7 +184,16 @@ const GS = {
     [3, 3, 5, 60, [[7, 80, 75]], 1],
   ],
   towns: () => [[1, 'Bigton', 42, 12, 5000, false, 800, 10, 200, 0, 6], [2, 'Smallham', 10, 50, 300, false, 40, 0, 10, 0, 2]],
-  companies: (_a, state) => [{ id: 0, name: 'Test Transport', money: state.money, loan: state.loan, max_loan: FAKE_MAX_LOAN }],
+  companies: (_a, state) => [{ id: 0, name: 'Test Transport', money: state.money, loan: state.loan, max_loan: FAKE_MAX_LOAN, value: 50000, income: 9000, expenses: -4000, cargo_delivered: 300, performance: 210, hq: -1,
+    ...(state.gsVersion >= 12 ? { station_count: 4, vehicles_by_type: [state.lostTrain ? 2 : 1, 1, 0, 0] } : {}) }],
+  // v12 queries (see main.nut). Older versions answer "unknown cmd" through v12only.
+  company_history: (a) => Array.from({ length: (a.quarters ?? 4) + 1 }, (_, q) => [q, 50000 - q * 1000, 9000 - q * 500, -4000, 300 - q * 10, q === 0 ? -1 : 210 - q]),
+  rating_parts: (_a, state) => ({ profitable_vehicles: 1, vehicles_over_2_years: 1, min_profit: -3000, station_facilities: 5, station_facilities_served: 5, money: state.money, loan: state.loan }),
+  station_vehicles: (a) => [[3, [11]], [4, [12]], [5, [11]], [7, [12]]].filter(([st]) => a.station === undefined || st === a.station),
+  tile_owners: (a, state) => [...fakeRailRows(state), ...fakeRoadRows(state)].filter(([x, y]) => x >= a.x0 && x <= a.x1 && y >= a.y0 && y <= a.y1).map(([x, y]) => [x, y, 0]),
+  vehicle_wagons: (a) => (a.vehicle === 11 ? [[0, 5, 0xFF, 0], [1, 27, 7, 30], [2, 27, 7, 30], [3, 27, 7, 30], [4, 27, 7, 30]] : [[0, 9, 0, 31]]),
+  signs: (_a, state) => state.signs.map((g) => [g.id, g.x, g.y, 0, g.text]),
+  road_types: () => [[0, 'Road', false, 0, 61, true], [1, 'Tramway', true, 0, 70, true]],
   get_rate: () => ({ command_delay_ticks: 0, max_builds_per_day: 0 }),
   dump_tiles: dumpRows,
   // owned_land (v10): indices of the points that are a.company's owned land.
@@ -174,15 +212,18 @@ const GS = {
   },
   echo: (a) => a,
   build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 98766, echoed_company: a.company }),
+  test_build_road: (a) => ({ ok: true, cost: 1234, error: '', money: 100000, echoed_company: a.company }),
   // operate (row formats: see main.nut)
   stations: () => [
     [3, 'Bigton Woods', 12, 20, 1, [[7, 240, 35]], 2],
     [4, 'Bigton Central', 41, 9, 4 | 2, [[0, 15, 80]], 5],
     [5, 'Sawmill Halt', 24, 20, 1, [], 1],
+    [7, 'Smallham Stop', 47, 9, 2, [[0, 5, 60]], 1],
   ],
   // v9 rows end with [current_order, dest_x, dest_y, dest_station, speed].
   vehicles: (_a, state) => [
-    [11, 'Train 1', 0, 5, 'Kirby Paul Tank', 4000, 7300, 62, -1200, -3000, 9000, 0, 14, 20, 2, 2, 1, 800, false, 1, 13, 22, -1, 60],
+    // state.trainInDepot: train 11 is stopped in the depot at (13,22).
+    [11, 'Train 1', 0, 5, 'Kirby Paul Tank', 4000, 7300, 62, -1200, -3000, 9000, ...(state.trainInDepot ? [2, 13, 22] : [0, 14, 20]), 2, 2, 1, 800, false, 1, 13, 22, -1, state.trainInDepot ? 0 : 60],
     [12, 'Road Vehicle 1', 1, 9, 'MPS Regal Bus', 100, 5475, 98, 400, 2500, 4000, 3, 41, 9, 0xFFFE, 2, 1, 300, true, 0, 41, 9, 4, 0],
     ...(state.lostTrain ? [[13, 'Train 2', 0, 5, 'Kirby Paul Tank', 800, 7300, 90, -200, -900, 9000, 0, 30, 40, 2, 2, 2, 800, false, 0, 12, 20, 3, 40]] : []),
   ].map((r) => (state.gsVersion >= 9 ? r : r.slice(0, 19))),
@@ -190,7 +231,20 @@ const GS = {
     if (state.gsVersion < 9) throw new Error('unknown cmd: rail_tiles');
     return fakeRailRows(state).filter(([x, y]) => x >= a.x0 && x <= a.x1 && y >= a.y0 && y <= a.y1);
   },
+  road_tiles: (a, state) => {
+    if (state.gsVersion < 11) throw new Error('unknown cmd: road_tiles');
+    return fakeRoadRows(state).filter(([x, y]) => x >= a.x0 && x <= a.x1 && y >= a.y0 && y <= a.y1);
+  },
   vehicle: (a, state) => {
+    if (a.vehicle === 12) {
+      return [
+        { id: 12, name: 'Road Vehicle 1', type: 1, engine: 9, engine_name: 'MPS Regal Bus', age_days: 100, max_age_days: 5475, reliability_pct: 98,
+          profit_this_year: 400, profit_last_year: 2500, value: 4000, running_cost: 300, state: 3, x: 41, y: 9, speed: 0, group: 0xFFFE,
+          wagons: 1, length: 8, capacity: [[0, 31, 10]], shared_orders: true, order_count: 2, current_order: 0, unit_number: 1 },
+        [0, 'station', 41, 9, 0, 4, 'Bigton Central', -1],
+        [1, 'station', 47, 9, 0, 7, 'Smallham Stop', -1],
+      ];
+    }
     if (a.vehicle === 13 && state.lostTrain) {
       return [
         { id: 13, name: 'Train 2', type: 0, engine: 5, engine_name: 'Kirby Paul Tank', age_days: 800, max_age_days: 7300, reliability_pct: 90,
@@ -213,9 +267,10 @@ const GS = {
     [5, 'Kirby Paul Tank', 0xFF, 0, 64, 8000, 800, 75, 7300, 1925, 300, 47, false, 0],
     [27, 'Wood Truck', 7, 30, 0, 1500, 0, 0, 0, 1925, 0, 18, true, 0],
     [6, 'SH 8P', 0xFF, 0, 128, 21000, 1800, 80, 7300, 1954, 1000, 85, false, 0],
-  ].filter((r) => a.type === 0 && (a.cargo === undefined || a.cargo === 7)),
+  ].filter((r) => a.type === 0 && (a.cargo === undefined || a.cargo === 7))
+    .concat(a.type === 1 && (a.cargo === undefined || a.cargo === 7) ? [[40, 'Wood Truck R', 7, 20, 48, 4000, 400, 80, 5475, 1935, 0, 0, false, 0]] : []),
   groups: () => [[2, 'Wood line', 0, -1, 1, -1200, -3000, 40]],
-  depots: (a) => (a.type === 0 ? [[13, 22, 0], [12, 22, 0], [31, 41, 0]] : []),
+  depots: (a, state) => (a.type === 0 ? [[13, 22, 0, 13, 21], [12, 22, 0, 12, 23], [31, 41, 0, 31, 40]] : a.type === 1 ? [[36, 8, 0, 36, 9]] : []).map((r) => (state.gsVersion >= 12 ? r : r.slice(0, 3))),
   autorenew: () => ({ enabled: false, months: 6, money: 100000 }),
   events: (a) => [
     { seq: 1, date: '1950-1-3', type: 'industry_open', industry: 9, industry_type: 3, x: 5, y: 5 },
@@ -241,6 +296,31 @@ const GS = {
         if (!rows.at(-1)[0] && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
         continue;
       }
+      if (st[0] === 'veh_depot' && state.gsVersion >= 11) {
+        // As DepotStep in main.nut: 404 unknown, state.headingDepot ids already on their way, 11 in depot with trainInDepot, state.brokenDown ids broken.
+        if (st[1] === 404) rows.push([false, 0, `not_found: vehicle 404 does not exist or is not yours`, 0]);
+        else if (st[1] === 11 && state.trainInDepot) rows.push([true, 0, '', 3]);
+        else if (state.headingDepot.includes(st[1])) rows.push([true, 0, '', 2]);
+        else if (state.brokenDown.includes(st[1])) rows.push([false, 0, `broken_down: vehicle ${st[1]} is broken down; send it again once it moves (a few days) (ERR_UNKNOWN)`, 0]);
+        else rows.push([true, 0, '', 1]);
+        continue;
+      }
+      if (['veh_reverse', 'sign', 'sign_remove', 'hq'].includes(st[0]) && state.gsVersion < 12) {
+        rows.push([false, 0, `unknown exec op: ${st[0]}`, 0]);
+        if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+        continue;
+      }
+      if (st[0] === 'sign' && !a.dry_run) { const id = 50 + state.signs.length; state.signs.push({ id, x: st[1], y: st[2], text: st[3] }); rows.push([true, 0, '', id]); continue; }
+      if (st[0] === 'sign_remove') {
+        const i = state.signs.findIndex((g) => g.id === st[1]);
+        if (i < 0) rows.push([false, 0, `not_found: sign ${st[1]} does not exist or is not yours`, 0]); else { if (!a.dry_run) state.signs.splice(i, 1); rows.push([true, 0, '', 0]); }
+        continue;
+      }
+      if (st[0] === 'veh_buy' && st[5] >= 0 && state.attachFails && !a.dry_run) {
+        rows.push([false, 10, `bought vehicle ${100 + rows.length} but could not attach it to train ${st[5]}: ERR_UNKNOWN`, 100 + rows.length]);
+        if (!(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
+        continue;
+      }
       const bad = st[0] === 'bogus' || (st[0] === 'veh_sell' && st[1] === 404) || (!a.dry_run && state.failOps.includes(st[0]));
       rows.push(bad ? [false, 0, 'Vehicle not available', 0] : [true, 10, '', 100 + rows.length]);
       if (bad && !(a.keep_going ?? a.dry_run)) { stopped = `step ${rows.length - 1} failed`; break; }
@@ -253,8 +333,10 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], money: 100000, loan: 300000, gsVersion: 10, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [] };
   const server = net.createServer((sock) => {
+    state.openConnections++;
+    sock.on('close', () => { state.openConnections--; });
     const splitter = new PacketSplitter();
     const send = (type, payload) => sock.write(encodePacket(type, payload));
     sock.on('data', (chunk) => {
@@ -269,7 +351,8 @@ export function startFakeServer({ password = 'pw' } = {}) {
         } else if (type === PKT.ADMIN_GAMESCRIPT) {
           const req = JSON.parse(r.str());
           received.push(req);
-          const handler = req.cmd === 'owned_land' && state.gsVersion < 10 ? undefined : GS[req.cmd];
+          const v12only = ['company_history', 'rating_parts', 'station_vehicles', 'tile_owners', 'vehicle_wagons', 'signs', 'road_types'];
+          const handler = (req.cmd === 'owned_land' && state.gsVersion < 10) || (v12only.includes(req.cmd) && state.gsVersion < 12) || (req.cmd === 'info' && state.noGs) ? undefined : GS[req.cmd];
           const base = { id: req.id, client: req.client };
           if (!handler) { send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: false, part: 0, last: true, error: `unknown cmd: ${req.cmd}` }))); continue; }
           let data;

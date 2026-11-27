@@ -104,12 +104,12 @@ test('terraform and demolish normalise rectangles; demolish passes allow_houses'
 });
 
 test('rail-types and bridge-types decode rows', async () => {
-  assert.deepEqual((await run('rail-types', {}))[1], { id: 1, name: 'Electrified railway construction', max_speed: 0, track_cost: 75 });
-  assert.equal((await run('bridge-types', { length: 5 }))[1].price, 1500);
+  assert.deepEqual((await run('rail-types', {})).rail_types[1], { id: 1, name: 'Electrified railway construction', max_speed: 0, track_cost: 75 });
+  assert.equal((await run('bridge-types', { length: 5 })).bridge_types[1].price, 1500);
 });
 
 test('find-cargo-pairs pairs goods with towns that accept them; acceptance command', async () => {
-  const res = await run('find-cargo-pairs', { cargo: 'goods', with_effort: false });
+  const res = await run('find-cargo-pairs', { cargo: 'goods', with_effort: false, min_distance: 0 });
   assert.equal(res.total_candidates, 1, 'Smallham accepts goods only at 4');
   assert.equal(res.pairs[0].dest.kind, 'town');
   assert.equal(res.pairs[0].dest.name, 'Bigton');
@@ -194,7 +194,7 @@ test('purchase-land: dry run normalises corners, estimates cost and buys nothing
   assert.deepEqual(lastExec().steps, [['buy_land', 10, 30, 13, 32]]);
   assert.equal(lastExec().dry_run, true);
   assert.equal(lastExec().company, 0);
-  assert.deepEqual(res, { ok: true, dry_run: true, company: 0, area: [10, 30, 13, 32], tiles: 12, estimated_cost: 600, money: 100000, affordable: true });
+  assert.deepEqual(res, { ok: true, error: null, dry_run: true, company: 0, area: [10, 30, 13, 32], tiles: 12, estimated_cost: 600, money: 100000, affordable: true });
   assert.equal(fake.state.land.size, 0);
   await assert.rejects(run('purchase-land', { x0: 0, y0: 0, x1: 20, y1: 19, dry_run: true }), /area too large: 21x20 = 420 tiles; purchase-land buys at most 400/);
   await assert.rejects(run('purchase-land', { x0: 60, y0: 0, x1: 64, y1: 1 }), /outside the map/);
@@ -203,7 +203,7 @@ test('purchase-land: dry run normalises corners, estimates cost and buys nothing
 test('purchase-land buys, refuses the whole rectangle on protected tiles, and owned-land lists the plots', async () => {
   try {
     const res = await run('purchase-land', { x0: 10, y0: 30, x1: 13, y1: 32 });
-    assert.deepEqual(res, { ok: true, dry_run: false, company: 0, area: [10, 30, 13, 32], tiles_bought: 12, cost: 600, money: res.money });
+    assert.deepEqual(res, { ok: true, error: null, dry_run: false, company: 0, area: [10, 30, 13, 32], tiles_bought: 12, cost: 600, money: res.money });
     assert.equal(fake.state.land.size, 12);
     // houses at 40..44,10..14, already-owned tiles and another company's tile: nothing is bought
     fake.state.landOwnedBy['20,30'] = 1;
@@ -224,7 +224,7 @@ test('purchase-land buys, refuses the whole rectangle on protected tiles, and ow
     assert.equal(owned.tiles, 17);
     assert.deepEqual(owned.rects, [[10, 30, 13, 33], [50, 50, 50, 50]]);
     const part = await run('owned-land', { x0: 12, y0: 31, x1: 11, y1: 30 });
-    assert.deepEqual(part, { company: 0, area: [11, 30, 12, 31], tiles: 4, rects: [[11, 30, 12, 31]] });
+    assert.deepEqual(part, { ok: true, error: null, company: 0, area: [11, 30, 12, 31], tiles: 4, rects: [[11, 30, 12, 31]] });
     assert.deepEqual((await run('owned-land', { limit: 1 })).truncated, true);
     await assert.rejects(run('owned-land', { x0: 1, y0: 1 }), /give all of --x0 --y0 --x1 --y1/);
   } finally { fake.state.land.clear(); fake.state.landOwnedBy = {}; }
@@ -264,5 +264,135 @@ test('owned land commands explain an older AgentBridge; airport-sites still work
     await assert.rejects(run('owned-land', {}), /older than v10/);
     const res = await run('airport-sites', { town: 'Smallham', limit: 1 });
     assert.ok(res.sites.length && res.sites.every((st) => !('owned' in st)));
-  } finally { fake.state.gsVersion = 10; }
+  } finally { fake.state.gsVersion = 12; }
+});
+
+test('build-signal --remove: no_signal_here instead of ERR_PRECONDITION_FAILED', async () => {
+  const before = fake.received.filter((r) => r.cmd === 'exec').length;
+  const none = await run('build-signal', { x: 15, y: 20, front_x: 14, front_y: 20, remove: true });
+  assert.deepEqual([none.ok, none.first_error], [false, 'no_signal_here']);
+  assert.match(none.error, /the tile has no signals/);
+  const wrong = await run('build-signal', { x: 18, y: 20, front_x: 17, front_y: 20, remove: true });
+  assert.match(wrong.error, /one facing trains from \(19,20\): give that as --front_x/);
+  assert.equal(fake.received.filter((r) => r.cmd === 'exec').length, before, 'nothing was sent');
+  const ok = await run('build-signal', { x: 18, y: 20, front_x: 19, front_y: 20, remove: true });
+  assert.equal(ok.ok, true);
+  assert.deepEqual(lastExec().steps, [['signal_remove', 18, 20, 19, 20]]);
+  assert.equal((await run('build-signal', { x: 5, y: 5, front_x: 7, front_y: 5, remove: true })).first_error, 'front_not_adjacent');
+});
+
+test('road stops and depots: connected, --connect auto, decoded drive-through refusals', async () => {
+  const dep = await run('build-road-depot', { x: 38, y: 12, front_x: 38, front_y: 11, connect: 'auto' });
+  assert.equal(dep.ok, true);
+  assert.deepEqual([dep.connect.ok, dep.connect.from, dep.connect.to], [true, { x: 38, y: 11 }, { x: 38, y: 9 }]);
+  assert.equal(lastExec().steps[0][0], 'road');
+  fake.state.failOps = ['road_station'];
+  try {
+    const dt = await run('build-road-station', { x: 36, y: 9, front_x: 37, front_y: 9, drive_through: true });
+    assert.equal(dt.first_error, 'drive_through_refused');
+    assert.match(dt.error, /junction: road leaves \(36,9\) sideways/);
+  } finally { fake.state.failOps = []; }
+  const bay = await run('build-road-station', { x: 47, y: 10, front_x: 47, front_y: 9 });
+  assert.equal(bay.connected, false, 'the fake world has no stop there');
+  const dry = await run('build-road-depot', { x: 38, y: 12, front_x: 38, front_y: 11, dry_run: true });
+  assert.equal(dry.connected, undefined, 'a dry run builds nothing to check');
+});
+
+test('build-passing-loop: site check, train length, dry run ok, remove', async () => {
+  const sig = await run('build-passing-loop', { x: 15, y: 20, dir: 'sw', length: 4, dry_run: true });
+  assert.deepEqual([sig.ok, sig.first_error, sig.at], [false, 'signal_at', { x: 18, y: 20 }]);
+  const stn = await run('build-passing-loop', { x: 20, y: 20, dir: 'sw', length: 2, dry_run: true });
+  assert.deepEqual([stn.first_error, stn.at], ['not_straight_at', { x: 24, y: 20 }]);
+  assert.match(stn.error, /a station tile/);
+  const short = await run('build-passing-loop', { x: 5, y: 30, length: 4, train_tiles: 5, dry_run: true });
+  assert.equal(short.first_error, 'loop_too_short');
+  const fit = await run('build-passing-loop', { x: 5, y: 30, for_vehicle: 11, dry_run: true });
+  assert.deepEqual([fit.ok, fit.length, fit.train_tiles, fit.clear_tiles, fit.longest_train.vehicle], [true, 7, 5, 6, 11]);
+  assert.equal(fit.site_check, 'ok');
+  const built = await run('build-passing-loop', { x: 5, y: 30, length: 4 });
+  assert.equal(built.ok, true);
+  assert.ok(built.loop_check, 'a real build traces both directions');
+  assert.match(built.route_after, /not_checked/);
+  const rm = await run('build-passing-loop', { x: 5, y: 30, length: 4, remove: true });
+  assert.equal(rm.removed, true);
+  assert.deepEqual(lastExec().steps[0], ['signal_remove', 9, 30, 8, 30]);
+});
+
+test('find-cargo-pairs: default distance bounds and --near_x/--near_y/--radius', async () => {
+  const res = await run('find-cargo-pairs', { cargo: 'passengers', with_effort: false });
+  assert.deepEqual([res.distance_bounds.min, res.distance_bounds.max], [20, 200]);
+  assert.ok(res.distance_bounds.defaulted);
+  const near = await run('find-cargo-pairs', { cargo: 'passengers', with_effort: false, near_x: 10, near_y: 50, radius: 5 });
+  assert.ok(near.pairs.length > 0);
+  assert.ok(near.pairs.every((p) => p.source.name === 'Smallham'), JSON.stringify(near.pairs));
+  const far = await run('find-cargo-pairs', { cargo: 'passengers', with_effort: false, min_distance: 0, max_distance: 10 });
+  assert.equal(far.total_candidates, 0);
+  assert.equal(far.distance_bounds.defaulted, undefined);
+});
+
+test('towns --near_x/--near_y/--radius and --id; industries --id', async () => {
+  const near = await run('towns', { near_x: 12, near_y: 48, radius: 10 });
+  assert.deepEqual(near.towns.map((t) => [t.name, t.distance]), [['Smallham', 4]]);
+  assert.equal((await run('towns', { id: 1 })).towns[0].name, 'Bigton');
+  const ind = await run('industries', { id: 2 });
+  assert.deepEqual(ind.industries.map((i) => i.id), [2]);
+});
+
+test('build-cargo-route: town fallbacks; warnings for own stations near a new terminus', async () => {
+  const { siteFallbacks } = await import('../src/commands.js');
+  const f = siteFallbacks({ radius: 8, length: 4, platforms: 2 });
+  assert.deepEqual(f.map((o) => [o.radius, o.length, o.platforms]), [[8, 4, 2], [12, 4, 2], [12, 3, 2], [12, 3, 1], [16, 3, 1]]);
+  assert.equal(siteFallbacks({ radius: 8, length: 2, platforms: 1 }).length, 3);
+  const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true, allow_existing: true });
+  assert.equal(res.ok, true, JSON.stringify(res).slice(0, 400));
+  assert.ok(res.warnings.some((w) => w.near_own_station.id === 3 && w.end === 'source'), JSON.stringify(res.warnings));
+});
+
+test('depots: front and exit_dir (v12); build-rail-depot checks its front', async () => {
+  const { depotFrontCheck } = await import('../src/commands.js');
+  const res = await run('depots', {});
+  assert.deepEqual(res.depots[0], { x: 13, y: 22, vehicles: 0, front: { x: 13, y: 21 }, exit_dir: 'nw' });
+  // Depot (13,22) faces nw onto (13,21), straight track along y: trains can only leave towards nw (-y).
+  assert.deepEqual(depotFrontCheck({ kind: 't', tracks: 2, owner: 0 }, 3, 0).front_leads, ['nw']);
+  assert.match(depotFrontCheck({ kind: 't', tracks: 2, owner: 0 }, 3, 0).warning, /only head nw/);
+  assert.equal(depotFrontCheck({ kind: 't', tracks: 1, owner: 0 }, 3, 0).front_joined, false);
+  assert.equal(depotFrontCheck(null, 3, 0).front_joined, false);
+  // Front with a junction: straight along y plus the curve from its se edge to sw (8): leaves nw or sw.
+  assert.deepEqual(depotFrontCheck({ kind: 't', tracks: 2 | 8, owner: 0 }, 3, 0).front_leads.sort(), ['nw', 'sw']);
+  const b = await run('build-rail-depot', { x: 13, y: 22, front_x: 13, front_y: 21 });
+  assert.equal(b.exit_dir, 'nw');
+  assert.equal(b.front_joined, true);
+});
+
+test('build-hq: one hq step; refused on an older GameScript', async () => {
+  const res = await run('build-hq', { x: 20, y: 30, dry_run: true });
+  assert.equal(res.ok, true);
+  assert.deepEqual(fake.received.filter((q) => q.cmd === 'exec').at(-1).args.steps, [['hq', 20, 30]]);
+  fake.state.gsVersion = 11;
+  try { await assert.rejects(run('build-hq', { x: 20, y: 30 }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
+});
+
+test('road-types; --road_type reaches exec for road builds; engines --road_type', async () => {
+  const rt = await run('road-types', {});
+  assert.deepEqual(rt.road_types.map((r) => [r.id, r.tram]), [[0, false], [1, true]]);
+  const r = await run('build-road', { x1: 1, y1: 1, x2: 4, y2: 1, road_type: 1, dry_run: true });
+  assert.equal(r.ok, true);
+  const last = fake.received.filter((q) => q.cmd === 'exec').at(-1).args;
+  assert.deepEqual([last.steps, last.road_type], [[['road', 1, 1, 4, 1]], 1]);
+  await run('build-road-depot', { x: 5, y: 5, front_x: 5, front_y: 6, road_type: 1, dry_run: true });
+  assert.equal(fake.received.filter((q) => q.cmd === 'exec').at(-1).args.road_type, 1);
+});
+
+test('build-truck-route: dry run picks stops, road, depot and trucks; a real build starts and verifies', async () => {
+  const dry = await run('build-truck-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true });
+  assert.equal(dry.ok, true, JSON.stringify(dry).slice(0, 500));
+  assert.equal(dry.vehicle.id, 40);
+  assert.ok(dry.road.tiles > 10);
+  assert.ok(dry.estimated_cost > 0);
+  assert.equal(dry.dest_stop.acceptance >= 8, true);
+  const res = await run('build-truck-route', { from_industry: 1, to_industry: 2, cargo: 'wood', vehicles: 2 });
+  assert.deepEqual(res.built.map((b) => b.step), ['source_stop', 'dest_stop', 'road', 'depot', 'buy_vehicles', 'orders_and_start'], JSON.stringify(res).slice(0, 500));
+  const last = fake.received.filter((q) => q.cmd === 'exec').map((q) => q.args.steps).findLast((st) => st.some((x) => x[0] === 'order_add'));
+  assert.ok(last.some((x) => x[0] === 'orders_copy'));
+  assert.equal(last.filter((x) => x[0] === 'veh_start_stop').length, 2);
 });

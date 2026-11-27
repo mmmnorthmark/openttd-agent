@@ -56,6 +56,9 @@ function readGsVersion(dir) {
   } catch { return null; }
 }
 
+/** AgentBridge version shipped in this package (gamescript/AgentBridge/info.nut). */
+export function bundledGsVersion() { return readGsVersion(path.join(PACKAGE_ROOT, 'gamescript', GS_NAME)); }
+
 const ORIGINAL_BASESET = ['trg1r.grf', 'trgcr.grf', 'trghr.grf', 'trgir.grf', 'trgtr.grf', 'sample.cat'];
 
 export function doctor() {
@@ -85,7 +88,16 @@ export function doctor() {
   }
   report.next_steps = [];
   if (!exe) report.next_steps.push('Install OpenTTD 15.x');
-  if (report.gamescript_installed_version !== report.gamescript_bundled_version) report.next_steps.push('If you host: openttd-agent install-gamescript');
+  if (report.gamescript_installed_version !== report.gamescript_bundled_version) {
+    report.gamescript_warning = report.gamescript_installed_version === null ? 'AgentBridge is not installed'
+      : `installed AgentBridge v${report.gamescript_installed_version} differs from the v${report.gamescript_bundled_version} this openttd-agent ships`;
+    report.next_steps.push('If you host: openttd-agent install-gamescript, then launch the game again (a running game keeps the GameScript it started with)');
+  }
+  const gsProblems = gameScriptProblems();
+  if (gsProblems.length) {
+    report.launch_profile_game_scripts = gsProblems;
+    report.next_steps.push(`Launch profile ${gsProblems.map((p) => p.profile).join(', ')}: [game_scripts] lists ${gsProblems.map((p) => p.game_scripts.join(', ') || 'nothing').join('; ')}; AgentBridge must be the only entry: run openttd-agent launch again (it rewrites the section)`);
+  }
   return report;
 }
 
@@ -127,6 +139,48 @@ export function patchIni(text, patches) {
     }
   }
   return lines.join('\n');
+}
+
+/**
+ * Replace a whole INI section's body with `lines` (adds the section if missing). Used for
+ * [game_scripts]: OpenTTD starts the first entry listed there, so a `none =` or another script
+ * copied from the user's openttd.cfg would win over AgentBridge.
+ */
+export function replaceIniSection(text, section, bodyLines) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((l) => l.trim().toLowerCase() === `[${section}]`);
+  if (start === -1) return [...lines, '', `[${section}]`, ...bodyLines].join('\n');
+  let end = lines.findIndex((l, i) => i > start && /^\s*\[.*\]\s*$/.test(l));
+  if (end === -1) end = lines.length;
+  // Keep blank lines and comments that separate this section from the next one.
+  lines.splice(start + 1, end - start - 1, ...bodyLines, '');
+  return lines.join('\n');
+}
+
+/** Entries of an INI section (key names, comments and blanks skipped). */
+export function iniSectionKeys(text, section) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((l) => l.trim().toLowerCase() === `[${section}]`);
+  if (start === -1) return [];
+  const out = [];
+  for (let i = start + 1; i < lines.length && !/^\s*\[.*\]\s*$/.test(lines[i]); i++) {
+    const m = /^\s*([^;#=\s][^=]*?)\s*=/.exec(lines[i]);
+    if (m) out.push(m[1]);
+  }
+  return out;
+}
+
+/** Launch profiles whose openttd.cfg [game_scripts] lists anything but AgentBridge alone (doctor). */
+export function gameScriptProblems(profilesDir = path.join(CONFIG_DIR, 'profiles')) {
+  const out = [];
+  if (!fs.existsSync(profilesDir)) return out;
+  for (const name of fs.readdirSync(profilesDir)) {
+    const cfg = path.join(profilesDir, name, 'openttd.cfg');
+    if (name === 'join' || !fs.existsSync(cfg)) continue;
+    const keys = iniSectionKeys(fs.readFileSync(cfg, 'utf8'), 'game_scripts');
+    if (keys.length !== 1 || keys[0] !== GS_NAME) out.push({ profile: name, game_scripts: keys, fix: `openttd-agent launch --mode ${name === 'host' ? 'host' : 'dedicated'} rewrites it` });
+  }
+  return out;
 }
 
 /** A console save name: 1-64 of A-Z a-z 0-9 _ . -, not starting with '.', no path separators. Returns it or throws. */
@@ -173,12 +227,12 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
     if (!adminPassword) throw new Error('adminPassword is required to host (the launch command generates one when none is configured)');
     patches.network = {
       server_admin_port: adminPort, server_port: gamePort, allow_insecure_admin_login: 'true',
-      server_game_type: 'local', server_name: serverName, pause_on_join: 'false',
+      server_game_type: 'local', pause_on_join: 'false',
     };
     // Opcodes a script may run per tick before OpenTTD suspends it (game default 10000, max 250000).
     // Higher = faster map dumps and replies, at some cost to tick time on the host.
     patches.script = { script_max_opcode_till_suspend: scriptOpcodes };
-    patches.game_scripts = { [GS_NAME]: `command_delay_ticks=${commandDelayTicks},max_builds_per_day=${maxBuildsPerDay}` };
+
     patches.game_creation = { map_x: mapBits, map_y: mapBits };
     // Uncompressed saves: scenario-prepare reads and rewrites them (src/savegame.js). Read at startup only.
     patches.misc = { savegame_format: 'none' };
@@ -187,11 +241,19 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
     patches.construction = { command_pause_level: 3 };
     if (terrain !== undefined) patches.difficulty = { terrain_type: TERRAIN_TYPES.indexOf(terrain) }; // seed goes on the command line (-G); ini v7 dropped generation_seed
     fs.writeFileSync(path.join(dir, 'secrets.cfg'), `[network]\nadmin_password = ${adminPassword}\n`, { mode: 0o600 });
+    // client_name and server_name are private settings (private.cfg since ini_version 1; openttd.cfg
+    // entries are ignored). A dedicated server joins its own game as a client: name it, or the
+    // client list shows "Unnamed Client".
+    const privatePath = path.join(dir, 'private.cfg');
+    const privateText = fs.existsSync(privatePath) ? fs.readFileSync(privatePath, 'utf8') : '';
+    fs.writeFileSync(privatePath, patchIni(privateText, { network: { server_name: serverName, ...(mode === 'dedicated' ? { client_name: 'openttd-agent server' } : {}) } }));
   }
   let cfgText = fs.readFileSync(cfgPath, 'utf8');
   if (!/^\s*\[version\]\s*$/m.test(cfgText)) cfgText = `[version]\nini_version = ${INI_VERSION}\n\n${cfgText}`;
   cfgText = cfgText.replace(/^\s*generation_seed\s*=.*\n?/m, '');
-  fs.writeFileSync(cfgPath, patchIni(cfgText, patches));
+  cfgText = patchIni(cfgText, patches);
+  if (mode !== 'join') cfgText = replaceIniSection(cfgText, 'game_scripts', [`${GS_NAME} = command_delay_ticks=${commandDelayTicks},max_builds_per_day=${maxBuildsPerDay}`]);
+  fs.writeFileSync(cfgPath, cfgText);
 
   const args = ['-c', cfgPath];
   if (mode === 'dedicated') args.push('-D', `${bind}:${gamePort}`, '-d', 'script=4');

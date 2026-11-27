@@ -103,9 +103,29 @@ test('passing loop: main track, loop track with four curve pieces, two one-way p
   const t = passingLoopSteps({ x: 20, y: 20, length: 4 });
   assert.deepEqual(t.steps[0], ['rail', 19, 20, 20, 20, 26, 20]);
   assert.equal(t.steps.filter((s) => s[0] === 'rail').length, 6);
-  assert.deepEqual(t.steps.slice(-2), [['signal', 24, 20, 23, 20, 5], ['signal', 21, 21, 22, 21, 5]]);
+  assert.deepEqual(t.steps.slice(-2), [['signal', 24, 20, 23, 20, 5], ['signal', 22, 21, 23, 21, 5]]);
   assert.deepEqual(t.ends, [{ x: 20, y: 20 }, { x: 25, y: 20 }]);
+  // Equal clear run on both sides: main 21..23 (points at 20, signal at 24), loop 23..25 (points at 25,0; signal at 22,1).
+  assert.equal(t.clear_tiles, 3);
+  const mainClear = 24 - 20 - 1, loopClear = 25 - 22;
+  assert.equal(mainClear, loopClear);
   assert.throws(() => passingLoopSteps({ x: 1, y: 1, length: 1 }), /at least 2/);
+});
+
+test('passing loop: site check and remove steps', async () => {
+  const { loopSiteProblem, passingLoopRemoveSteps } = await import('../src/planner.js');
+  const t = passingLoopSteps({ x: 20, y: 20, length: 4 });
+  const straight = (x, y) => (y === 20 ? { kind: 't', tracks: 1, signals: 0 } : null);
+  assert.equal(loopSiteProblem(t, straight, () => 'b'), null);
+  const bend = (x, y) => (y === 20 ? { kind: 't', tracks: x === 23 ? 1 | 8 : 1, signals: 0 } : null);
+  assert.deepEqual(loopSiteProblem(t, bend, () => 'b').code, 'not_straight_at');
+  assert.deepEqual(loopSiteProblem(t, bend, () => 'b').x, 23);
+  assert.equal(loopSiteProblem(t, () => null, (x, y) => (x === 22 && y === 20 ? 'o' : 'b')).code, 'blocked_at');
+  assert.equal(loopSiteProblem(t, (x, y) => (y === 21 && x === 22 ? { kind: 't', tracks: 1, signals: 0 } : straight(x, y)), () => 'b').code, 'loop_side_occupied_at');
+  const rm = passingLoopRemoveSteps(t);
+  assert.deepEqual(rm.slice(0, 2), [['signal_remove', 24, 20, 23, 20], ['signal_remove', 22, 21, 23, 21]]);
+  assert.ok(rm.slice(2).every((st) => st[0] === 'rail_remove'));
+  assert.deepEqual(rm.at(-1), ['rail_remove', 19, 20, 20, 20, 20, 21], 'the points piece on the main track goes last');
 });
 
 test('terminusCandidates: sites stay on flat buildable land within reach, facing `toward`', async () => {
@@ -162,4 +182,46 @@ test('depotCandidates: depot beside a straight line piece, away from the station
   assert.equal(steps.length, 3);
   assert.deepEqual(steps[1].slice(5), [6, 10]);
   assert.deepEqual(steps[2].slice(5), [8, 10]);
+});
+
+test('loopSites: centres a loop in each long straight run and ranks by the gap to bends', async () => {
+  const { loopSites, straightRuns } = await import('../src/planner.js');
+  // Line: 30 tiles along y=10 from x=0, a curve at (30,10), then 8 tiles down x=30 (too short for length 6).
+  const path = [];
+  for (let x = 0; x <= 30; x++) path.push({ x, y: 10 });
+  for (let y = 11; y <= 18; y++) path.push({ x: 30, y });
+  const rail = new Map(path.map((p, i) => [`${p.x},${p.y}`, { x: p.x, y: p.y, kind: i === 0 ? 's' : 't', tracks: p.x === 30 && p.y === 10 ? 32 : p.y === 10 ? 1 : 2, signals: 0, owner: 0 }]));
+  const railAt = (x, y) => rail.get(`${x},${y}`) ?? null;
+  const runs = straightRuns(path, railAt);
+  assert.deepEqual(runs.map((r) => [r.axis, r.tiles.length]), [['x', 29], ['y', 8]]);
+  const sites = loopSites(path, railAt, () => 'b', { length: 6, minGap: 8 });
+  assert.equal(sites.length, 4); // one run long enough: centred and one more position, two sides each
+  const s0 = sites[0];
+  assert.deepEqual([s0.dir, s0.length, s0.gap, s0.problem], ['sw', 6, 9, null]);
+  // Run x=1..29 (29 tiles), footprint 10, offset 9: footprint x=10..19, anchor x=11.
+  assert.deepEqual([s0.x, s0.y], [11, 10]);
+  // A house beside the track on one side: that side gets a problem and sorts last.
+  const blocked = loopSites(path, railAt, (x, y) => ((y === 11 || y === 9) && x === 14 ? 'o' : 'b'), { length: 6 });
+  assert.equal(blocked.filter((q) => q.problem).length, 4);
+  assert.equal(blocked[0].problem.code, 'loop_side_occupied_at');
+});
+
+test('plannedRail + spreadLoops: loops spread along a planned straight line, kept apart', async () => {
+  const { plannedRail, spreadLoops, loopSites } = await import('../src/planner.js');
+  const tiles = [];
+  for (let x = 0; x <= 81; x++) tiles.push([x, 5]);
+  const { path, railAt } = plannedRail({ tiles, bridges: [] });
+  assert.equal(path.length, 80);
+  assert.equal(railAt(10, 5).tracks, 1);
+  // The whole line is one straight run, so loopSites offers its middle; spreadLoops needs more
+  // candidates to spread, so build them by hand at several positions.
+  const cands = [10, 20, 30, 40, 50, 60, 70].map((i) => ({ x: i, y: 5, dir: 'sw', side: 1, path_index: i, problem: null }));
+  const two = spreadLoops(cands, 2, 80, 6);
+  assert.deepEqual(two.map((c) => c.path_index), [30, 50]);
+  const three = spreadLoops(cands, 3, 80, 6);
+  assert.deepEqual(three.map((c) => c.path_index), [20, 40, 60]);
+  assert.equal(spreadLoops(cands.slice(0, 1), 2, 80, 6).length, 1);
+  const sites = loopSites(path, railAt, () => 'b', { length: 6 });
+  assert.ok(sites.length >= 8, `long straight run gives several positions (${sites.length})`);
+  assert.equal(spreadLoops(sites, 2, path.length, 6).length, 2);
 });

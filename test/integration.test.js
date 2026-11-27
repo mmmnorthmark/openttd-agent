@@ -42,7 +42,7 @@ test('library: connect, find wood pairs ranked by route effort', async () => {
     assert.equal(res.pairs[0].route.reachable, true);
     assert.ok(res.map_complete);
     const gaps = await game.run('town-gaps', { min_population: 0 });
-    assert.equal(gaps[0].name, 'Bigton');
+    assert.equal(gaps.towns[0].name, 'Bigton');
   } finally { game.close(); }
 });
 
@@ -73,6 +73,8 @@ test('client-side rate limit blocks builds over max_builds_per_minute', async ()
   try {
     await runCommand(ctx, 'build-road', { x1: 1, y1: 1, x2: 2, y2: 1 });
     await assert.rejects(runCommand(ctx, 'build-road', { x1: 1, y1: 1, x2: 2, y2: 1 }), /client rate limit/);
+    const dry = await runCommand(ctx, 'build-road', { x1: 1, y1: 1, x2: 2, y2: 1, dry_run: true });
+    assert.deepEqual([dry.ok, dry.dry_run, dry.cost], [true, true, 1234], 'a dry run needs no build slot');
   } finally { ctx.close(); }
 });
 
@@ -85,9 +87,11 @@ test('build-track sends one rail piece from -> tile -> to', async () => {
 });
 
 test('build-road-depot also joins its entrance to the road', async () => {
-  await cli('build-road-depot', '--x', '27', '--y', '62', '--front_x', '26', '--front_y', '62');
-  const steps = fake.received.at(-1).args.steps;
+  const res = await cli('build-road-depot', '--x', '27', '--y', '62', '--front_x', '26', '--front_y', '62');
+  const steps = fake.received.filter((r) => r.cmd === 'exec').at(-1).args.steps;
   assert.deepEqual(steps[1], ['road', 26, 62, 27, 62]);
+  assert.equal(res.connected, false, 'the fake road world has no road there');
+  assert.match(res.hint, /--connect auto/);
 });
 
 test('unknown flags are refused and nothing runs; --help prints command help', async () => {
@@ -99,4 +103,18 @@ test('unknown flags are refused and nothing runs; --help prints command help', a
   assert.equal(fake.received.filter((r) => r.cmd === 'exec' || r.cmd === 'build_road').length, fake.received.slice(0, before).filter((r) => r.cmd === 'exec' || r.cmd === 'build_road').length);
   const help = (await run(process.execPath, [BIN, 'turn-advance', '--help'], { env })).stdout;
   assert.match(help, /^turn-advance: /);
+});
+
+test('a game without AgentBridge: connect fails with the launch hint and closes its admin connection', async () => {
+  const { startFakeServer } = await import('./fake-server.js');
+  const f2 = await startFakeServer({ password: 'pw' });
+  f2.state.noGs = true;
+  const { Session } = await import('../src/session.js');
+  try {
+    for (let i = 0; i < 3; i++) {
+      await assert.rejects(new Session({ host: '127.0.0.1', admin_port: f2.port, admin_password: 'pw', tile_refresh_rows_per_sec: 0 }).connect(), /did not answer.*\[game_scripts\]/);
+    }
+    for (let i = 0; i < 50 && f2.state.openConnections > 0; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(f2.state.openConnections, 0, 'no admin connection left open');
+  } finally { f2.server.close(); }
 });

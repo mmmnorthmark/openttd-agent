@@ -4,11 +4,12 @@
 //   openttd-agent guide [--role host|player] setup checklist; follow "next"
 //   openttd-agent <command> [--key value]   run a command, JSON result on stdout
 //   openttd-agent <command> --args '{"k":1}'
+//   openttd-agent --profile NAME <command> ...  use ~/.openttd-agent/players/NAME.json (or OPENTTD_AGENT_PROFILE)
 //   openttd-agent batch < calls.jsonl        one {"name","args"} per line -> one JSON result per line
 //   openttd-agent mcp [--tools a,b] [--compact true]  run as an MCP server (stdio), optionally only some tools
 //   openttd-agent daemon | daemon-stop       local background connection (auto-started)
 //   openttd-agent relay [--port N] [--bind A] host: serve registered players over the LAN (foreground)
-// Exit code 0 on success, 1 on error (error JSON on stdout: {"error": "..."}).
+// Exit code 0 on success, 1 on error (error JSON on stdout: {"ok": false, "error": "...", "first_error": "<code>"}).
 
 import readline from 'node:readline';
 import { COMMANDS_BY_NAME, describeCommands, runCommand } from '../src/commands.js';
@@ -16,6 +17,7 @@ import { loadConfig } from '../src/config.js';
 import { ensureDaemon, callDaemon, startDaemon, stopDaemon } from '../src/daemon.js';
 import { makeContext } from '../src/context.js';
 import { VERSION } from '../src/version.js';
+import { errorResult } from '../src/envelope.js';
 
 function parseFlags(argv) {
   const args = {};
@@ -38,11 +40,14 @@ async function execute(name, args, noDaemon) {
   const cmd = COMMANDS_BY_NAME.get(name);
   if (!cmd) throw new Error(`unknown command '${name}'. Run: openttd-agent help`);
   // With a relay configured the host's relay is the long-lived process; no local daemon needed.
-  if (!cmd.session || noDaemon || loadConfig().relay) {
+  // A profile in direct (admin-port) mode may name its own company: run in this process, because the
+  // shared daemon runs with the base config.
+  const cfg = loadConfig();
+  if (!cmd.session || noDaemon || cfg.relay || cfg.profile) {
     const ctx = makeContext();
     try { return await runCommand(ctx, name, args); } finally { ctx.close(); }
   }
-  const port = loadConfig().daemon_port;
+  const port = cfg.daemon_port;
   await ensureDaemon(port);
   return callDaemon(port, name, args);
 }
@@ -86,8 +91,19 @@ function printCommandHelp(name) {
   process.stdout.write(lines.join('\n') + '\n');
 }
 
+/** Remove the global --profile NAME (anywhere on the line) and set OPENTTD_AGENT_PROFILE from it. */
+function takeProfile(argv) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--profile') { process.env.OPENTTD_AGENT_PROFILE = argv[++i] ?? ''; continue; }
+    if (argv[i].startsWith('--profile=')) { process.env.OPENTTD_AGENT_PROFILE = argv[i].slice('--profile='.length); continue; }
+    out.push(argv[i]);
+  }
+  return out;
+}
+
 async function main() {
-  const [name, ...rest] = process.argv.slice(2);
+  const [name, ...rest] = takeProfile(process.argv.slice(2));
   if (!name || name === 'help' || name === '--help' || name === '-h') return printHelp();
   if (name === 'version' || name === '--version') return console.log(VERSION);
   if (rest.includes('--help') || rest.includes('-h')) return printCommandHelp(name);
@@ -113,7 +129,7 @@ async function main() {
       try {
         const { name: n, args = {} } = JSON.parse(line);
         console.log(JSON.stringify({ name: n, result: await execute(n, args, false) }));
-      } catch (e) { failed = true; console.log(JSON.stringify({ error: e.message })); }
+      } catch (e) { failed = true; console.log(JSON.stringify(errorResult(e.message))); }
     }
     process.exitCode = failed ? 1 : 0;
     return;
@@ -124,6 +140,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.log(JSON.stringify({ error: e.message }));
+  console.log(JSON.stringify(errorResult(e.message)));
   process.exitCode = 1;
 });

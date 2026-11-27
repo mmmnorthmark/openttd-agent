@@ -55,3 +55,31 @@ test('breakdowns, low reliability and old age are info; the fix does not stop a 
   assert.match(low[0].suggested_fix, /^none needed.*--vehicles 31 --service true/);
   assert.equal(vehicleProblems(train({ state: 'in_depot' }), { today: 10 })[0].severity, 'action');
 });
+
+test('stall samples: standing still on one tile builds up, moving clears; two near each other = deadlock', async () => {
+  const { recordStall, deadlockPartners } = await import('../src/problems.js');
+  const h = new Map();
+  assert.equal(recordStall(h, 'a', { date: 100, x: 5, y: 5, speed: 0, state: 'at_station' }), null);
+  recordStall(h, 'a', { date: 100, x: 5, y: 5, speed: 0, state: 'running' });
+  const e = recordStall(h, 'a', { date: 115, x: 5, y: 5, speed: 0, state: 'running' });
+  assert.deepEqual([e.since, e.samples], [100, 2]);
+  assert.equal(recordStall(h, 'a', { date: 116, x: 6, y: 5, speed: 30, state: 'running' }), null);
+  assert.equal(h.has('a'), false);
+  const v = { id: 7, x: 5, y: 5, type: 'rail', state: 'running', order_count: 2, profit_last_year: 0, age_days: 10, age_pct: 1, reliability_pct: 90, speed: 0 };
+  const stalled = vehicleProblems(v, { today: 115, stall: { x: 5, y: 5, since: 100, samples: 2 }, stallDays: 10 });
+  assert.deepEqual(stalled.map((p) => p.problem), ['stalled_on_line']);
+  const partners = deadlockPartners([{ id: 7, x: 5, y: 5, type: 'rail' }, { id: 8, x: 9, y: 6, type: 'rail' }, { id: 9, x: 60, y: 60, type: 'rail' }]);
+  assert.deepEqual([partners.get(7), partners.get(8), partners.get(9)], [[8], [7], undefined]);
+  const dl = vehicleProblems(v, { today: 115, stall: { x: 5, y: 5, since: 100, samples: 2 }, stallDays: 10, partners: [8] });
+  assert.equal(dl[0].problem, 'deadlock');
+  assert.match(dl[0].suggested_fix, /vehicle-reverse --vehicles 7/);
+  // Too short a stall: nothing.
+  assert.deepEqual(vehicleProblems(v, { today: 105, stall: { x: 5, y: 5, since: 100, samples: 2 }, stallDays: 10 }), []);
+});
+
+test('parked days in stopped_in_depot; loose wagons', () => {
+  const parked = vehicleProblems(train({ state: 'in_depot' }), { today: 50, parkedDays: 40 });
+  assert.match(parked.find((p) => p.problem === 'stopped_in_depot').evidence, /parked for 40 days/);
+  const loose = vehicleProblems(train({ state: 'in_depot', unit_number: -1 }), { today: 50 });
+  assert.deepEqual(loose.map((p) => p.problem), ['loose_wagons']);
+});

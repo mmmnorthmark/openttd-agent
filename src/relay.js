@@ -17,6 +17,7 @@ import { COMMANDS_BY_NAME, runCommand } from './commands.js';
 import { CONFIG_DIR, loadConfig } from './config.js';
 import { loadPlayers, playerForToken } from './relay-players.js';
 import { playerView } from './session.js';
+import { makeStatsRecorder } from './relay-stats.js';
 import { log } from './log.js';
 import { VERSION } from './version.js';
 
@@ -25,6 +26,11 @@ export const AUDIT_FILE = path.join(CONFIG_DIR, 'relay-audit.jsonl');
 const PLAYER_GROUPS = new Set(['game', 'world', 'build', 'operate']); // anything else (setup, relay, future groups) is host-only
 const UNAUDITED_GROUPS = new Set(['world']);                         // read-only map/economy queries, called constantly
 const MAX_BODY_BYTES = 1_000_000;
+// Read-only commands a player may run for another company: what the game window shows anyone
+// (a rival's station list with waiting cargo and ratings; its vehicle counts per type in the
+// company window). The commands themselves trim a rival's view (stations: no vehicle counts;
+// vehicles: counts only). Everything else stays bound to the player's own company.
+export const RIVAL_READS = new Set(['stations', 'vehicles']);
 
 export class Refused extends Error {}
 
@@ -45,10 +51,12 @@ export function authorize(player, name, rawArgs = {}) {
       throw new Refused(`player '${player.name}' is not bound to a company yet. Ask the host to run: openttd-agent relay-set-company --name ${player.name} --company <id>. run: openttd-agent guide`);
     }
     const asked = args.company;
-    if (asked !== undefined && asked !== null && asked !== '' && Number(asked) !== player.company) {
-      throw new Refused(`player '${player.name}' is bound to company ${player.company} and cannot act as company ${asked}`);
+    const other = asked !== undefined && asked !== null && asked !== '' && Number(asked) !== player.company;
+    if (other && !RIVAL_READS.has(name)) {
+      throw new Refused(`player '${player.name}' is bound to company ${player.company} and cannot act as company ${asked}${RIVAL_READS.size ? ` (other companies can only be read with: ${[...RIVAL_READS].join(', ')}; companies lists all)` : ''}`);
     }
-    args.company = player.company;
+    if (other && !/^\d+$/.test(String(asked))) throw new Refused(`company must be a company id, got '${asked}'`);
+    args.company = other ? Number(asked) : player.company;
   }
   if (name === 'chat' && typeof args.message === 'string') args.message = `[${player.name}] ${args.message}`;
   return args;
@@ -81,6 +89,7 @@ const bearer = (req) => /^Bearer\s+(\S+)$/i.exec(req.headers.authorization ?? ''
 export function startRelay({ port = loadConfig().relay_port, bind = '0.0.0.0' } = {}) {
   const ctx = makeContext();          // the host's own config: admin port on this machine + admin password
   const throttles = new Map();        // player name -> { times: [build timestamps] } (survives reconnects and re-binds)
+  const stats = makeStatsRecorder();  // liveness per player for the host's relay-stats (never served here)
 
   /** Context for one request: the shared session seen as this player. */
   const playerContext = (player) => {
@@ -101,6 +110,7 @@ export function startRelay({ port = loadConfig().relay_port, bind = '0.0.0.0' } 
       player = playerForToken(bearer(req), loadPlayers()); // re-read each time: host changes apply at once
       if (!player) {
         audit({ outcome: 'auth_failed', remote });
+        stats.record({ player: null, outcome: 'auth_failed' });
         return reply(401, { ok: false, error: 'relay: missing or unknown token. Ask the host for one (openttd-agent relay-add-player), then: openttd-agent configure --relay <url> --token <token>. run: openttd-agent guide' });
       }
       const parsed = JSON.parse((await readBody(req)) || '{}');
@@ -111,11 +121,13 @@ export function startRelay({ port = loadConfig().relay_port, bind = '0.0.0.0' } 
       const result = await runCommand(playerContext(player), name, args);
       const ms = Date.now() - started;
       log.info('relay', 'call', { player: player.name, name, ms });
+      stats.record({ player: player.name, outcome: 'ok', name });
       if (!UNAUDITED_GROUPS.has(COMMANDS_BY_NAME.get(name).group)) audit({ outcome: 'ok', player: player.name, company: player.company, remote, name, args, ms });
       reply(200, { ok: true, result });
     } catch (e) {
       const refused = e instanceof Refused;
       log.warn('relay', refused ? 'refused' : 'call failed', { player: player?.name, name, error: e.message });
+      stats.record({ player: player?.name ?? null, outcome: refused ? 'refused' : 'error', name });
       audit({ outcome: refused ? 'refused' : 'error', player: player?.name, company: player?.company, remote, name, args, error: e.message, ms: Date.now() - started });
       reply(refused ? 403 : 200, { ok: false, error: refused ? `relay refused: ${e.message}` : e.message });
     }
@@ -126,7 +138,7 @@ export function startRelay({ port = loadConfig().relay_port, bind = '0.0.0.0' } 
     server.listen(port, bind, () => {
       const actual = server.address().port;
       log.info('relay', 'listening', { bind, port: actual, pid: process.pid, players: loadPlayers().length, audit: AUDIT_FILE });
-      resolve({ server, port: actual, close: () => { ctx.close(); server.close(); server.closeAllConnections?.(); } });
+      resolve({ server, port: actual, close: () => { stats.flush(); ctx.close(); server.close(); server.closeAllConnections?.(); } });
     });
   });
 }

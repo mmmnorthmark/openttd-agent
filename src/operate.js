@@ -2,6 +2,8 @@
 // and order-flag helpers. Pure functions; row formats are documented next to the
 // GS handlers in gamescript/AgentBridge/main.nut.
 
+import { errorCode } from './envelope.js';
+
 export const VEHICLE_TYPES = ['rail', 'road', 'water', 'air'];
 export const VEHICLE_STATES = ['running', 'stopped', 'in_depot', 'at_station', 'broken', 'crashed'];
 export const FACILITIES = ['rail', 'truck', 'bus', 'airport', 'dock'];
@@ -15,13 +17,20 @@ export function vehicleTypeId(name) {
 
 const cargoName = (cargos, id) => cargos?.get(id)?.name ?? `cargo ${id}`;
 
-/** Resolve a cargo given as id or name/label substring to its id. */
+/** Cargo name/label for matching: case, '_', '-' and spaces do not matter (iron_ore = Iron Ore = iron-ore). */
+export const normCargo = (v) => String(v).toLowerCase().replace(/[\s_-]+/g, ' ').trim();
+
+/** Does a cargo name contain the query (normalised)? */
+export const cargoMatches = (name, query) => normCargo(name).includes(normCargo(query));
+
+/** Resolve a cargo given as id, label (COAL), or name or name substring (any case, _ - or spaces) to its id. */
 export function cargoId(cargos, ref) {
   if (ref === undefined || ref === null || ref === '') return undefined;
   if (/^\d+$/.test(String(ref))) return Number(ref);
-  const lc = String(ref).toLowerCase();
-  const hit = [...cargos.values()].find((c) => c.name.toLowerCase().includes(lc) || c.label.toLowerCase() === lc);
-  if (!hit) throw new Error(`no cargo matching '${ref}'. Run: openttd-agent cargos`);
+  const q = normCargo(ref);
+  const all = [...cargos.values()];
+  const hit = all.find((c) => normCargo(c.label) === q) ?? all.find((c) => normCargo(c.name) === q) ?? all.find((c) => normCargo(c.name).includes(q));
+  if (!hit) throw new Error(`no cargo matching '${ref}'. Known: ${all.map((c) => c.name).join(', ')}`);
   return hit.id;
 }
 
@@ -111,21 +120,59 @@ export function vehicleDetail([info, ...orderRows], cargos) {
   };
 }
 
+/** Tiles an exec `rail` step lays track on: [op, from_x, from_y, x, y, to_x, to_y] covers x,y up to (not including) to. */
+export function railStepTiles([, , , x, y, tx, ty]) {
+  if (x !== tx && y !== ty) return [[x, y]]; // a curve piece: its own tile only
+  const dx = Math.sign(tx - x), dy = Math.sign(ty - y);
+  const out = [];
+  for (let cx = x, cy = y; (cx !== tx || cy !== ty) && out.length < 1000; cx += dx, cy += dy) out.push([cx, cy]);
+  return out.length ? out : [[x, y]];
+}
+
+/**
+ * Dry runs cannot place a signal on track that an earlier step of the same list would lay (the
+ * track is not there in test mode). Such failed signal rows become ok with skipped_in_dry_run.
+ */
+export function markDryRunSkips(steps, results) {
+  const planned = new Set();
+  results.forEach((r, i) => {
+    const st = steps[i];
+    if (st[0] === 'rail') for (const [x, y] of railStepTiles(st)) planned.add(`${x},${y}`);
+    if ((st[0] === 'signal' || st[0] === 'signal_remove') && !r.ok && planned.has(`${st[1]},${st[2]}`)) {
+      r.ok = true;
+      r.skipped_in_dry_run = true;
+      r.dry_run_error = r.error;
+      delete r.error;
+    }
+  });
+  return results;
+}
+
 /** Summarise GS `exec` replies (one per batch) against the steps that were sent. */
+const ID_STEPS = new Set(['veh_buy', 'veh_clone', 'sign', 'group_create']);
+
 export function execSummary(steps, replies, dryRun) {
   const results = [];
   let cost = 0, money = null, stopped = '';
   for (const [summary, ...rows] of replies) {
     for (const [ok, c, error, value] of rows) {
       const step = steps[results.length];
-      results.push({ step: results.length, op: step[0], ok, cost: c, ...(error ? { error } : {}), ...(value ? { value } : {}) });
+      // value 0 is a real id for steps that create something (vehicle 0, sign 0, group 0).
+      results.push({ step: results.length, op: step[0], ok, cost: c, ...(error ? { error } : {}), ...(value || (!dryRun && ok && ID_STEPS.has(step[0]) && value === 0) ? { value } : {}) });
     }
     cost += summary.cost; money = summary.money; stopped = summary.stopped;
   }
+  if (dryRun) markDryRunSkips(steps, results);
   const failed = results.filter((r) => !r.ok);
+  const skipped = results.filter((r) => r.skipped_in_dry_run).length;
+  const ok = failed.length === 0 && results.length === steps.length;
+  // A dry run keeps going after a failure, so its batch "stopped" text is only about real stops.
+  const err = failed.length ? { error: `step ${failed[0].step} (${failed[0].op}): ${failed[0].error ?? 'failed'}`, first_error: errorCode(failed[0].error ?? 'failed') }
+    : !ok ? { error: stopped || `only ${results.length} of ${steps.length} steps ran`, first_error: errorCode(stopped) } : { error: null };
   return {
-    ok: failed.length === 0 && results.length === steps.length, dry_run: !!dryRun, steps_total: steps.length, steps_done: results.length - failed.length,
-    cost, money, ...(stopped ? { stopped } : {}), ...(failed.length ? { first_error: failed[0].error ?? 'failed' } : {}), results,
+    ok, ...err, dry_run: !!dryRun, steps_total: steps.length, steps_done: results.length - failed.length - skipped,
+    ...(skipped ? { skipped_in_dry_run: skipped, note: 'signals on track this list lays are checked only when it is built (a dry run has no track yet)' } : {}),
+    cost, money, ...(stopped ? { stopped } : {}), results,
   };
 }
 
@@ -171,4 +218,70 @@ export function findExistingRoute(stations, srcEnd, dstEnd, cargo, { radius = 8,
     return from && to ? { from_station: { id: from.id, name: from.name }, to_station: { id: to.id, name: to.name } } : null;
   };
   return match(srcEnd, dstEnd) ?? (bothWays ? match(dstEnd, srcEnd) : null);
+}
+
+// ---- summary lines (summary command) ----------------------------------------------
+
+const money = (n) => (Math.abs(n) >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
+
+/** One compact line per vehicle: "#4 id 31 Train 4 [rail] +1.2k/-3k age 2.1y 40% rel 62% running (22,7) -> North". */
+export function vehicleLine(v, stationNames = new Map()) {
+  const dest = v.dest_station >= 0 && stationNames.has(v.dest_station) ? ` -> ${stationNames.get(v.dest_station)}` : '';
+  return `#${v.unit_number} id ${v.id} ${v.name || v.engine_name} [${v.type}] profit ${money(v.profit_this_year)}/${money(v.profit_last_year)} (this/last yr) `
+    + `age ${(v.age_days / 365).toFixed(1)}y ${v.age_pct}% rel ${v.reliability_pct}% ${v.state} (${v.x},${v.y})${dest}`;
+}
+
+/** One compact line per station: "id 3 Bigton Woods [rail] 2 veh: Wood 240 waiting 35%". */
+export function stationLine(st) {
+  const cargo = st.cargo.length ? st.cargo.map((c) => `${c.name} ${c.waiting} waiting ${c.rating_pct}%`).join(', ') : 'no cargo rating yet';
+  return `id ${st.id} ${st.name} [${st.facilities.join('+')}]${st.vehicles !== undefined ? ` ${st.vehicles} veh` : ''}: ${cargo}`;
+}
+
+// ---- performance rating (rating command) --------------------------------------------
+// OpenTTD 15.3 economy.cpp _score_info: { needed, max points } per component; the total is out of 1000.
+export const SCORE_INFO = {
+  vehicles: [120, 100], stations: [80, 100], min_profit: [10000, 100], min_income: [50000, 50], max_income: [100000, 100],
+  delivered: [40000, 400], cargo_types: [8, 50], money: [10000000, 50], loan: [250000, 50],
+};
+
+const HOW = {
+  vehicles: 'vehicles with a profit last year (each counts once)',
+  stations: 'station parts (rail, bus, truck, airport, dock) that a vehicle served in the last 20 days',
+  min_profit: 'profit last year of your worst vehicle older than 2 years (sell or fix loss makers)',
+  min_income: 'worst quarter (income + expenses) of the last 12',
+  max_income: 'best quarter (income + expenses) of the last 12',
+  delivered: 'cargo units delivered in the last 4 quarters',
+  cargo_types: 'cargo types delivered last quarter',
+  money: 'bank balance',
+  loan: '250000 minus your loan (no loan = full points)',
+};
+
+/**
+ * Performance-rating components as OpenTTD's UpdateCompanyRatingAndValue computes them, from the GS
+ * `rating_parts` table and `company_history` rows ([q, value, income, expenses, delivered, perf]).
+ * cargo_types is not readable by scripts: null, and its points are left out of `points_known`.
+ */
+export function ratingTable(parts, history) {
+  const past = history.filter((r) => r[0] >= 1).sort((p, q) => p[0] - q[0]);
+  let valid = 0;
+  for (const r of past) { if (r[1] === 0 && r[2] === 0 && r[3] === 0 && r[4] === 0) break; valid++; }
+  const net = past.slice(0, Math.min(valid, 12)).map((r) => r[2] + r[3]);
+  const raw = {
+    vehicles: parts.profitable_vehicles,
+    stations: parts.station_facilities_served,
+    min_profit: parts.vehicles_over_2_years > 0 && parts.min_profit > 0 ? parts.min_profit : 0,
+    min_income: net.length && Math.min(...net) > 0 ? Math.min(...net) : 0,
+    max_income: net.length ? Math.max(...net) : 0,
+    delivered: past.slice(0, Math.min(valid, 4)).reduce((n, r) => n + r[4], 0),
+    cargo_types: null,
+    money: Math.max(0, parts.money),
+    loan: SCORE_INFO.loan[0] - parts.loan,
+  };
+  const components = Object.entries(SCORE_INFO).map(([name, [needed, max]]) => {
+    const v = raw[name];
+    const points = v === null ? null : Math.floor((Math.min(Math.max(v, 0), needed) * max) / needed);
+    return { component: name, value: v, needed, points, max, missing: points === null ? null : max - points, what: HOW[name] };
+  });
+  const known = components.filter((c) => c.points !== null);
+  return { components, points_known: known.reduce((n, c) => n + c.points, 0), max_known: known.reduce((n, c) => n + c.max, 0), quarters_used: Math.min(valid, 12) };
 }

@@ -15,16 +15,16 @@ Needs Node 20+ and OpenTTD 15.x with the original TTD graphics or OpenGFX (run O
 Nothing to clone: run it straight from GitHub with `npx`, pinned to a release tag.
 
 ```sh
-npx -y github:mmmnorthmark/openttd-agent#v0.6.0 doctor      # checks OpenTTD, graphics, GameScript
+npx -y github:mmmnorthmark/openttd-agent#v0.7.0 doctor      # checks OpenTTD, graphics, GameScript
 ```
 
 Every example below writes `openttd-agent ...`. Either make that a short alias for the `npx` form:
 
 ```sh
-alias openttd-agent='npx -y github:mmmnorthmark/openttd-agent#v0.6.0'   # add to ~/.zshrc or ~/.bashrc
+alias openttd-agent='npx -y github:mmmnorthmark/openttd-agent#v0.7.0'   # add to ~/.zshrc or ~/.bashrc
 ```
 
-or install it once: `npm i -g github:mmmnorthmark/openttd-agent#v0.6.0`.
+or install it once: `npm i -g github:mmmnorthmark/openttd-agent#v0.7.0`.
 
 **Versions.** Releases follow [semver](https://semver.org) and are git tags `vX.Y.Z`
 ([CHANGELOG.md](CHANGELOG.md)); `main` may be ahead of the latest release. To update, change the
@@ -36,10 +36,10 @@ loads the game again (a running game keeps the GameScript it started with).
 Claude Code, as MCP tools:
 
 ```sh
-claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.6.0 mcp
+claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.7.0 mcp
 ```
 
-Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.6.0", "mcp"]`.
+Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.7.0", "mcp"]`.
 For a small or fast model, expose only the tools it needs and get compact results (unreleased, on `main`):
 `openttd-agent mcp --tools goal-status,stations,vehicles,find-cargo-pairs,build-cargo-route --compact true`.
 Agents that run shell commands can use the CLI directly; it is often faster than MCP because they
@@ -90,7 +90,13 @@ openttd-agent launch --mode dedicated --bind 127.0.0.1      # headless server on
 
 To play from another machine (a laptop on the same network or VPN), launch with `--bind 0.0.0.0`
 and join `<this machine's IP>:3979`. Read the security notes under Game night first: the admin port
-is then reachable too.
+is then reachable too. With `--bind <one address>` the server listens only there, so `launch` saves
+that address as `host` in the config (the CLI on this machine then reaches the admin port there).
+
+`launch` writes its own launch profile: `[game_scripts]` lists AgentBridge only (an entry copied
+from your own openttd.cfg, such as `none =`, used to win and the game ran without AgentBridge),
+and `private.cfg` names the server (`server_name`) and the dedicated server's own client
+(`client_name = openttd-agent server`, instead of "Unnamed Client").
 
 ## Game night
 
@@ -152,11 +158,27 @@ starts nothing and prints no secrets; agents should run it first.
 3. Connect your agent. Claude Code:
 
    ```sh
-   claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.6.0 mcp
+   claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.7.0 mcp
    ```
 
-   Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.6.0", "mcp"]`.
+   Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.7.0", "mcp"]`.
    Or let the agent use the CLI directly (`openttd-agent help`; every command prints JSON).
+
+### Several players or agents on one machine (profiles)
+
+Each relay token can live in its own profile instead of the shared config, so agents never need
+to export a token on every call:
+
+```sh
+openttd-agent --profile alice configure --relay http://192.168.1.20:47978 --token <alice's token>
+openttd-agent --profile alice status                 # or: OPENTTD_AGENT_PROFILE=alice openttd-agent status
+OPENTTD_AGENT_PLAYER_FILE=/path/to/alice.json openttd-agent status   # any JSON file with relay + relay_token (or token)
+```
+
+A profile is `~/.openttd-agent/players/<name>.json`; its keys override `config.json`, and env vars
+override both. `configure` with a profile writes to the profile. MCP: `openttd-agent --profile alice mcp`.
+A profile without a relay (direct admin-port mode) runs each call in its own process instead of the
+shared daemon, so its `company` applies.
 
 ### A human and an agent in one company
 
@@ -169,7 +191,9 @@ before changing them. A guard that keeps the agent off things it did not build i
 
 - Read the world (towns, industries, map, all companies' figures) and run every analysis command.
 - Build and operate **only as the company the host bound it to**. `--company <other>` is refused;
-  leaving it out always means "my company".
+  leaving it out always means "my company". Two read-only exceptions show what the game window
+  shows anyone: `stations --company X` (a rival's stations, waiting cargo and ratings, without
+  vehicle counts) and `vehicles --company X` (counts per vehicle type only).
 - Not: `rate` changes, `launch`, `install-gamescript`, `scenario-prepare`, `save`, setting goals,
   pausing or advancing turns, anything on the host's config, or raw console access.
 - Chat sent through the relay is prefixed with the player's name.
@@ -186,8 +210,11 @@ refusal: time, player, company, command, arguments, outcome).
   URL in `show-config` right?
 - **`missing or unknown token`:** the host re-issues one (`relay-remove-player`, then `relay-add-player`).
 - **`not bound to a company yet`:** the host runs `relay-set-company` (step 8).
-- **`unknown command` through the relay:** player and host run different openttd-agent versions.
-- **AgentBridge did not answer:** the host runs `install-gamescript` and launches the game again.
+- **`unknown command` through the relay:** player and host run different openttd-agent versions
+  (`status` warns about it, and about a game running an older AgentBridge).
+- **AgentBridge did not answer:** the host runs `install-gamescript` and launches the game again with
+  `openttd-agent launch` (`doctor` lists launch profiles whose `[game_scripts]` is wrong). A loaded
+  save runs the GameScript stored in it.
 
 ### Security notes
 
@@ -206,19 +233,29 @@ refusal: time, player, company, command, arguments, outcome).
 | Group | Commands |
 |---|---|
 | setup | `guide` (what to do next, host or player), `doctor`, `install-gamescript`, `configure`, `show-config`, `launch`, `scenario-prepare` (host) |
-| relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player` |
-| game | `status`, `companies`, `chat`, `rate`, `goal-status` |
+| relay (host) | `relay` (the server), `relay-add-player`, `relay-list-players`, `relay-set-company`, `relay-remove-player`, `relay-stats` (is each player still calling?) |
+| game | `status`, `companies`, `rating` (performance rating by component), `chat`, `rate`, `goal-status` |
 | host (refused through the relay) | `goal-set`, `goal-clear`, `pause`, `unpause`, `turn-advance`, `save` |
-| world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns; town to town for passengers and mail), `acceptance`, `route-effort`, `airport-types`, `airport-sites` (with your company: `owned` per site), `tiles`, `owned-land` (your owned land as rectangles; GameScript v10) |
-| operate: look | `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
-| operate: diagnose | `vehicle-problems` (one row per problem: `problem`, `severity` (`action` or `info`; `--severity action` for only what needs a command), `evidence`, `suggested_fix`, with the id and the unit number the game shows as "Train #4"), `verify-route` (`--vehicle ID`, or `--from_station A --to_station B`: is there a rail path, and if not, the last reachable tile and the first gap) |
-| operate: change | `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot`, `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace`, `loan` (`--amount N`, `--borrow N`, `--repay N` or `--max true`; GameScript v8) |
-| build: rail | `build-cargo-route` (stations, line, depot, train, orders in one call), `station-sites`, `build-line-depot`, `rail-types`, `build-rail` (planned path), `build-track` (one piece, for junctions and depot spurs), `build-rail-station`, `build-rail-depot`, `build-signal`, `build-terminus`, `build-passing-loop` |
-| build: road | `build-road-path` (planned path), `build-road-station`, `build-road-depot`, `build-road` / `test-build-road` (straight) |
+| world (read-only) | `towns`, `industries`, `industry-types`, `cargos`, `town-gaps`, `find-cargo-pairs` (industries and towns; town to town for passengers and mail), `acceptance`, `route-effort`, `airport-types`, `airport-sites` (with your company: `owned` per site), `tiles` (owner marks: `*` yours, `#` another company), `rail-tiles` (exact track, signals and owner per tile), `signs` (your map signs; `sign`, `sign-remove` to place and remove them), `owned-land` (your owned land as rectangles; GameScript v10) |
+| operate: look | `summary` (one line per vehicle and station), `stations`, `vehicles`, `vehicle`, `engines`, `groups`, `depots`, `events`, `autorenew` |
+| operate: diagnose | `vehicle-problems` (one row per problem, including `stalled_on_line` and `deadlock`: `problem`, `severity` (`action` or `info`; `--severity action` for only what needs a command), `evidence`, `suggested_fix`, with the id and the unit number the game shows as "Train #4"), `verify-route` (`--vehicle ID`, or `--from_station A --to_station B`: is there a rail or road path (road: GameScript v11), and if not, the last reachable tile and the first gap) |
+| operate: change | `add-train` (checks loops against trains, clones, starts, verifies), `train-add-wagons`, `vehicle-replace` (buy or clone on the route, start, sell the old one when it reaches the depot), `vehicle-reverse`, `vehicle-buy`, `vehicle-clone`, `vehicle-start`, `vehicle-stop`, `vehicle-depot` (safe to repeat: `already_heading`, `already_in_depot`), `vehicle-sell`, `vehicle-refit`, `vehicle-rename`, `order-add`, `order-remove`, `order-flags`, `order-skip`, `orders-copy`, `group-create`, `group-rename`, `group-delete`, `group-move`, `group-autoreplace`, `loan` (`--amount N`, `--borrow N`, `--repay N` or `--max true`; GameScript v8) |
+| build: rail | `build-cargo-route` (stations, line, depot, train, orders in one call), `station-sites`, `build-line-depot`, `rail-types`, `build-rail` (planned path), `build-track` (one piece, for junctions and depot spurs), `build-rail-station`, `build-rail-depot`, `build-signal`, `build-terminus`, `build-passing-loop` (`--for_vehicle ID` sizes it for that line's longest train and traces the route after; `--remove true` undoes it), `loop-sites` (ranked, dry-run loop sites on a line) |
+| build: road | `build-truck-route` (stops, road, depot, trucks, orders in one call), `road-types`, `build-road-path` (planned path), `build-road-station` and `build-road-depot` (`connected`; `--connect auto` joins them to the nearest road; GameScript v11), `build-road` / `test-build-road` (straight) |
 | build: other | `bridge-types`, `build-bridge`, `build-tunnel`, `terraform`, `demolish`, `purchase-land` (owned land, up to 400 tiles; GameScript v10), `build-dock`, `build-buoy`, `build-water-depot`, `build-airport` |
 
 Every command that changes the game takes `--dry_run true` (cost and feasibility only). It acts as
 your company: the one the host bound your token to (a different `--company` is refused).
+
+**Results (0.7.0).** Every command prints one JSON object with `ok` (true/false) and `error`
+(human text; `null` on success). A failure also has `first_error`, a short code: a game code such
+as `ERR_AREA_NOT_CLEAR`, or one of ours such as `no_signal_here` or `refused`. List commands
+(`stations`, `vehicles`, `towns`, `industries`, `engines`, `companies`, `depots`, ...) return
+`{ok, error, total, matched, <items>, truncated}`, where `<items>` is named after the command
+(`stations`, `towns`, ...): `total` before filters, `matched` after, `truncated` when `--limit`
+cut the list. Build results keep their per-step `results[]`; in a dry run, a signal on track the
+same command would lay is marked `skipped_in_dry_run` instead of failing, so a dry run's `ok` is
+trustworthy. Cargo names are matched loosely: `iron_ore`, `Iron Ore` and `iron-ore` are the same.
 
 Examples:
 
@@ -342,7 +379,8 @@ openttd-agent unpause
 ## Building
 
 - **Dry run first.** `--dry_run true` returns the cost and, per step, whether the game would
-  accept it. Nothing is built and no rate limit is used.
+  accept it. Nothing is built and no rate limit is used. Signals on track the same command lays
+  cannot be checked before the track exists: they show `skipped_in_dry_run`, and `ok` ignores them.
 - **Paths are planned by openttd-agent** (on the host's relay) from the map mirror (flat and straight preferred; houses,
   industries and stations avoided; roads crossed on the level; water, rail and roads bridged), then
   built piece by piece. `build-rail` lays track strictly *between* its two anchor tiles (a station
@@ -360,7 +398,8 @@ openttd-agent unpause
 ## Tips for agents
 
 - **Discover, don't guess:** `openttd-agent help` lists commands; `openttd-agent <command> --help`
-  prints one command's arguments. Unknown flags are refused and nothing runs.
+  prints one command's arguments. Unknown flags are refused and nothing runs. `--id` is accepted
+  for `--vehicle`, and `--vehicle`/`--vehicles` for each other.
 - **Prefer the composite commands** (`build-cargo-route`, `station-sites`, `build-line-depot`,
   `find-cargo-pairs`): one call each instead of a dozen small ones, and they place things with the
   map mirror. Reading `tiles` to plan by hand is slow and error-prone; use it to look at a failure.

@@ -35,11 +35,14 @@ test('order flags round-trip and reject unknown names', () => {
 });
 
 test('stations: decoded facilities and cargo, filtered by rating', async () => {
-  const all = await run('stations', {});
+  const res = await run('stations', {});
+  assert.deepEqual([res.ok, res.error, res.total, res.matched, res.truncated], [true, null, 4, 4, false]);
+  const all = res.stations;
   assert.deepEqual(all[1].facilities, ['truck', 'bus']);
   assert.deepEqual(all[0].cargo[0], { cargo: 7, name: 'Wood', waiting: 240, rating_pct: 35 });
   const poor = await run('stations', { max_rating_pct: 50, min_waiting: 100 });
-  assert.deepEqual(poor.map((s) => s.id), [3]);
+  assert.deepEqual(poor.stations.map((s) => s.id), [3]);
+  assert.equal((await run('stations', { limit: 1 })).truncated, true);
 });
 
 test('vehicles: loss makers filter; vehicle detail decodes orders', async () => {
@@ -57,27 +60,40 @@ test('vehicles: loss makers filter; vehicle detail decodes orders', async () => 
 test('engines: cargo name resolved, newest first, wagons filter; groups; depots', async () => {
   const engines = await run('engines', { type: 'rail', cargo: 'wood' });
   assert.equal(fake.received.at(-1).args.cargo, 7);
-  assert.deepEqual(engines.map((e) => e.id), [6, 5, 27]);
-  assert.deepEqual((await run('engines', { type: 'rail', wagons: true })).map((e) => e.name), ['Wood Truck']);
+  assert.deepEqual(engines.engines.map((e) => e.id), [6, 5, 27]);
+  assert.deepEqual((await run('engines', { type: 'rail', wagons: true })).engines.map((e) => e.name), ['Wood Truck']);
   await assert.rejects(run('engines', { type: 'rail', cargo: 'unobtainium' }), /no cargo matching/);
-  assert.equal((await run('groups', {}))[0].profit_last_year, -3000);
-  assert.deepEqual((await run('depots', { type: 'rail' }))[0], { x: 13, y: 22, vehicles: 0 });
+  assert.equal((await run('groups', {})).groups[0].profit_last_year, -3000);
+  assert.deepEqual((await run('depots', { type: 'rail' })).depots[0], { x: 13, y: 22, vehicles: 0, front: { x: 13, y: 21 }, exit_dir: 'nw' });
 });
 
 test('events: since filter and latest_seq', async () => {
   const first = await run('events', {});
   assert.equal(first.latest_seq, 2);
   const next = await run('events', { since: first.latest_seq });
-  assert.deepEqual(next, { latest_seq: 2, my_company: 0, events: [] });
+  assert.deepEqual(next, { ok: true, error: null, latest_seq: 2, my_company: 0, events: [] });
   assert.equal((await run('events', { type: 'crash' })).events.length, 1);
 });
 
 test('vehicle-buy sends one step per vehicle and returns new ids; dry_run is passed on', async () => {
+  const refused = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 27, attach_to: 11, dry_run: true });
+  assert.deepEqual([refused.ok, refused.first_error], [false, 'train_not_in_depot']);
+  assert.match(refused.error, /not stopped in a depot.*vehicle-depot --vehicles 11/);
+  fake.state.trainInDepot = true;
   const res = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 27, cargo: 'wood', attach_to: 11, count: 3 });
   assert.equal(res.ok, true);
   assert.deepEqual(res.vehicles, [100, 101, 102]);
   assert.equal(res.cost, 30);
   assert.deepEqual(lastExec().steps[0], ['veh_buy', 13, 22, 27, 7, 11]);
+  assert.match((await run('vehicle-buy', { depot_x: 31, depot_y: 41, engine: 27, attach_to: 11 })).error, /stopped in the depot at \(13,22\), not at \(31,41\)/);
+  fake.state.attachFails = true;
+  try {
+    const back = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 27, attach_to: 11 });
+    assert.equal(back.ok, false);
+    assert.deepEqual(back.sold_back.vehicles, [100]);
+    assert.deepEqual(lastExec().steps, [['veh_sell', 100]]);
+    assert.match(back.error, /could not attach.*sold the wagon back \(100\)/);
+  } finally { fake.state.attachFails = false; fake.state.trainInDepot = false; }
   const dry = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, dry_run: true });
   assert.equal(dry.dry_run, true);
   assert.equal(lastExec().dry_run, true);
@@ -96,7 +112,8 @@ test('a failed step is reported with its error; group-create returns the id', as
   const res = await run('vehicle-sell', { vehicles: '5,404,6' });
   assert.equal(res.ok, false);
   assert.equal(res.steps_done, 2);
-  assert.equal(res.first_error, 'Vehicle not available');
+  assert.equal(res.error, 'step 1 (veh_sell): Vehicle not available');
+  assert.equal(res.first_error, 'failed');
   assert.equal(res.results[1].ok, false);
   const g = await run('group-create', { type: 'rail', name: 'Wood line' });
   assert.equal(g.group, 100);
@@ -107,7 +124,7 @@ test('a failed step is reported with its error; group-create returns the id', as
 });
 
 test('goals: set with cargo labels, status with pct, done and failed, clear', async () => {
-  assert.deepEqual(await run('goal-status', {}), { company: 0, status: 'none', note: 'no goal set for this company (the host sets one with goal-set)' });
+  assert.deepEqual(await run('goal-status', {}), { ok: true, error: null, company: 0, status: 'none', note: 'no goal set for this company (the host sets one with goal-set)' });
   const set = await run('goal-set', { deadline_year: 1954, targets: 'wood:3000, PASS:500,VALUE:100000' });
   assert.deepEqual(fake.received.at(-1).args, { company: 0, deadline_year: 1954, targets: [['WOOD', 3000], ['PASS', 500], ['VALUE', 100000]] });
   assert.equal(set.status, 'active');
@@ -126,7 +143,7 @@ test('goals: set with cargo labels, status with pct, done and failed, clear', as
   await assert.rejects(run('goal-set', { deadline_year: 1954, targets: 'WOOD:lots' }), /whole number above 0/);
   await assert.rejects(run('goal-set', { deadline_year: 1940, targets: 'WOOD:10' }), /in the past/);
   assert.deepEqual(await run('goal-set', { deadline_year: 1951, targets: [{ cargo: 'pass', amount: 5 }], company: 3 }).then((g) => [g.company, g.targets.length]), [3, 1]);
-  assert.deepEqual(await run('goal-clear', {}), { company: 0, removed: true });
+  assert.deepEqual(await run('goal-clear', {}), { ok: true, error: null, company: 0, removed: true });
   assert.equal((await run('goal-status', {})).status, 'none');
   assert.equal((await run('goal-status', { company: 3 })).status, 'active');
 });
@@ -158,7 +175,7 @@ test('turn-advance runs the wanted number of days and leaves the game paused', a
 
 test('loan: show, borrow rounds up, repay, max, dry run', async () => {
   fake.state.money = 100000; fake.state.loan = 300000;
-  assert.deepEqual(await run('loan', {}), { loan: 300000, max_loan: 500000, money: 100000 });
+  assert.deepEqual(await run('loan', {}), { ok: true, error: null, loan: 300000, max_loan: 500000, money: 100000 });
   const dry = await run('loan', { borrow: 15000, dry_run: true });
   assert.deepEqual(lastExec().steps, [['loan', 'add', 15000]]);
   assert.equal(lastExec().dry_run, true);
@@ -301,3 +318,311 @@ test('save runs the console save with a checked name and never a path', async ()
   }
   assert.equal(fake.state.rcons.length, before, 'refused names never reach the console');
 });
+
+test('argument aliases: --id and --vehicle/--vehicles; engines and depots default to rail; NaN echoes the value', async () => {
+  const { aliasArgs } = await import('../src/commands.js');
+  assert.deepEqual(aliasArgs(['vehicle'], { id: 5 }), { vehicle: 5 });
+  assert.deepEqual(aliasArgs(['vehicles'], { vehicle: '5,6' }), { vehicles: '5,6' });
+  assert.deepEqual(aliasArgs(['vehicles'], { id: 7 }), { vehicles: 7 });
+  assert.deepEqual(aliasArgs(['vehicle'], { vehicles: '9' }), { vehicle: '9' });
+  assert.deepEqual(aliasArgs(['vehicle', 'id'], { id: 1 }), { id: 1 }, 'a real --id is kept');
+  assert.equal((await run('vehicle', { id: 11 })).id, 11);
+  await run('vehicle-stop', { vehicle: 11 });
+  assert.deepEqual(lastExec().steps, [['veh_start_stop', 11, 0]]);
+  assert.equal((await run('depots', {})).type, 'rail');
+  assert.equal((await run('engines', {})).engines.length, 3);
+  await assert.rejects(run('vehicle', { vehicle: 'abc' }), /--vehicle: .*\(got "abc"\)/);
+});
+
+test('existing route: only a vehicle with orders at both stations blocks build-cargo-route', async () => {
+  const { vehicleServing } = await import('../src/commands.js');
+  const s = await ctx.session();
+  const st = (id, vehicles) => ({ id, vehicles });
+  // Train 11 has orders for station 3 and a depot only (fake `vehicle`), so 3 + 5 is not served by it.
+  assert.equal(await vehicleServing(s, 0, [st(3, 2), st(5, 1)], 3, 5), null);
+  assert.equal(await vehicleServing(s, 0, [st(3, 2), st(5, 0)], 3, 5), null, 'nobody has orders at station 5');
+  fake.state.lostTrain = true; // train 13 heads for station 3 with orders 3 -> 5
+  try { assert.equal(await vehicleServing(s, 0, [st(3, 2), st(5, 1)], 3, 5), 13); } finally { fake.state.lostTrain = false; }
+});
+
+test('status: versions, and a warning when the running AgentBridge is older than the bundled one', async () => {
+  const { bundledGsVersion } = await import('../src/setup.js');
+  const now = await run('status', {});
+  assert.equal(now.versions.gamescript_bundled, bundledGsVersion());
+  fake.state.gsVersion = bundledGsVersion() - 1;
+  try {
+    const old = await run('status', {});
+    assert.match(old.warnings[0], /runs AgentBridge v\d+; this openttd-agent .* ships v\d+/);
+  } finally { fake.state.gsVersion = 12; }
+});
+
+test('verify-route traces road vehicles and road stops (AgentBridge v11), refuses on older GameScripts', async () => {
+  const ok = await run('verify-route', { vehicle: 12 });
+  assert.deepEqual([ok.type, ok.method, ok.connected], ['road', 'road_tiles', true]);
+  assert.equal(ok.legs.length, 2);
+  const pair = await run('verify-route', { from_station: 4, to_station: 'Smallham Stop' });
+  assert.deepEqual([pair.mode, pair.connected], ['road', true]);
+  fake.state.roadGap = '44,9';
+  try {
+    const gap = await run('verify-route', { from_station: 4, to_station: 7 });
+    assert.equal(gap.connected, false);
+    assert.deepEqual([gap.first_gap.x, gap.first_gap.y, gap.first_gap.reason], [44, 9, 'no_road']);
+    assert.deepEqual(gap.last_reachable, { x: 43, y: 9 });
+  } finally { fake.state.roadGap = null; }
+  fake.state.roadOneWay = '44,9';
+  try {
+    assert.equal((await run('verify-route', { from_station: 4, to_station: 7 })).connected, true, 'with the one-way direction');
+    const back = await run('verify-route', { from_station: 7, to_station: 4 });
+    assert.deepEqual([back.connected, back.first_gap.reason], [false, 'one_way_road']);
+  } finally { fake.state.roadOneWay = null; }
+  const probs = await run('vehicle-problems', {});
+  assert.equal(probs.road_trace, 'road_tiles');
+  assert.ok(!probs.problems.some((p) => p.id === 12 && /path/.test(p.evidence)));
+  fake.state.gsVersion = 10;
+  try {
+    await assert.rejects(run('verify-route', { vehicle: 12 }), /refused: road vehicles .* AgentBridge v11/);
+    assert.match((await run('vehicle-problems', {})).road_trace, /^off: /);
+  } finally { fake.state.gsVersion = 12; }
+});
+
+test('vehicle-depot: idempotent (already heading / in depot) and decoded failures', async () => {
+  fake.state.headingDepot = [12];
+  fake.state.brokenDown = [15];
+  fake.state.trainInDepot = true;
+  try {
+    const res = await run('vehicle-depot', { vehicles: '11,12,13,15,404' });
+    assert.deepEqual([res.sent, res.already_heading, res.already_in_depot], [[13], [12], [11]]);
+    assert.deepEqual(res.failed.map((f) => [f.vehicle, f.error.split(':')[0]]), [[15, 'broken_down'], [404, 'not_found']]);
+    assert.equal(res.ok, false);
+    assert.equal(res.first_error, 'broken_down');
+    fake.state.gsVersion = 10;
+    const old = await run('vehicle-depot', { vehicles: '11,13' });
+    assert.deepEqual([old.already_in_depot, old.sent], [[11], [13]]);
+    assert.deepEqual(lastExec().steps, [['veh_depot', 13, false]]);
+    assert.match(old.note, /older than v11/);
+  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 12; }
+});
+
+test('loop-sites: traces the line and explains when no stretch is long enough', async () => {
+  const res = await run('loop-sites', { from_station: 3, to_station: 'Sawmill Halt', train_tiles: 2 });
+  assert.equal(res.ok, true);
+  assert.equal(res.length, 4);
+  assert.ok(res.line_tiles >= 12, JSON.stringify(res));
+  assert.deepEqual(res.sites, []);
+  assert.match(res.note, /no straight stretch of 8 tiles/);
+  await assert.rejects(run('loop-sites', {}), /give --vehicle ID/);
+});
+
+test('vehicle-replace: clone, start, old gets a stop-in-depot order and is sold on arrival', async () => {
+  const { depotOrderPosition } = await import('../src/commands.js');
+  const st = (flags) => ({ kind: 'station', flags });
+  assert.equal(depotOrderPosition([st(['full_load_any']), st(['unload', 'no_load'])], 0), 2);
+  assert.equal(depotOrderPosition([st(['full_load_any']), st(['unload', 'no_load'])], 1), 2);
+  assert.equal(depotOrderPosition([st([]), st([])], 1), 2);
+  const dry = await run('vehicle-replace', { vehicles: '11', dry_run: true });
+  assert.equal(dry.ok, true, JSON.stringify(dry));
+  assert.equal(dry.replaced[0].would.buy, 'clone');
+  const res = await run('vehicle-replace', { vehicles: '11' });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const r = res.replaced[0];
+  assert.deepEqual([r.vehicle, r.depot, r.started], [11, { x: 13, y: 22 }, true]);
+  const execs = fake.received.filter((q) => q.cmd === 'exec').slice(-3).map((q) => q.args.steps);
+  assert.deepEqual(execs[0], [['veh_clone', 13, 22, 11, true]]);
+  assert.deepEqual(execs[1].at(-1)[0], 'veh_start_stop');
+  // Train 11 heads for order 1 (a depot); its next station is order 0 (full_load_any): no_load there, depot after it.
+  assert.deepEqual(execs[2][0], ['orders_unshare', 11]);
+  assert.deepEqual(execs[2][1], ['orders_copy', 11, r.new_vehicle, false]);
+  assert.deepEqual(execs[2][2], ['order_flags', 11, 0, 1 | 128]);
+  assert.deepEqual(execs[2][3], ['order_add', 11, 13, 22, 8, 1]);
+  assert.deepEqual(res.pending_sales.map((p) => p.vehicle), [11]);
+  fake.state.trainInDepot = true;
+  const fin = await run('vehicle-replace', { finish: true });
+  fake.state.trainInDepot = false;
+  assert.deepEqual(fin.sold.map((x) => x.vehicle), [11]);
+  assert.deepEqual(fin.pending_sales, []);
+  // --engine: buys the engine, the old train's wagons (v12 vehicle_wagons) refitted, shares orders.
+  const eng = await run('vehicle-replace', { vehicles: '11', engine: 6 });
+  assert.equal(eng.ok, true, JSON.stringify(eng));
+  const steps = fake.received.filter((q) => q.cmd === 'exec').slice(-3).map((q) => q.args.steps);
+  assert.deepEqual(steps[0], [['veh_buy', 13, 22, 6, -1, -1]]);
+  assert.equal(steps[1].filter((x) => x[0] === 'veh_buy' && x[3] === 27 && x[4] === 7).length, 4);
+  assert.ok(steps[1].some((x) => x[0] === 'orders_copy' && x[2] === 11 && x[3] === true));
+  await run('vehicle-replace', { finish: true });
+});
+
+test('vehicle-reverse: one veh_reverse step per vehicle; refused on an older GameScript', async () => {
+  const res = await run('vehicle-reverse', { vehicles: '11,12' });
+  assert.equal(res.ok, true);
+  assert.deepEqual(lastExec().steps, [['veh_reverse', 11], ['veh_reverse', 12]]);
+  assert.deepEqual(res.reversed, [11, 12]);
+  fake.state.gsVersion = 11;
+  try { await assert.rejects(run('vehicle-reverse', { vehicles: '11' }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
+});
+
+test('rail-tiles: decoded pieces, signals, depot fronts, owner; tiles marks owners (v12)', async () => {
+  const res = await run('rail-tiles', { x0: 12, y0: 19, x1: 19, y1: 22 });
+  assert.equal(res.ok, true);
+  const at = (x, y) => res.tiles.find((t) => t.x === x && t.y === y);
+  assert.deepEqual(at(13, 20).tracks, ['x', 's', 'e']);
+  assert.deepEqual(at(18, 20).signals, [{ facing: 'from_sw', one_way: false }]);
+  assert.deepEqual(at(13, 22).front, { x: 13, y: 21 });
+  assert.equal(at(12, 20).kind, 'station');
+  assert.equal(at(14, 20).mine, true);
+  assert.equal((await run('rail-tiles', { x0: 12, y0: 19, x1: 19, y1: 22, mine: false })).tiles.length, 0);
+  const t = await run('tiles', { x0: 12, y0: 20, x1: 14, y1: 20 });
+  assert.match(t.rows[0].tiles, /\*/);
+  assert.match(t.legend, /owned by your company/);
+});
+
+test('vehicle-buy: wagons, orders and start in one call', async () => {
+  const res = await run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, wagon: 27, wagons: 2, cargo: 'wood', orders: '3,Sawmill Halt', order_flags: 'full_load_any;unload,no_load', start: true });
+  assert.equal(res.ok, true, JSON.stringify(res));
+  const steps = lastExec().steps;
+  const v = res.vehicles[0];
+  assert.deepEqual(steps.filter((x) => x[0] === 'veh_buy').map((x) => x.slice(3)), [[27, 7, v], [27, 7, v]]);
+  assert.deepEqual(steps.filter((x) => x[0] === 'order_add').map((x) => x.slice(1)), [[v, 12, 20, 96, -1], [v, 24, 20, 4 | 128, -1]]);
+  assert.deepEqual(steps.at(-1), ['veh_start_stop', v, 1]);
+  assert.deepEqual(res.orders.map((o) => o.station), [3, 5]);
+  assert.equal(res.started, true);
+  await assert.rejects(run('vehicle-buy', { depot_x: 13, depot_y: 22, engine: 5, orders: '3,5', order_flags: 'a;b;c' }), /3 sets for 2 orders/);
+});
+
+test('stations carry vehicle_ids (v12); vehicles --station filters by them', async () => {
+  const res = await run('stations', {});
+  assert.deepEqual(res.stations.find((st) => st.id === 3).vehicle_ids, [11]);
+  const v = await run('vehicles', { station: 'Bigton Central' });
+  assert.deepEqual(v.vehicles.map((x) => x.id), [12]);
+  fake.state.gsVersion = 11;
+  try {
+    assert.equal((await run('stations', {})).stations[0].vehicle_ids, undefined);
+    await assert.rejects(run('vehicles', { station: 3 }), /needs AgentBridge v12/);
+  } finally { fake.state.gsVersion = 12; }
+});
+
+test('summary: one line per vehicle and station; filters', async () => {
+  const res = await run('summary', {});
+  assert.equal(res.ok, true);
+  assert.equal(res.vehicles.length, 2);
+  assert.match(res.vehicles[0], /^#1 id 11 Train 1 \[rail\] profit -1\.2k\/-3k .* rel 62% running \(14,20\)/);
+  assert.match(res.stations.join('\n'), /id 3 Bigton Woods \[rail\] 2 veh: Wood 240 waiting 35%/);
+  const one = await run('summary', { vehicles: '12' });
+  assert.deepEqual([one.vehicles.length, one.stations], [1, undefined]);
+  assert.match(one.vehicles[0], /-> Bigton Central/);
+  const st = await run('summary', { stations: 'Sawmill Halt' });
+  assert.deepEqual([st.vehicles, st.stations], [undefined, ['id 5 Sawmill Halt [rail] 1 veh: no cargo rating yet']]);
+});
+
+test('rating: components with points from rating_parts and company_history', async () => {
+  const { ratingTable } = await import('../src/operate.js');
+  const t = ratingTable({ profitable_vehicles: 60, station_facilities_served: 80, vehicles_over_2_years: 3, min_profit: 5000, money: 2_000_000, loan: 100000 },
+    [[0, 1, 0, 0, 0, -1], [1, 10, 60000, -20000, 8000, 300], [2, 10, 30000, -10000, 9000, 290], [3, 0, 0, 0, 0, 0]]);
+  const by = Object.fromEntries(t.components.map((c) => [c.component, c]));
+  assert.deepEqual([by.vehicles.points, by.stations.points, by.min_profit.points], [50, 100, 50]);
+  assert.deepEqual([by.min_income.value, by.min_income.points, by.max_income.value, by.max_income.points], [20000, 20, 40000, 40]);
+  assert.deepEqual([by.delivered.value, by.delivered.points], [17000, 170]);
+  assert.deepEqual([by.money.points, by.loan.value, by.loan.points, by.cargo_types.points], [10, 150000, 30, null]);
+  assert.equal(t.quarters_used, 2);
+  const res = await run('rating', {});
+  assert.equal(res.ok, true);
+  assert.equal(res.components.length, 9);
+  assert.equal(res.game_rating_last_quarter, 209);
+});
+
+test('companies: period, station_count, vehicles_by_type; --history N quarters newest first', async () => {
+  const { quarterLabel } = await import('../src/commands.js');
+  assert.equal(quarterLabel({ year: 1951, month: 5 }, 1), '1951 Q1');
+  assert.equal(quarterLabel({ year: 1951, month: 2 }, 1), '1950 Q4');
+  const res = await run('companies', {});
+  const c = res.companies[0];
+  assert.deepEqual([c.period, c.station_count, c.vehicles_by_type], ['1949 Q4', 4, { rail: 1, road: 1, water: 0, air: 0 }]);
+  assert.equal(c.history, undefined);
+  const h = await run('companies', { history: 3 });
+  assert.deepEqual(h.companies[0].history.map((q) => [q.period, q.value]), [['1949 Q4', 49000], ['1949 Q3', 48000], ['1949 Q2', 47000]]);
+});
+
+test('save --every_months: saves now, schedule shows, 0 stops; pause --save saves once paused', async () => {
+  const r = await run('save', { every_months: 3, prefix: 'night' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.first_save.name, 'night-1950-01.sav');
+  assert.equal(fake.state.rcons.at(-1), 'save night-1950-01');
+  assert.deepEqual((await run('save', {})).periodic.every_months, 3);
+  assert.equal((await run('save', { every_months: 0 })).stopped, true);
+  assert.equal((await run('save', {})).periodic, null);
+  await assert.rejects(run('save', { every_months: 1, prefix: '../x' }), /save name must be/);
+  const p = await run('pause', { save: 'paused-1' });
+  assert.equal(p.save.saved, 'paused-1.sav');
+  assert.equal(fake.state.rcons.at(-1), 'save paused-1');
+  assert.ok(fake.state.rcons.includes('pause'));
+  await run('unpause', {});
+});
+
+test('sign, signs, sign-remove (v12)', async () => {
+  const r = await run('sign', { x: 5, y: 6, text: 'plot A' });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(typeof r.sign, 'number');
+  await run('sign', { x: 7, y: 6, text: 'plot B' });
+  assert.deepEqual((await run('signs', { text: 'plot' })).signs.map((g) => g.text), ['plot A', 'plot B']);
+  const rm = await run('sign-remove', { x: 5, y: 6 });
+  assert.deepEqual(rm.removed, [r.sign]);
+  assert.equal((await run('sign-remove', { text: 'nothing' })).first_error, 'not_found');
+  await run('sign-remove', { text: 'plot' });
+  assert.equal((await run('signs', {})).total, 0);
+  await assert.rejects(run('sign', { x: 1, y: 1, text: 'x'.repeat(32) }), /31/);
+});
+
+test('vehicle-problems rows carry as_of and days_watched; --fresh restarts the history', async () => {
+  fake.state.trainInDepot = true;
+  try {
+    const r = await run('vehicle-problems', { trace: false });
+    const row = r.problems.find((p) => p.problem === 'stopped_in_depot');
+    assert.ok(row, JSON.stringify(r.problems));
+    assert.equal(typeof row.as_of, 'string');
+    assert.equal(typeof row.days_watched, 'number');
+    const f = await run('vehicle-problems', { trace: false, fresh: true });
+    assert.equal(f.problems.find((p) => p.problem === 'stopped_in_depot').days_watched, 0);
+  } finally { fake.state.trainInDepot = false; }
+});
+
+test('execSummary keeps id 0 of a new vehicle (real runs only)', async () => {
+  const { execSummary } = await import('../src/operate.js');
+  const steps = [['veh_buy', 1, 1, 5, -1, -1], ['veh_start_stop', 0, 1]];
+  const reply = [{ cost: 10, money: 0, stopped: '' }, [true, 10, '', 0], [true, 0, '', 0]];
+  const real = execSummary(steps, [reply], false);
+  assert.deepEqual([real.results[0].value, real.results[1].value], [0, undefined]);
+  assert.equal(execSummary(steps, [reply], true).results[0].value, undefined);
+});
+
+test('train-add-wagons: in depot now; else to depot, then wagons and restart on arrival', async () => {
+  fake.state.trainInDepot = true;
+  try {
+    const now = await run('train-add-wagons', { vehicle: 11, wagons: 2 });
+    assert.equal(now.ok, true, JSON.stringify(now));
+    assert.deepEqual(lastExec().steps, [['veh_buy', 13, 22, 27, 7, 11], ['veh_buy', 13, 22, 27, 7, 11], ['veh_start_stop', 11, 1]]);
+  } finally { fake.state.trainInDepot = false; }
+  const later = await run('train-add-wagons', { vehicle: 11, wagons: 1 });
+  assert.equal(later.heading_to_depot, true);
+  assert.deepEqual(lastExec().steps, [['veh_depot', 11, false]]);
+  fake.state.trainInDepot = true;
+  try {
+    const fin = await run('train-add-wagons', { finish: true });
+    assert.deepEqual(fin.wagons_added.map((w) => [w.vehicle, w.wagons_added, w.restarted]), [[11, 1, true]]);
+    assert.deepEqual(lastExec().steps, [['veh_buy', 13, 22, 27, 7, 11], ['veh_start_stop', 11, 1]]);
+    assert.deepEqual(fin.pending, []);
+  } finally { fake.state.trainInDepot = false; }
+});
+
+test('add-train: refuses without a loop for the extra train; --force clones, starts and verifies', async () => {
+  fake.state.lostTrain = true; // vehicle 13: orders for stations 3 and 5
+  try { await addTrainChecks(); } finally { fake.state.lostTrain = false; }
+});
+async function addTrainChecks() {
+  const no = await run('add-train', { vehicle: 13 });
+  assert.equal(no.ok, false);
+  assert.equal(no.first_error, 'needs_loop');
+  assert.deepEqual([no.check.trains_on_line, no.check.passing_loops], [1, 0]);
+  const yes = await run('add-train', { vehicle: 13, force: true });
+  assert.equal(yes.ok, true, JSON.stringify(yes).slice(0, 300));
+  assert.deepEqual(fake.received.filter((q) => q.cmd === 'exec').slice(-2).map((q) => q.args.steps[0][0]), ['veh_clone', 'veh_start_stop']);
+  assert.equal(yes.started, true);
+  assert.ok('verify' in yes);
+}

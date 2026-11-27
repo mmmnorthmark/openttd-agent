@@ -34,7 +34,7 @@ export function makeContext() {
           // the next call connects again and mirrors the new map.
           s.admin.on('newgame', () => { if (session === s) session = null; s.close(); });
           return s;
-        }).finally(() => { connecting = null; });
+        }, (e) => { s.close(); throw e; }).finally(() => { connecting = null; });
       }
       return connecting;
     },

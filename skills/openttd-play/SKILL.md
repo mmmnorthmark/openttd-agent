@@ -17,11 +17,13 @@ tool with underscores (`goal_status`, `build_cargo_route`) and the flags as argu
 
 1. **Read the state** (cheap, read-only):
    - `goal-status`: targets, progress, `days_left`.
-   - `status` and `companies`: date, your money and loan, how the others are doing.
+   - `status` and `companies`: date, your money and loan, how the others are doing
+     (`companies --history 4` for trends; `rating` shows which rating components are low).
+   - `summary`: one line per vehicle and station (worst first).
    - `events --since <latest_seq from last turn>`: what happened.
 2. **Fix before you build:** `vehicle-problems`. Handle every `severity: action` row first using its
    `suggested_fix`; `verify-route --vehicle <id>` names where the track breaks. Leave `info` rows on
-   a running train alone.
+   a running train alone. `deadlock` / `stalled_on_line`: `vehicle-reverse --vehicles <one id>`.
 3. **Find one opportunity:** `find-cargo-pairs --cargo <name> --limit 5` (see `cargos` for names;
    passengers and mail pair towns, feed both names to `--from_town` / `--to_town`). `industries` and
    `town-gaps` give more options.
@@ -34,8 +36,12 @@ tool with underscores (`goal_status`, `build_cargo_route`) and the flags as argu
    good route, `loan --repay <amount>` when cash piles up. Interest costs money: borrow for a plan.
 6. **Grow busy routes:** `stations --min_waiting 100` shows cargo piling up. Add a train with
    `vehicle-clone --vehicle <id> --depot auto --start true` (it picks a depot on that train's own
-   line). A clone in another line's depot gets lost.
+   line). A clone in another line's depot gets lost. A single-track line needs a passing loop before a
+   second train: `loop-sites --vehicle <id>` ranks dry-run sites and prints the `build-passing-loop`
+   command. Old or weak vehicles: `vehicle-replace --vehicles <ids>` (the old one is sold when it
+   reaches the depot).
 7. **Write notes** outside the game: ids you built, the plan, what failed. Long games outlast context.
+   On the map itself, `sign --x --y --text` marks a planned plot for free.
 
 ## Rules
 
