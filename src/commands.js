@@ -11,6 +11,7 @@ import * as z from 'zod/v4';
 import { doctor, installGamescript, launch, findExecutable, checkSaveName, bundledGsVersion, adminHostForBind, profileDir, TERRAIN_TYPES } from './setup.js';
 import { serverTarget, serverStates, profilePorts, serverPids, waitReady, notReadyDetail, stopServer, withAdmin, loadSave, listSaves, companyNew, reloadGamescript, logTail, portOpen } from './host.js';
 import { VERSION } from './version.js';
+import { connectionHint, diagnoseAddress, hostCheck, playerCheck } from './netcheck.js';
 import { classifyVersion, versionRefusal, acceptUntested, detectInstalledVersion, compareHostClient, installHint } from './versions.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
@@ -1930,7 +1931,34 @@ export const COMMANDS = [
         if (url.protocol !== 'http:') throw new Error('relay must be an http:// URL (the relay speaks plain HTTP on the LAN)');
         a.relay = url.origin;
       }
-      return redacted(saveConfig({ ...a, ...(token !== undefined ? { relay_token: token } : {}) }));
+      const saved = redacted(saveConfig({ ...a, ...(token !== undefined ? { relay_token: token } : {}) }));
+      const net = a.relay ? diagnoseAddress(a.relay) : null;
+      return net?.hint ? { ...saved, network: net, hint: net.hint } : saved;
+    },
+  },
+  {
+    name: 'net-check', group: 'setup', session: false,
+    description: "Network diagnosis, read-only and without admin rights. --role player (default when a relay is configured): classifies the host address (loopback, private LAN, CGNAT/mesh VPN, link-local, public) against this machine's subnets and test-connects the relay and game ports; a private address on another network gets hint + options (OpenTTD invite codes for the game; a mesh VPN or tunnel for the relay, links only). --role host: who listens on the game/admin/relay ports and on which address (lsof), a self-connect on the LAN address, the firewall state (macOS socketfilterfw incl. whether OpenTTD and node are blocked; Linux ufw/firewalld; Windows netsh) and `fixes`: allow the app or port on private networks, never turn the firewall off.",
+    args: z.object({
+      role: z.enum(['host', 'player']).optional().describe('default: player when a relay is configured, else host'),
+      target: z.string().optional().describe('player: host address or relay URL to check (default: the configured relay, else host)'),
+      ...serverArg,
+      game_port: int().min(1).max(65535).optional().describe('default: the server profile\'s, else 3979'),
+      relay_port: int().min(1).max(65535).optional().describe('default: the port in the relay URL, else the configured relay_port'),
+      probe: bool().optional().describe('player: also test-connect a private address that is on none of this machine\'s subnets (skipped by default: it is almost always another LAN)'),
+    }),
+    run: async (ctx, a) => {
+      const role = a.role ?? (ctx.cfg.relay ? 'player' : 'host');
+      if (role === 'player') {
+        const target = a.target ?? (ctx.cfg.relay || ctx.cfg.host);
+        let relayPort = a.relay_port;
+        if (relayPort === undefined) { try { relayPort = Number(new URL(/^[a-z]+:\/\//i.test(target) ? target : `http://${target}`).port) || ctx.cfg.relay_port; } catch { relayPort = ctx.cfg.relay_port; } }
+        return playerCheck({ target, probe: a.probe, ports: [{ port: relayPort, role: 'relay' }, { port: a.game_port ?? 3979, role: 'game' }] });
+      }
+      let t = null;
+      try { t = serverTarget(ctx.cfg, a.server); } catch (e) { if (a.server) throw e; }
+      const ports = [{ port: a.game_port ?? t?.game_port ?? 3979, role: 'game' }, { port: t?.admin_port ?? ctx.cfg.admin_port, role: 'admin' }, { port: a.relay_port ?? ctx.cfg.relay_port, role: 'relay' }];
+      return { server: t?.server ?? null, ...(await hostCheck({ ports, exe: findExecutable() })) };
     },
   },
   {
@@ -4004,6 +4032,13 @@ function parseArgs(cmd, name, args, cls) {
   throw new Error(`bad_arguments: bad arguments for ${name}: could not repair them`);
 }
 
+/** A failed admin connection (direct mode) -> { hint, network } for its address, or null. */
+function adminConnectHint(message) {
+  const m = /admin connect to (\[[^\]]+\]|[^\s:]+):(\d+) failed: (\S+?)[.)]?(\s|$)/.exec(message) ?? /no welcome from (\[[^\]]+\]|[^\s:]+):(\d+) within/.exec(message);
+  if (!m) return null;
+  return connectionHint(m[1], m[3] ?? 'timeout', { kind: 'admin' });
+}
+
 /**
  * Validate and run one command; the full enveloped result (no output shaping). The daemon and the
  * relay serve this; callers shape it once (runCommand / dispatch). opts.readOnly: L12 gate.
@@ -4037,7 +4072,12 @@ export async function executeCommand(ctx, name, rawArgs = {}, { readOnly = false
   const withNotes = (res) => (Object.keys(notes).length ? { ...res, ...notes } : res);
   // Player with a relay configured: the host's relay runs every game command (it holds the admin connection and the map mirror).
   if (cmd.session && ctx.cfg.relay) {
-    const res = envelope(await callRelay(ctx.cfg, name, parsed.args));
+    let res;
+    try { res = envelope(await callRelay(ctx.cfg, name, parsed.args)); } catch (e) {
+      const h = e.netCode ? connectionHint(ctx.cfg.relay, e.netCode, { kind: 'relay' }) : null;
+      if (!h) throw e;
+      return withNotes({ ok: false, error: e.message, first_error: errorCode(e.message), hint: h.hint, network: h.network });
+    }
     const host = res.versions?.openttd_agent;
     if (name === 'status' && host && host !== VERSION) {
       res.warnings = [...(res.warnings ?? []), `the host's relay runs openttd-agent ${host}, you run ${VERSION}: use the same version (npx -y github:mmmnorthmark/openttd-agent#v${host} ...)`];
@@ -4047,7 +4087,12 @@ export async function executeCommand(ctx, name, rawArgs = {}, { readOnly = false
   // G20: every game action (a command with dry_run) answers with the bank balance after it.
   const wantMoney = cmd.session && cls === 'dry_run';
   const mark = wantMoney ? (await ctx.session()).lastExec?.n ?? 0 : 0;
-  const res = envelope(await cmd.run(ctx, parsed.data));
+  let res;
+  try { res = envelope(await cmd.run(ctx, parsed.data)); } catch (e) {
+    const h = cmd.session ? adminConnectHint(e.message) : null;
+    if (!h) throw e;
+    return withNotes({ ok: false, error: e.message, first_error: errorCode(e.message), hint: h.hint, network: h.network });
+  }
   if (wantMoney && res.money_after === undefined) {
     const m = await moneyAfter(ctx, parsed.data.company, mark, res);
     if (m !== undefined) res.money_after = m;

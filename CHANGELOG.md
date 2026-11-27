@@ -21,6 +21,14 @@ Hardening (batch 8):
   release manifest), runs a smoke suite per version in a sandbox (own HOME, OPENTTD_AGENT_HOME,
   OpenGFX, ports) and prints the table in `docs/COMPATIBILITY.md` (14.0-15.3 green on macOS);
   `.github/workflows/version-matrix.yml` runs it on the Linux builds.
+- `net-check` (new, read-only): player side classifies the host address (loopback, private,
+  CGNAT/mesh, link-local, public) against this machine's subnets and test-connects the relay and
+  game ports (a private address on another network is not probed unless `--probe true`); host side
+  (`--role host`) shows listeners and bind addresses, a LAN self-connect, the firewall state
+  without admin rights and secure `fixes`. A failed relay call (`relay_unreachable`) or admin
+  connection now answers with `hint` and `network`; `configure --relay` with a private address on
+  another network adds them too. README: "Playing over a network".
+- README "Bonus": a link to John Broomhall's 2014 re-recorded Transport Tycoon soundtrack (no audio bundled).
 - Public hygiene: `tools/check_public.sh` (part of `npm run check`) fails on personal names,
   paths, private IPs and hostnames; examples use RFC 5737 addresses.
 

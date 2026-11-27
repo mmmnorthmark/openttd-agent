@@ -12,7 +12,9 @@ export async function callRelay(cfg, name, args = {}, { timeoutMs = callTimeoutM
     res = await postJson(`${clean(cfg.relay)}/call`, { name, args }, { headers: { authorization: `Bearer ${cfg.relay_token}` }, timeoutMs });
   } catch (e) {
     if (e.code === 'timeout') throw new Error(`relay_timeout: no reply from the relay at ${cfg.relay} within ${Math.round(timeoutMs / 1000)} s for ${name}; it may still be running there. Set OPENTTD_AGENT_CALL_TIMEOUT_S for longer calls`);
-    throw new Error(`cannot reach the relay at ${cfg.relay} (${e.code ?? e.message}). Is 'openttd-agent relay' running on the host, and is the address right? Then run: openttd-agent guide`);
+    const err = new Error(`relay_unreachable: cannot reach the relay at ${cfg.relay} (${e.code ?? e.message}). Is 'openttd-agent relay' running on the host, and is the address right? See hint (openttd-agent net-check tests the network), then run: openttd-agent guide`);
+    err.netCode = e.code ?? 'failed';
+    throw err;
   }
   const body = res.json;
   if (!body) throw new Error(`relay at ${cfg.relay} sent a non-JSON reply (HTTP ${res.status}); is that address an openttd-agent relay?`);

@@ -9,7 +9,7 @@
 
 /** Commands that change nothing (and take no dry_run). */
 export const READ_COMMANDS = new Set([
-  'doctor', 'guide', 'show-config', 'relay-list-players', 'relay-stats',
+  'doctor', 'guide', 'show-config', 'net-check', 'relay-list-players', 'relay-stats',
   'status', 'companies', 'rating', 'goal-status',
   'cargos', 'industry-types', 'towns', 'industries', 'find-cargo-pairs', 'acceptance', 'town-gaps', 'route-effort',
   'airport-types', 'airport-sites', 'tiles', 'rail-tiles', 'signs', 'owned-land',
