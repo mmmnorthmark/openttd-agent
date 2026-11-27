@@ -161,7 +161,7 @@ test('build-cargo-route builds in order, buys and orders the train, starts it', 
 test('build-cargo-route traces the built line both ways: route_broken when it does not join (C1)', async () => {
   fake.state.newStations = []; // the new stations exist, but no track joins them in rail_tiles
   try {
-    const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', wagons: 3 });
+    const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', wagons: 3, reuse_stations: 'never' });
     assert.deepEqual([res.ok, res.failed_step, res.first_error, res.verify.connected, res.verify.there, res.verify.back], [false, 'verify', 'route_broken', false, false, false]);
     assert.equal(res.built.at(-1).step, 'start', 'the train was built and started');
     assert.match(res.error, /route_broken: the new line does not trace from New 0 to New 1.*verify-route --vehicle/);
@@ -171,7 +171,8 @@ test('build-cargo-route traces the built line both ways: route_broken when it do
 test('build-cargo-route: no terminus site says what was tried and why (C8, L4)', async () => {
   fake.state.stationError = 'ERR_FLAT_LAND_REQUIRED';
   try {
-    const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true });
+    assert.equal((await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true })).no_site.tried.length, 7, 'two joined to Bigton Woods, then five new');
+    const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true, reuse_stations: 'never' });
     assert.deepEqual([res.ok, res.failed_step, res.first_error], [false, 'source_station', 'no_terminus_site']);
     assert.equal(res.no_site.tried.length, 5, 'an industry end gets the fallbacks too');
     assert.deepEqual(res.no_site.tried.at(-1), { radius: 16, length: 3, platforms: 1 });
@@ -390,9 +391,23 @@ test('build-cargo-route: town fallbacks; warnings for own stations near a new te
   const f = siteFallbacks({ radius: 8, length: 4, platforms: 2 });
   assert.deepEqual(f.map((o) => [o.radius, o.length, o.platforms]), [[8, 4, 2], [12, 4, 2], [12, 3, 2], [12, 3, 1], [16, 3, 1]]);
   assert.equal(siteFallbacks({ radius: 8, length: 2, platforms: 1 }).length, 3);
-  const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true, allow_existing: true });
+  const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true, allow_existing: true, reuse_stations: 'never' });
   assert.equal(res.ok, true, JSON.stringify(res).slice(0, 400));
   assert.ok(res.warnings.some((w) => w.near_own_station.id === 3 && w.end === 'source'), JSON.stringify(res.warnings));
+});
+
+test('build-cargo-route --reuse_stations auto (default): the terminus joins your station at a served end (L3)', async () => {
+  const before = execs().length;
+  const res = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', dry_run: true, allow_existing: true });
+  assert.equal(res.ok, true, JSON.stringify(res).slice(0, 400));
+  assert.deepEqual(res.source_site.reused_station, { id: 3, name: 'Bigton Woods' });
+  assert.equal(res.source_site.join, 3);
+  assert.ok(!(res.warnings ?? []).some((w) => w.near_own_station?.id === 3 && w.end === 'source'), 'no warning about the station it joins');
+  const stationSteps = execs().slice(before).flatMap((e) => e.args.steps).filter((st) => st[0] === 'rail_station');
+  assert.equal(stationSteps[0][6], 3, 'the dry run joins station 3');
+  const built = await run('build-cargo-route', { from_industry: 1, to_industry: 2, cargo: 'wood', allow_existing: true, wagons: 2 });
+  assert.equal(built.source_station, 3, 'the joined station is the source');
+  assert.equal(built.built[0].station, 3);
 });
 
 test('depots: front and exit_dir (v12); build-rail-depot checks its front', async () => {

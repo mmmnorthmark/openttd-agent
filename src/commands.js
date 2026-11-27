@@ -479,7 +479,7 @@ async function buildCargoRoute(s, company, a) {
         { existing: { ...existing, served_by: servedBy }, first_error: 'existing_route',
           hint: `add capacity instead: vehicle-clone --vehicle ${servedBy} --depot auto --start true; or pass --allow_existing true to build a second line anyway` });
     }
-    if (existing) plan.existing_unserved = { ...existing, note: 'your stations there have no vehicle serving both, so a new line is built (they are not reused)' };
+    if (existing) plan.existing_unserved = { ...existing, note: 'your stations there have no vehicle serving both, so a new line is built (with --reuse_stations auto the new termini join them where they fit)' };
   }
 
   // 1. Stations: best dry-run-checked site at each end, facing the other end, not overlapping.
@@ -502,10 +502,17 @@ async function buildCargoRoute(s, company, a) {
   };
   let srcSites = null, dstSites = null, accepting = [];
   const srcTried = [], dstTried = [];
-  for (const o of tries()) {
-    srcSites = await stationSites(s, company, from, to, o);
+  // L3: an end next to one of your rail stations joins a new platform group to it (join = its id;
+  // the game needs the result within station_spread). Tried with the first two option sets, then a new station.
+  const reuseAt = (end) => (a.reuse_stations === 'never' ? null : ownNear(end).find((st) => st.tiles <= a.radius) ?? null);
+  const joinsFor = (reuse) => (reuse ? [...tries().slice(0, 2).map((o) => ({ o, join: reuse.id })), ...tries().map((o) => ({ o, join: -1 }))] : tries().map((o) => ({ o, join: -1 })));
+  const reuseNote = (reuse, join) => (reuse ? (join >= 0 ? { reused_station: { id: reuse.id, name: reuse.name } } : { reuse_failed: { id: reuse.id, name: reuse.name, note: 'no terminus joined to it passed its dry run (too far apart for station_spread, or no room); a new station is built' } }) : {});
+  const srcReuse = reuseAt(from), dstReuse = reuseAt(to);
+  let srcJoin = -1, dstJoin = -1;
+  for (const { o, join } of joinsFor(srcReuse)) {
+    srcSites = await stationSites(s, company, from, to, { ...o, join });
     srcTried.push({ opts: o, res: srcSites });
-    if (srcSites.sites.length) { if (o !== opts) plan.source_fallback = fallbackNote(opts, o); break; }
+    if (srcSites.sites.length) { srcJoin = join; if (o !== opts) plan.source_fallback = fallbackNote(opts, o); break; }
   }
   const noSite = (which, sites, tried, end) => {
     const report = noSiteReport(tried, ownNear(end));
@@ -514,13 +521,13 @@ async function buildCargoRoute(s, company, a) {
       { first_error: 'no_terminus_site', no_site: report, hint_sites: report.hint });
   };
   if (!srcSites.sites.length) return noSite('source_station', srcSites, srcTried, from);
-  for (const o of tries()) {
-    dstSites = await stationSites(s, company, to, from, o);
+  for (const { o, join } of joinsFor(dstReuse)) {
+    dstSites = await stationSites(s, company, to, from, { ...o, join });
     dstTried.push({ opts: o, res: dstSites });
     // Destination sites must accept the cargo (AgentBridge v7; null = not checkable, kept with a note).
     for (const d of dstSites.sites) accepts.set(d, await acceptOf(d));
     accepting = dstSites.sites.filter((d) => accepts.get(d) === null || accepts.get(d) >= ACCEPTED);
-    if (accepting.length) { if (o !== opts) plan.dest_fallback = fallbackNote(opts, o); break; }
+    if (accepting.length) { dstJoin = join; if (o !== opts) plan.dest_fallback = fallbackNote(opts, o); break; }
   }
   if (!dstSites.sites.length) return noSite('dest_station', dstSites, dstTried, to);
   if (!accepting.length) {
@@ -529,13 +536,15 @@ async function buildCargoRoute(s, company, a) {
   let src = null, dst = null;
   for (const p of srcSites.sites) { const q = accepting.find((d) => !sitesOverlap(p, d)); if (q) { src = p; dst = q; break; } }
   if (!src) return fail('dest_station', 'every source and destination site overlap: the two ends are too close for two termini');
-  plan.source_site = { target: srcSites.target, ...src };
-  plan.dest_site = { target: dstSites.target, ...dst, acceptance: accepts.get(dst) };
+  src.join = srcJoin; dst.join = dstJoin;
+  plan.source_site = { target: srcSites.target, ...src, ...reuseNote(srcReuse, srcJoin) };
+  plan.dest_site = { target: dstSites.target, ...dst, acceptance: accepts.get(dst), ...reuseNote(dstReuse, dstJoin) };
   // Warn when a new terminus lands next to one of our stations: often a second line to the same place.
   const ownStations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
   const warnings = [];
   for (const [end, site] of [['source', src], ['dest', dst]]) {
     for (const st of ownStations) {
+      if (st.id === site.join) continue;
       const d = tileDistance(st, site);
       if (d <= 8) warnings.push({ near_own_station: { id: st.id, name: st.name, x: st.x, y: st.y }, end, tiles: d });
     }
@@ -603,10 +612,11 @@ async function buildCargoRoute(s, company, a) {
   const exec = async (steps, opts2 = {}) => { s.throttleBuild(); return s.exec(company, steps, { railType, ...opts2 }); };
   let spent = 0;
   const station = async (name, site) => {
-    const t = terminusSteps({ x: site.x, y: site.y, axis: site.axis, platforms: site.platforms, length: site.length, exitHigh: site.exit === 'high', join: -1 });
+    const t = terminusSteps({ x: site.x, y: site.y, axis: site.axis, platforms: site.platforms, length: site.length, exitHigh: site.exit === 'high', join: site.join ?? -1 });
     const res = await exec(t.steps);
     spent += res.cost;
-    const st = res.results.some((r) => r.op === 'rail_station' && r.ok) ? await stationAt(s, company, site) : null;
+    const placed = res.results.some((r) => r.op === 'rail_station' && r.ok);
+    const st = !placed ? null : site.join >= 0 ? stationsFromRows(await s.gs.call('stations', { company }), s.cargos).find((q) => q.id === site.join) ?? null : await stationAt(s, company, site);
     if (st || res.results.some((r) => r.ok)) built.push({ step: name, station: st?.id ?? null, x: site.x, y: site.y, connect_at: site.connect_at, complete: res.ok, cost: res.cost });
     return { res, st };
   };
@@ -2900,6 +2910,7 @@ export const COMMANDS = [
       max_bridge: int().min(3).max(40).default(12), rail_type: int().optional().describe('see rail-types; default: the one with the cheapest track'),
       allow_existing: bool().default(false).describe('build even when one of your vehicles already serves your stations at both ends (refused by default: clone trains instead)'),
       passing_loops: int().min(0).max(6).default(0).describe('passing loops to build on the line, spread along it on straight stretches (loop-sites logic), sized for the train'),
+      reuse_stations: z.enum(['auto', 'never']).default('auto').describe('auto: at an end within --radius of one of your rail stations, the new terminus joins that station (reused_station; reuse_failed when it does not fit); never: always a new station'),
     }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
