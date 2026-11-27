@@ -149,7 +149,11 @@ export function diagnoseGs(cfg) {
     if (!names.length) return null;
   }
   const t = serverTarget(cfg);
-  if (!t.local) return null;
+  return t.local ? diagnoseTarget(t) : null;
+}
+
+/** diagnoseGs for a known server target (its profile's log). */
+export function diagnoseTarget(t) {
   const tail = logTail(t.dir, { lines: 4, errors: true });
   if (!tail.exists) return null;
   if (tail.gs.state === 'died') return { code: 'gs_died', detail: `the GameScript died (server log ${tail.file}: ${tail.gs.context.join(' | ').slice(-600)}). Load the game again (openttd-agent load --name <save>) or launch again; server-log --errors true shows more` };
@@ -169,6 +173,7 @@ export async function withAdmin(target, fn, { name = 'openttd-agent-host' } = {}
     throw new Error(`server_not_running: no admin port at ${target.host}:${target.admin_port} (server '${target.server}': ${e.message}). Start it with: openttd-agent launch${target.server !== 'dedicated' ? ` --server ${target.server}` : ''}`);
   }
   const gs = new GSRpc(admin);
+  if (target.local) gs.diagnose = () => diagnoseTarget(target);
   try { return await fn(admin, gs); } finally { admin.close(); }
 }
 

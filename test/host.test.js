@@ -122,3 +122,13 @@ test('saves and server-log read the launch profile; an unknown --server says whi
 test('parseLs keeps savegames only and drops .sav', () => {
   assert.deepEqual(host.parseLs(['0) .. (Parent directory)', '1) autosave/ (Directory)', '2) t080-a.sav', 'junk']), [{ index: 2, name: 't080-a' }]);
 });
+
+test('a GS timeout names the cause from the server log: gs_died with the log lines', async () => {
+  const { GSRpc } = await import('../src/gs-rpc.js');
+  const { EventEmitter } = await import('node:events');
+  const admin = Object.assign(new EventEmitter(), { subscribe() {}, sendGamescript() {} });
+  const gs = new GSRpc(admin);
+  await assert.rejects(gs.call('info', {}, 20), /^Error: gs_timeout: GS cmd 'info' timed out/);
+  gs.diagnose = () => host.diagnoseTarget(host.serverTarget({ admin_password: 'pw' }, 'side'));
+  await assert.rejects(gs.call('info', {}, 20), /^Error: gs_died: GS cmd 'info' timed out after 20ms; the GameScript died \(server log .*died unexpectedly/);
+});

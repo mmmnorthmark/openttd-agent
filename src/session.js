@@ -6,6 +6,7 @@ import { GSRpc } from './gs-rpc.js';
 import { TileMap, townsFromRows, industriesFromRows } from './world.js';
 import { execSummary, VEHICLE_STATES } from './operate.js';
 import { recordStall } from './problems.js';
+import { diagnoseGs } from './host.js';
 import { log } from './log.js';
 
 const ECONOMY_TTL_MS = 60_000; // towns/industries refresh at most once a minute (~1 game month)
@@ -44,11 +45,13 @@ export class Session {
     });
     this.admin.subscribe(UPDATE.CHAT, FREQ.AUTOMATIC);
     this.gs = new GSRpc(this.admin);
+    this.gs.diagnose = () => diagnoseGs(this.cfg);
     this.info = await this.gs.call('info', {}, 10000).catch((e) => {
       // Close at once: a daemon retrying every call must not pile up admin connections (the
       // server refuses new ones once its admin slots are full: "read ECONNRESET").
       this.close();
-      throw new Error(`connected to admin port but the AgentBridge GameScript did not answer: ${e.message}. The game is running without AgentBridge. `
+      const code = /^(gs_died|gs_timeout):/.exec(e.message)?.[1] ?? 'no_gamescript';
+      throw new Error(`${code}: connected to admin port but the AgentBridge GameScript did not answer: ${e.message}. The game is running without AgentBridge (or it died). `
         + 'On the host: openttd-agent install-gamescript, then start the game again with openttd-agent launch (it writes [game_scripts] so AgentBridge is the only game script; '
         + 'an entry copied from your own openttd.cfg, e.g. "none =", used to win). A loaded save runs the GameScript stored in it: prepare it with scenario-prepare. Then run: openttd-agent guide');
     });
