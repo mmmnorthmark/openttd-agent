@@ -235,3 +235,15 @@ test('--select picks vehicles by filter for vehicle-depot and vehicle-replace', 
   await assert.rejects(run('vehicle-depot', { select: 'colour=red' }), /bad_arguments: --select/);
   await assert.rejects(run('vehicle-depot', {}), /--vehicles A,B or --select/);
 });
+
+// ---- R11: vehicle-clone --station ---------------------------------------------------------
+
+test('vehicle-clone --station clones a vehicle serving that station', async () => {
+  const res = await run('vehicle-clone', { station: 'Bigton Central', dry_run: true });
+  assert.equal(res.source.vehicle, 12);
+  assert.equal(res.source.station.id, 4);
+  const wood = await run('vehicle-clone', { station: '3', cargo: 'wood', dry_run: true });
+  assert.equal(wood.source.vehicle, 11);
+  await assert.rejects(run('vehicle-clone', { station: '4', cargo: 'wood', dry_run: true }), /no vehicle of yours/);
+  await assert.rejects(run('vehicle-clone', { dry_run: true }), /--vehicle ID or --station/);
+});

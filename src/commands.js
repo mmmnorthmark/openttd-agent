@@ -945,6 +945,28 @@ const selectArgs = (what, max) => ({
   max: int().min(1).max(100).default(max).describe('with --select: at most this many vehicles'),
 });
 
+/**
+ * vehicle-clone --station (R11): the best vehicle to copy among those with an order for `station`:
+ * not queued for sale, not crashed, carrying `cargo` when given (vehicle_loads, v13), highest profit last year.
+ * Returns { vehicle, unit_number, profit_last_year, candidates } or throws a refusal.
+ */
+async function cloneSourceAt(s, company, station, cargo) {
+  const st = findStation(stationsFromRows(await s.gs.call('stations', { company }), s.cargos), station);
+  const ids = await stationVehicleIds(s, company, st.id);
+  if (!ids) throw new Error('refused: vehicle-clone --station needs AgentBridge v12; give --vehicle ID instead');
+  const serving = new Set(ids.get(st.id) ?? []);
+  let cands = vehiclesFromRows(await s.gs.call('vehicles', { company })).filter((v) => serving.has(v.id) && v.state !== 'crashed' && !s.pendingSales.has(`${company}:${v.id}`));
+  if (cargo !== undefined) {
+    const want = cargoId(s.cargos, cargo);
+    const loads = await vehicleLoads(s, company, cands.map((v) => v.id));
+    if (!loads) throw new Error('refused: --cargo with --station needs AgentBridge v13; give --vehicle ID instead');
+    cands = cands.filter((v) => loads.get(v.id)?.cargo.some((c) => c.cargo === want));
+  }
+  if (!cands.length) throw new Error(`refused: no vehicle of yours with an order for ${st.name} (${st.id})${cargo !== undefined ? ` carries ${cargo}` : ''} that is not queued for sale; build one with vehicle-buy --orders`);
+  const best = [...cands].sort((p, q) => q.profit_last_year - p.profit_last_year || q.profit_this_year - p.profit_this_year)[0];
+  return { vehicle: best.id, unit_number: best.unit_number, profit_last_year: best.profit_last_year, station: { id: st.id, name: st.name }, candidates: cands.length };
+}
+
 /** Station ids in a vehicle's orders (for the sale ledger); [] when it cannot be read. */
 async function orderStationIds(s, company, id) {
   try { return [...new Set((await currentOrderOf(s, company, id)).orders.filter((o) => o.kind === 'station').map((o) => o.station))]; } catch { return []; }
@@ -2559,16 +2581,21 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-clone', group: 'operate', session: true,
-    description: 'Clone a vehicle `count` times, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check.',
+    description: 'Clone a vehicle `count` times, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check. --station ID [--cargo C] instead of --vehicle clones the best-earning vehicle with an order there (source says which). A sold vehicle id is refused with already_sold, the sale date and the vehicles serving its stations now.',
     args: z.object({ ...act, ...borrow, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
-      depot_x: int().optional(), depot_y: int().optional(), vehicle: int(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
+      depot_x: int().optional(), depot_y: int().optional(), vehicle: int().optional(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
+      station: z.string().optional().describe('instead of --vehicle: clone the best-earning vehicle with an order for this station (id or name; AgentBridge v12)'),
+      cargo: z.string().optional().describe('with --station: only a vehicle that carries this cargo'),
       check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const { depot, ...check } = await depotForRoute(s, company, a, a.vehicle, { cmd: 'vehicle-clone' });
-      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, a.share_orders]));
+      if ((a.vehicle === undefined) === (a.station === undefined)) throw new Error('give --vehicle ID or --station ID (clone a vehicle serving it), not both');
+      const source = a.station !== undefined ? await cloneSourceAt(s, company, a.station, a.cargo) : null;
+      const vehicle = source ? source.vehicle : a.vehicle;
+      const { depot, ...check } = await depotForRoute(s, company, a, vehicle, { cmd: 'vehicle-clone' });
+      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, vehicle, a.share_orders]));
       const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
-      const out = { ...res, depot, ...check, vehicles };
+      const out = { ...res, ...(source ? { source } : {}), depot, ...check, vehicles };
       if (!a.start || a.dry_run || !vehicles.length) return out;
       const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
       return { ...out, started: started.ok };
