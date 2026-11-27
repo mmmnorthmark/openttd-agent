@@ -70,12 +70,14 @@ class AgentBridge extends GSController {
 			vehicle_wagons = "CmdVehicleWagons",
 			signs = "CmdSigns",
 			road_types = "CmdRoadTypes",
+			town_rating = "CmdTownRating",
+			vehicle_loads = "CmdVehicleLoads",
 		};
 	}
 }
 
 function AgentBridge::Start() {
-	GSLog.Info("AgentBridge v12 started");
+	GSLog.Info("AgentBridge v13 started");
 	this.RestoreGoals();
 	GSAdmin.Send({ id = 0, client = "", ok = true, part = 0, last = true, data = { event = "started", tick = GSController.GetTick() } });
 	while (true) {
@@ -233,7 +235,7 @@ function AgentBridge::CmdInfo(args) {
 		paused = GSGame.IsPaused(),
 		towns = GSTown.GetTownCount(),
 		industries = GSIndustry.GetIndustryCount(),
-		bridge_version = 12,
+		bridge_version = 13,
 		event_seq = this.event_seq,
 		goals = this.goals.len(),
 	};
@@ -1555,6 +1557,70 @@ function AgentBridge::CmdRoadTypes(args) {
 		foreach (rt, _ in GSRoadTypeList(rtt)) {
 			out.append([rt, this.Str(GSRoad.GetName(rt)), rtt == GSRoad.ROADTRAMTYPES_TRAM, GSRoad.GetMaxSpeed(rt),
 				GSRoad.GetBuildCost(rt, GSRoad.BT_ROAD), GSRoad.IsRoadTypeAvailable(rt)]);
+		}
+	}
+	return out;
+}
+
+// ---- v13: town ratings, vehicle loads ---------------------------------------------
+
+// GSTown.TownRating -> name (the words of the town window).
+function AgentBridge::RatingName(r) {
+	switch (r) {
+		case GSTown.TOWN_RATING_NONE: return "none";
+		case GSTown.TOWN_RATING_APPALLING: return "appalling";
+		case GSTown.TOWN_RATING_VERY_POOR: return "very_poor";
+		case GSTown.TOWN_RATING_POOR: return "poor";
+		case GSTown.TOWN_RATING_MEDIOCRE: return "mediocre";
+		case GSTown.TOWN_RATING_GOOD: return "good";
+		case GSTown.TOWN_RATING_VERY_GOOD: return "very_good";
+		case GSTown.TOWN_RATING_EXCELLENT: return "excellent";
+		case GSTown.TOWN_RATING_OUTSTANDING: return "outstanding";
+	}
+	return "invalid";
+}
+
+// args: company, optional towns [ids] or points [[x, y], ...] (at most 60).
+// Rows: [town, rating, detailed, x, y]: rating = RatingName(GSTown.GetRating), detailed = GSTown.GetDetailedRating
+// (-1000..1000; the game's number behind the word). Point rows: the town whose local authority covers tile x,y
+// (GSTile.GetTownAuthority; town -1 when none); town rows have x, y = the town centre.
+function AgentBridge::CmdTownRating(args) {
+	local company = this.CheckCompany(args);
+	local out = [];
+	if ("points" in args) {
+		foreach (p in args.points) {
+			local t = GSTile.GetTownAuthority(this.T(p[0], p[1]));
+			if (!GSTown.IsValidTown(t)) { out.append([-1, "", 0, p[0], p[1]]); continue; }
+			out.append([t, this.RatingName(GSTown.GetRating(t, company)), GSTown.GetDetailedRating(t, company), p[0], p[1]]);
+		}
+		return out;
+	}
+	local ids = [];
+	if ("towns" in args) { foreach (t in args.towns) ids.append(t); }
+	else { foreach (t, _ in GSTownList()) ids.append(t); }
+	foreach (t in ids) {
+		if (!GSTown.IsValidTown(t)) continue;
+		local tile = GSTown.GetLocation(t);
+		out.append([t, this.RatingName(GSTown.GetRating(t, company)), GSTown.GetDetailedRating(t, company), GSMap.GetTileX(tile), GSMap.GetTileY(tile)]);
+	}
+	return out;
+}
+
+// args: company, optional vehicles [ids]. Rows: [vehicle, cargo, capacity, load] for every cargo the vehicle
+// (all its wagons) can carry now (GSVehicle.GetCapacity > 0).
+function AgentBridge::CmdVehicleLoads(args) {
+	local mode = GSCompanyMode(this.CheckCompany(args));
+	local cargos = [];
+	foreach (c, _ in GSCargoList()) cargos.append(c);
+	local ids = [];
+	if ("vehicles" in args) { foreach (v in args.vehicles) ids.append(v); }
+	else { foreach (v, _ in GSVehicleList()) ids.append(v); }
+	local out = [];
+	foreach (v in ids) {
+		if (!GSVehicle.IsValidVehicle(v)) continue;
+		foreach (c in cargos) {
+			local n = GSVehicle.GetCapacity(v, c);
+			if (n > 0) out.append([v, c, n, GSVehicle.GetCargoLoad(v, c)]);
 		}
 	}
 	return out;

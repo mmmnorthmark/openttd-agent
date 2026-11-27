@@ -354,7 +354,7 @@ test('status: versions, and a warning when the running AgentBridge is older than
   try {
     const old = await run('status', {});
     assert.match(old.warnings[0], /runs AgentBridge v\d+; this openttd-agent .* ships v\d+/);
-  } finally { fake.state.gsVersion = 12; }
+  } finally { fake.state.gsVersion = 13; }
 });
 
 test('verify-route traces road vehicles and road stops (AgentBridge v11), refuses on older GameScripts', async () => {
@@ -383,7 +383,7 @@ test('verify-route traces road vehicles and road stops (AgentBridge v11), refuse
   try {
     await assert.rejects(run('verify-route', { vehicle: 12 }), /refused: road vehicles .* AgentBridge v11/);
     assert.match((await run('vehicle-problems', {})).road_trace, /^off: /);
-  } finally { fake.state.gsVersion = 12; }
+  } finally { fake.state.gsVersion = 13; }
 });
 
 test('vehicle-depot: idempotent (already heading / in depot) and decoded failures', async () => {
@@ -401,7 +401,7 @@ test('vehicle-depot: idempotent (already heading / in depot) and decoded failure
     assert.deepEqual([old.already_in_depot, old.sent], [[11], [13]]);
     assert.deepEqual(lastExec().steps, [['veh_depot', 13, false]]);
     assert.match(old.note, /older than v11/);
-  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 12; }
+  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 13; }
 });
 
 test('loop-sites: traces the line and explains when no stretch is long enough', async () => {
@@ -457,7 +457,7 @@ test('vehicle-reverse: one veh_reverse step per vehicle; refused on an older Gam
   assert.deepEqual(lastExec().steps, [['veh_reverse', 11], ['veh_reverse', 12]]);
   assert.deepEqual(res.reversed, [11, 12]);
   fake.state.gsVersion = 11;
-  try { await assert.rejects(run('vehicle-reverse', { vehicles: '11' }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
+  try { await assert.rejects(run('vehicle-reverse', { vehicles: '11' }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 13; }
 });
 
 test('rail-tiles: decoded pieces, signals, depot fronts, owner; tiles marks owners (v12)', async () => {
@@ -497,7 +497,7 @@ test('stations carry vehicle_ids (v12); vehicles --station filters by them', asy
   try {
     assert.equal((await run('stations', {})).stations[0].vehicle_ids, undefined);
     await assert.rejects(run('vehicles', { station: 3 }), /needs AgentBridge v12/);
-  } finally { fake.state.gsVersion = 12; }
+  } finally { fake.state.gsVersion = 13; }
 });
 
 test('summary: one line per vehicle and station; filters', async () => {

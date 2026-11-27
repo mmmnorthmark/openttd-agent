@@ -205,6 +205,16 @@ const GS = {
   vehicle_wagons: (a) => (a.vehicle === 11 ? [[0, 5, 0xFF, 0], [1, 27, 7, 30], [2, 27, 7, 30], [3, 27, 7, 30], [4, 27, 7, 30]] : [[0, 9, 0, 31]]),
   signs: (_a, state) => state.signs.map((g) => [g.id, g.x, g.y, 0, g.text]),
   road_types: () => [[0, 'Road', false, 0, 61, true], [1, 'Tramway', true, 0, 70, true]],
+  // v13 (see main.nut): town_rating rows [town, rating, detailed, x, y]; state.townRatings id -> [name, detailed].
+  // A point's local authority: the town whose centre is within 12 tiles (Bigton 42,12; Smallham 10,50).
+  town_rating: (a, state) => {
+    const towns = [[1, 42, 12], [2, 10, 50]];
+    const row = ([id, x, y]) => [id, ...(state.townRatings[id] ?? ['none', 500]), x, y];
+    if (a.points) return a.points.map(([x, y]) => { const t = towns.find(([, cx, cy]) => Math.abs(cx - x) + Math.abs(cy - y) <= 12); return t ? [...row(t).slice(0, 3), x, y] : [-1, '', 0, x, y]; });
+    return towns.filter(([id]) => !a.towns || a.towns.includes(id)).map(row);
+  },
+  // vehicle_loads rows [vehicle, cargo, capacity, load].
+  vehicle_loads: (a, state) => [[11, 7, 120, 40], [12, 0, 31, 10], ...(state.lostTrain ? [[13, 7, 120, 0]] : [])].filter(([v]) => !a.vehicles || a.vehicles.includes(v)),
   get_rate: () => ({ command_delay_ticks: 0, max_builds_per_day: 0 }),
   dump_tiles: dumpRows,
   // owned_land (v10): indices of the points that are a.company's owned land.
@@ -344,7 +354,7 @@ const GS = {
 export function startFakeServer({ password = 'pw' } = {}) {
   const received = [];
   const chats = []; // messages sent with ADMIN_CHAT
-  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 12, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
+  const state = { year: 1950, goals: [], delivered: {}, paused: false, pauseLevel: 3, daysRun: 0, runningSince: Date.now(), dayMs: 15, rcons: [], failOps: [], trainInDepot: false, attachFails: false, noGs: false, openConnections: 0, headingDepot: [], brokenDown: [], roadGap: null, roadOneWay: null, money: 100000, loan: 300000, gsVersion: 13, townRatings: { 1: ['good', 450] }, lostTrain: false, railGap: null, land: new Map(), landOwnedBy: {}, landFailAt: null, signs: [], history: null, stalled: [], saves: ['fake-game'], extraCompanies: [], loads: 0, versionAfterLoad: null };
   const server = net.createServer((sock) => {
     state.openConnections++;
     sock.on('close', () => { state.openConnections--; });
@@ -366,7 +376,8 @@ export function startFakeServer({ password = 'pw' } = {}) {
           const req = JSON.parse(r.str());
           received.push(req);
           const v12only = ['company_history', 'rating_parts', 'station_vehicles', 'tile_owners', 'vehicle_wagons', 'signs', 'road_types'];
-          const handler = (req.cmd === 'owned_land' && state.gsVersion < 10) || (v12only.includes(req.cmd) && state.gsVersion < 12) || (req.cmd === 'info' && state.noGs) ? undefined : GS[req.cmd];
+          const v13only = ['town_rating', 'vehicle_loads'];
+          const handler = (req.cmd === 'owned_land' && state.gsVersion < 10) || (v12only.includes(req.cmd) && state.gsVersion < 12) || (v13only.includes(req.cmd) && state.gsVersion < 13) || (req.cmd === 'info' && state.noGs) ? undefined : GS[req.cmd];
           const base = { id: req.id, client: req.client };
           if (!handler) { send(PKT.SERVER_GAMESCRIPT, cstr(JSON.stringify({ ...base, ok: false, part: 0, last: true, error: `unknown cmd: ${req.cmd}` }))); continue; }
           let data;
