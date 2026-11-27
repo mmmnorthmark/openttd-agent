@@ -204,10 +204,12 @@ test('loan: show, borrow rounds up, repay, max, dry run', async () => {
 
 test('loan: refusals, one option only, and an older GameScript', async () => {
   fake.state.money = 5000; fake.state.loan = 300000;
+  // 0.8.0 (L8): more than max_loan borrows up to it.
   const over = await run('loan', { amount: 600000 });
-  assert.equal(over.ok, false);
-  assert.match(over.error, /over max_loan 500000/);
-  assert.deepEqual(over.after, over.before);
+  assert.equal(over.ok, true);
+  assert.deepEqual(over.clamped, { asked: 600000, clamped_to_max_loan: 500000 });
+  assert.equal(over.after.loan, 500000);
+  fake.state.money = 5000; fake.state.loan = 300000;
   assert.match((await run('loan', { amount: -10 })).error, /below 0/);
   const poor = await run('loan', { repay: 100000 });
   assert.equal(poor.ok, false);

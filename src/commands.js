@@ -29,6 +29,7 @@ import { takeOutputArgs, shapeResult } from './output.js';
 import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
+import { townRatingFromRow, authorityNeed, RATING_HINT, moneyDetail } from './fleet.js';
 
 // Strict numbers (0.8.0): plain z.number(); runCommand (parseArgs) turns a numeric string ("12", " -3 ")
 // into its number. null, "", false and [] are no longer 0 (company 0 is a real company).
@@ -46,6 +47,7 @@ const ids = () => z.preprocess(idList, z.array(int()).min(1));
 const who = { company: int().optional().describe('company id; default: your configured company') };
 const serverArg = { server: z.string().optional().describe('launch profile of the server (launch --server NAME); default: the server at the configured admin_port') };
 const act = { ...who, dry_run: bool().default(false).describe('true = cost/feasibility only, changes nothing') };
+const borrow = { borrow_if_needed: bool().default(false).describe('when the game refuses for lack of money, borrow what the rest costs (within max_loan) and carry on') };
 const lc = (v) => String(v).toLowerCase();
 const PAIR_MIN_DIST = 20, PAIR_MAX_DIST = 200; // find-cargo-pairs defaults (tiles, Manhattan)
 /** Non-loopback IPv4 addresses of this machine (what players put in their relay URL). */
@@ -124,13 +126,12 @@ async function buildPath(ctx, a, mode) {
   const steps = (mode === 'rail' ? railSteps : roadSteps)(plan, { bridgeType: bridgeType(a.bridge) });
   const out = { reachable: true, ...plan.stats, ...(a.show_path ? { path: plan.tiles } : {}) };
   if (a.plan_only) return { ...out, steps_total: steps.length, steps };
-  if (!a.dry_run) s.throttleBuild();
-  const res = await s.exec(company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) });
+  const res = await execExplained(s, company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) }, a);
   if (!a.dry_run) await s.refreshArea(...box);
   return { ...out, ...res };
 }
 const pathArgs = {
-  ...act, x1: int(), y1: int(), x2: int(), y2: int(),
+  ...act, ...borrow, x1: int(), y1: int(), x2: int(), y2: int(),
   start_dir: z.enum(DIR_NAMES).optional().describe('force the first step out of x1,y1: sw=+x, se=+y, ne=-x, nw=-y'),
   end_dir: z.enum(DIR_NAMES).optional().describe('force the direction of the last step into x2,y2'),
   margin: int().min(2).max(80).default(20).describe('how far outside the two points the path may wander'),
@@ -1249,11 +1250,97 @@ async function driveThroughRefusal(s, company, a) {
   return why;
 }
 
-/** Run exec steps as the company (client throttle + GS rate gate apply). */
+/** Run exec steps as the company (client throttle + GS rate gate apply; failures explained, see execExplained). */
 async function run(ctx, a, steps, opts = {}) {
   const { s, company } = await mine(ctx, a);
-  if (!a.dry_run) s.throttleBuild();
-  return s.exec(company, steps, { dryRun: a.dry_run, ...opts });
+  return execExplained(s, company, steps, { dryRun: a.dry_run, ...opts }, a);
+}
+
+/** The tile a step acts on: [op, x, y, ...] for most ops; rail [op, fx, fy, x, y, ...]; bridge/tunnel [op, type, x, y, ...]. */
+function stepTile(step) {
+  if (step[0] === 'rail' || step[0] === 'rail_remove') return { x: step[3], y: step[4] };
+  if (step[0] === 'bridge' || step[0] === 'tunnel') return { x: step[2], y: step[3] };
+  return typeof step[1] === 'number' && typeof step[2] === 'number' ? { x: step[1], y: step[2] } : null;
+}
+
+/** Tiles from (x1,y1) to (x2,y2) in a straight line (a road step), at most 200. */
+function lineTiles(x1, y1, x2, y2) {
+  const out = [];
+  const dx = Math.sign(x2 - x1), dy = Math.sign(y2 - y1);
+  for (let x = x1, y = y1; out.length < 200; x += dx, y += dy) { out.push({ x, y }); if (x === x2 && y === y2) break; if (!dx && !dy) break; }
+  return out;
+}
+
+/** Local-authority detail for a refused step at `tile` (GS v13 town_rating), or a note on an older GameScript. */
+async function authorityDetail(s, company, step, tile) {
+  const need = authorityNeed(step[0]);
+  let row;
+  try { [row] = await s.gs.call('town_rating', { company, points: [[tile.x, tile.y]] }); } catch (e) {
+    if (/unknown cmd/.test(e.message)) return { ...need, note: 'the running AgentBridge is older than v13: it cannot read town ratings; the host re-runs install-gamescript and loads the game again' };
+    throw e;
+  }
+  const r = townRatingFromRow(row);
+  if (r.town < 0) return { ...need, town: null };
+  const { towns } = await s.economy();
+  const name = towns.find((t) => t.id === r.town)?.name ?? `town ${r.town}`;
+  return { town: r.town, town_name: name, rating: r.rating, rating_value: r.rating_value, ...need, hint: RATING_HINT };
+}
+
+/**
+ * s.exec plus what a failure means (0.8.0):
+ * - ERR_LOCAL_AUTHORITY_REFUSES (R8): local_authority { town, town_name, rating, rating_value, needed }.
+ * - ERR_NOT_ENOUGH_CASH (L8): needed, money, loan, max_loan, loan_headroom, next; with a.borrow_if_needed
+ *   the loan is raised by what the rest of the steps cost (dry run) and the rest is run once more.
+ * - a dry run that costs more than the bank balance: the same money fields and a warning.
+ * - a road step refused on a slope (R15): first_error sloped_tile, at, hint.
+ */
+async function execExplained(s, company, steps, opts, a = {}) {
+  if (!opts.dryRun) s.throttleBuild();
+  let res = await s.exec(company, steps, opts);
+  const failed = (res.results ?? []).find((r) => !r.ok);
+  if (opts.dryRun) {
+    if (res.ok && res.money !== null && res.money !== undefined && res.cost > res.money) {
+      const m = moneyDetail({ cost: res.cost, ...(await loanState(s, company)), money: res.money });
+      res = { ...res, ...m, warnings: [...(res.warnings ?? []), `not_enough_money: this costs ${res.cost}, the bank has ${res.money}${m.next ? `; ${m.next}` : ''}`] };
+    }
+    return res;
+  }
+  if (!failed) return res;
+  const step = steps[failed.step];
+  const tile = stepTile(step);
+  const err = String(failed.error ?? '');
+  if (/ERR_NOT_ENOUGH_CASH/.test(err)) {
+    const rest = steps.slice(failed.step);
+    const est = await s.exec(company, rest, { ...opts, dryRun: true, keepGoing: true });
+    const loan = await loanState(s, company);
+    const m = moneyDetail({ cost: est.cost > 0 ? est.cost : null, ...loan });
+    if (a.borrow_if_needed && m.needed && m.needed <= m.loan_headroom) {
+      const lr = await s.exec(company, [['loan', 'add', m.needed]]);
+      if (lr.ok) {
+        const again = await s.exec(company, rest, opts);
+        const done = res.results.slice(0, failed.step);
+        const results = [...done, ...again.results.map((r) => ({ ...r, step: r.step + failed.step }))];
+        return { ...again, borrowed: lr.results[0]?.value !== undefined ? lr.results[0].value - loan.loan : m.needed, cost: res.cost + again.cost,
+          steps_total: steps.length, steps_done: done.filter((r) => r.ok).length + again.steps_done, results };
+      }
+      return { ...res, ...m, borrow_failed: lr.error };
+    }
+    return { ...res, ...m };
+  }
+  if (/ERR_LOCAL_AUTHORITY_REFUSES/.test(err) && tile) {
+    const la = await authorityDetail(s, company, step, tile);
+    const who = la.town_name ? `${la.town_name} rates you ${la.rating} (${la.rating_value}); ` : '';
+    return { ...res, error: `${res.error}: local authority refuses: ${who}${la.needed_text}`, local_authority: la };
+  }
+  if (/ERR_LAND_SLOPED_WRONG|ERR_FLAT_LAND_REQUIRED/.test(err) && ['road', 'road_station', 'road_depot'].includes(step[0])) {
+    const line = step[0] === 'road' ? lineTiles(step[1], step[2], step[3], step[4]) : [tile];
+    const xs = line.map((t) => t.x), ys = line.map((t) => t.y);
+    await s.refreshArea(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
+    const at = line.find((t) => s.map.inBounds(t.x, t.y) && s.map.slopeAt(t.x, t.y)) ?? tile;
+    return { ...res, error: `sloped_tile: (${at.x},${at.y}) is sloped the wrong way for ${step[0] === 'road' ? 'this road' : 'a stop or depot'} (game: ${err})`, first_error: 'sloped_tile', at,
+      hint: step[0] === 'road' ? `level it first (terraform --op level --x0 ${at.x} --y0 ${at.y}), or plan round it with build-road-path (it reuses roads and goes round obstacles)` : `pick a flat tile (road-stop-sites finds dry-run-checked spots), or terraform --op level --x0 ${at.x} --y0 ${at.y}` };
+  }
+  return res;
 }
 
 export const COMMANDS = [
@@ -1708,17 +1795,30 @@ export const COMMANDS = [
   },
   {
     name: 'towns', group: 'world', session: true,
-    description: 'Towns with population and last-month passenger/mail production and transported %. Filter by min_population, name, id, near_x/near_y within radius (each row then has distance); sorted by population (by distance with near_x/near_y).',
-    args: z.object({ min_population: int().default(0), limit: int().default(50), name: z.string().optional(), id: int().optional(),
+    description: 'Towns with population and last-month passenger/mail production and transported %. Filter by min_population, name, id, near_x/near_y within radius (each row then has distance); sorted by population (by distance with near_x/near_y). With a company (yours by default): my_rating {rating, value, rated} = what the town\'s local authority thinks of the company (the town window\'s word: none, appalling, very_poor, poor, mediocre, good, very_good, excellent, outstanding; value -1000..1000; a new station needs more than -200). AgentBridge v13.',
+    args: z.object({ ...who, min_population: int().default(0), limit: int().default(50), name: z.string().optional(), id: int().optional(),
       near_x: int().optional(), near_y: int().optional(), radius: int().min(1).default(50) }),
     run: async (ctx, a) => {
       if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
-      const { towns } = await (await ctx.session()).economy();
+      const s = await ctx.session();
+      const { towns } = await s.economy();
       const near = a.near_x !== undefined ? { x: a.near_x, y: a.near_y } : null;
-      const hits = towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())) && (a.id === undefined || t.id === a.id))
+      let hits = towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())) && (a.id === undefined || t.id === a.id))
         .map((t) => (near ? { ...t, distance: manhattan(t, near) } : t)).filter((t) => !near || t.distance <= a.radius)
         .sort((x, y) => (near ? x.distance - y.distance : y.population - x.population));
-      return listResult('towns', towns, hits, a.limit);
+      const company = a.company ?? s.cfg.company;
+      let note = null;
+      if (company !== null && company !== undefined && hits.length) {
+        const shown = hits.slice(0, a.limit);
+        try {
+          const rows = new Map((await s.gs.call('town_rating', { company, towns: shown.map((t) => t.id) })).map((r) => [r[0], townRatingFromRow(r)]));
+          hits = [...shown.map((t) => { const r = rows.get(t.id); return r ? { ...t, my_rating: { rating: r.rating, value: r.rating_value, rated: r.rated } } : t; }), ...hits.slice(a.limit)];
+        } catch (e) {
+          if (!/unknown cmd/.test(e.message)) throw e;
+          note = 'my_rating needs AgentBridge v13; the host re-runs install-gamescript and loads the game again';
+        }
+      }
+      return { ...(company !== null && company !== undefined ? { company } : {}), ...listResult('towns', towns, hits, a.limit), ...(note ? { my_rating_note: note } : {}) };
     },
   },
   {
@@ -2270,7 +2370,7 @@ export const COMMANDS = [
   },
   {
     name: 'loan', group: 'operate', session: true,
-    description: 'Show or change your company loan. Give one of: amount (set the loan to this), borrow (add this much), repay (pay back this much; needs the cash), max true (borrow up to max_loan). The new loan is rounded up to the loan interval; refused below 0 or over max_loan. No arguments = show. Returns loan, max_loan and money before and after (dry_run: predicted). Needs AgentBridge v8.',
+    description: 'Show or change your company loan. Give one of: amount (set the loan to this), borrow (add this much), repay (pay back this much; needs the cash), max true (borrow up to max_loan). The new loan is rounded up to the loan interval; refused below 0; more than max_loan borrows up to max_loan (clamped). No arguments = show. Returns loan, max_loan and money before and after (dry_run: predicted). Needs AgentBridge v8.',
     args: z.object({ ...act, amount: int().optional().describe('set the loan to this amount'), borrow: int().min(1).optional().describe('add this much to the loan'),
       repay: int().min(1).optional().describe('pay back this much of the loan'), max: bool().optional().describe('true = borrow up to max_loan') }),
     run: async (ctx, a) => {
@@ -2279,8 +2379,11 @@ export const COMMANDS = [
       const { s, company } = await mine(ctx, a);
       const before = await loanState(s, company);
       if (!given.length) return before;
-      const step = a.max ? ['loan', 'max', 0] : a.amount !== undefined ? ['loan', 'set', a.amount] : ['loan', 'add', a.borrow ?? -a.repay];
-      const requested = a.max ? before.max_loan : a.amount ?? before.loan + (a.borrow ?? -a.repay);
+      let step = a.max ? ['loan', 'max', 0] : a.amount !== undefined ? ['loan', 'set', a.amount] : ['loan', 'add', a.borrow ?? -a.repay];
+      let requested = a.max ? before.max_loan : a.amount ?? before.loan + (a.borrow ?? -a.repay);
+      // L8: asking for more than max_loan borrows up to it (a weak model asks "borrow 1000000" and loops on the refusal).
+      const overMax = requested > before.max_loan ? { asked: requested, clamped_to_max_loan: before.max_loan } : null;
+      if (overMax) { step = ['loan', 'max', 0]; requested = before.max_loan; }
       if (!a.dry_run) s.throttleBuild();
       const res = await s.exec(company, [step], { dryRun: a.dry_run });
       const r = res.results[0];
@@ -2288,7 +2391,7 @@ export const COMMANDS = [
       if (!res.ok) return { ok: false, dry_run: a.dry_run, error: r?.error ?? res.stopped ?? 'failed', requested_loan: requested, before, after: before };
       const target = r.value ?? 0; // execSummary drops a 0 value
       const after = a.dry_run ? { loan: target, max_loan: before.max_loan, money: before.money + target - before.loan } : await loanState(s, company);
-      return { ok: true, dry_run: a.dry_run, requested_loan: requested, ...(target !== requested ? { rounded_to: target, note: 'rounded up to a multiple of the loan interval' } : {}),
+      return { ok: true, dry_run: a.dry_run, requested_loan: requested, ...(overMax ? { clamped: overMax } : {}), ...(target !== requested ? { rounded_to: target, note: 'rounded up to a multiple of the loan interval' } : {}),
         change: target - before.loan, before, after };
     },
   },
@@ -2336,7 +2439,7 @@ export const COMMANDS = [
   {
     name: 'vehicle-buy', group: 'operate', session: true,
     description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>; the train must be stopped in that depot (checked first, also in a dry run; a wagon the game will not couple is sold back). New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one). One call for a whole train: --wagon W --wagons N attaches N wagons of engine W to each new locomotive (refitted to cargo); --orders A,B (station ids or names) gives the new vehicles those orders (the first gets them, the others share them; with attach_to, the train attach_to gets them), --order_flags sets flags per order separated by ";" (e.g. "full_load_any;unload,no_load"; one set applies to every order), --start true starts them.',
-    args: z.object({ ...act, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1),
+    args: z.object({ ...act, ...borrow, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1),
       route_of: int().optional().describe('rail: check the depot is joined to this vehicle\'s order stations first'),
       wagon: int().optional().describe('wagon engine id to attach to each new locomotive'), wagons: int().min(0).max(60).default(0),
       orders: z.string().optional().describe('comma-separated station ids or names, in order'), order_flags: z.string().default('').describe('flags per order separated by ";", or one set for all'),
@@ -2381,7 +2484,7 @@ export const COMMANDS = [
   {
     name: 'vehicle-clone', group: 'operate', session: true,
     description: 'Clone a vehicle `count` times, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check.',
-    args: z.object({ ...act, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
+    args: z.object({ ...act, ...borrow, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
       depot_x: int().optional(), depot_y: int().optional(), vehicle: int(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
       check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations') }),
     run: async (ctx, a) => {
@@ -2605,13 +2708,13 @@ export const COMMANDS = [
   {
     name: 'build-rail-station', group: 'build', session: true,
     description: 'Build a rail station with its lowest-x/y corner at x,y. axis=x: platforms run along x and are stacked along y (axis=y: the reverse). Trains enter at either end of a platform.',
-    args: z.object({ ...act, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(20).default(1), length: int().min(1).max(20).default(4), ...join, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(20).default(1), length: int().min(1).max(20).default(4), ...join, rail_type: int().optional() }),
     run: (ctx, a) => run(ctx, a, [['rail_station', a.x, a.y, a.axis === 'y', a.platforms, a.length, joinArg(a.join)]], { railType: a.rail_type }),
   },
   {
     name: 'build-rail-depot', group: 'build', session: true,
     description: 'Build a rail depot at x,y with its entrance facing front (a tile next to it that has or will get track). Connect it with build-rail using the front tile as an anchor. The result has exit_dir and (AgentBridge v9) front_joined: whether track on the front tile reaches the entrance, and front_leads (the ways a train leaving the depot can go from there); a warning when nothing joins it yet or when trains can leave in one direction only (every new train then runs that way first, e.g. to the far end of the line to turn).',
-    args: z.object({ ...act, ...point, ...front, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, ...point, ...front, rail_type: int().optional() }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const res = await run(ctx, a, [['rail_depot', a.x, a.y, a.front_x, a.front_y]], { railType: a.rail_type });
@@ -2865,7 +2968,7 @@ export const COMMANDS = [
   {
     name: 'build-road-station', group: 'build', session: true,
     description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis; not on junctions). A normal (bay) stop also gets the road piece on front that joins its entrance. Returns connected (AgentBridge v11): true when the entrance (or one end of a drive-through stop) joins a road beyond it. connect=auto builds a road from the entrance to the nearest road when it does not. A refused drive-through stop says why where it can tell (junction, one_way_road, other_owner_road, slope).',
-    args: z.object({ ...act, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join,
+    args: z.object({ ...act, ...borrow, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join,
       connect: z.enum(['none', 'auto']).default('none').describe('auto = when the entrance does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
       const res = await run(ctx, a, [
@@ -2884,7 +2987,7 @@ export const COMMANDS = [
   {
     name: 'build-road-depot', group: 'build', session: true,
     description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile), plus the road piece on front that joins the entrance. Returns connected (AgentBridge v11): true when the front tile joins a road beyond it. connect=auto builds a road from the front tile to the nearest road when it does not.',
-    args: z.object({ ...act, ...point, ...front,
+    args: z.object({ ...act, ...borrow, ...point, ...front,
       connect: z.enum(['none', 'auto']).default('none').describe('auto = when the front tile does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
       const res = await run(ctx, a, [['road_depot', a.x, a.y, a.front_x, a.front_y], ['road', a.front_x, a.front_y, a.x, a.y]], a.road_type !== undefined ? { roadType: a.road_type } : {});
@@ -2897,13 +3000,13 @@ export const COMMANDS = [
   {
     name: 'build-bridge', group: 'build', session: true,
     description: 'Build a rail, road or water (aqueduct) bridge between two tiles in a straight line (the ramps go on those tiles).',
-    args: z.object({ ...act, type: z.enum(['rail', 'road', 'water']).default('rail'), x1: int(), y1: int(), x2: int(), y2: int(), ...bridgeArg, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, type: z.enum(['rail', 'road', 'water']).default('rail'), x1: int(), y1: int(), x2: int(), y2: int(), ...bridgeArg, rail_type: int().optional() }),
     run: (ctx, a) => run(ctx, a, [['bridge', transport(a.type), a.x1, a.y1, a.x2, a.y2, bridgeType(a.bridge)]], { railType: a.rail_type }),
   },
   {
     name: 'build-tunnel', group: 'build', session: true,
     description: 'Build a rail or road tunnel starting at x,y, a tile at the foot of a slope; the game finds the other end straight through the hill.',
-    args: z.object({ ...act, type: z.enum(['rail', 'road']).default('rail'), ...point, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, type: z.enum(['rail', 'road']).default('rail'), ...point, rail_type: int().optional() }),
     run: (ctx, a) => run(ctx, a, [['tunnel', transport(a.type), a.x, a.y]], { railType: a.rail_type }),
   },
   {
@@ -2989,7 +3092,7 @@ export const COMMANDS = [
   {
     name: 'build-dock', group: 'build', session: true,
     description: 'Build a ship dock on the sloped coast tile x,y (the land half; the water half extends into the sea).',
-    args: z.object({ ...act, ...point, ...join }),
+    args: z.object({ ...act, ...borrow, ...point, ...join }),
     run: (ctx, a) => run(ctx, a, [['dock', a.x, a.y, joinArg(a.join)]]),
   },
   {
@@ -3007,7 +3110,7 @@ export const COMMANDS = [
   {
     name: 'build-airport', group: 'build', session: true,
     description: 'Build an airport with its lowest-x/y corner at x,y. airport = type name (see airport-types); find a spot with airport-sites.',
-    args: z.object({ ...act, ...point, airport: z.string().default('small'), ...join }),
+    args: z.object({ ...act, ...borrow, ...point, airport: z.string().default('small'), ...join }),
     run: async (ctx, a) => {
       const types = await (await ctx.session()).gs.call('airport_types');
       const at = types.find((t) => t.name === lc(a.airport));
