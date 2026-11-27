@@ -202,7 +202,8 @@ export function goalFromRow(g) {
 
 /**
  * A route you already run between two ends: one of your rail stations near each end (within
- * `radius` tiles of any target tile), the source one already handling `cargo` (it has a rating).
+ * `radius` tiles of any target tile), the source one already handling `cargo` (it has a rating, or no
+ * rating for any cargo yet: just built).
  * Passengers and mail (`bothWays`) also match the reverse direction and need no rating: a rating
  * lapses once no train has loaded for a while, and a stalled passenger line is still that line.
  * `ends`: lineEnd() results.
@@ -211,10 +212,13 @@ export function goalFromRow(g) {
 export function findExistingRoute(stations, srcEnd, dstEnd, cargo, { radius = 8, bothWays = false } = {}) {
   const near = (st, end) => end.targets.some(([x, y]) => Math.max(Math.abs(st.x - x), Math.abs(st.y - y)) <= radius);
   const rail = stations.filter((st) => st.facilities.includes('rail'));
-  const handles = (st) => bothWays || st.cargo.some((c) => c.cargo === cargo);
+  // A station with no rating at all is new (nothing loaded yet): it counts, or re-running the
+  // command that just built a route would not see it.
+  const handles = (st) => bothWays || !st.cargo.length || st.cargo.some((c) => c.cargo === cargo);
   const match = (a, b) => {
     const from = rail.find((st) => near(st, a) && handles(st));
-    const to = from && rail.find((st) => st.id !== from.id && near(st, b));
+    // One-way cargo: a destination that loads this cargo itself is the other route's source.
+    const to = from && rail.find((st) => st.id !== from.id && near(st, b) && (bothWays || !st.cargo.some((c) => c.cargo === cargo)));
     return from && to ? { from_station: { id: from.id, name: from.name }, to_station: { id: to.id, name: to.name } } : null;
   };
   return match(srcEnd, dstEnd) ?? (bothWays ? match(dstEnd, srcEnd) : null);

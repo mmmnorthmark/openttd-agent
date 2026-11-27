@@ -654,7 +654,7 @@ async function buildCargoRoute(s, company, a, ctx) {
     const loopsPlanned = (plan.passing_loops ?? []).filter((l) => !l.dry_run_error).length;
     extraTrains = Math.min(a.trains - 1, loopsPlanned);
     plan.trains = { asked: a.trains, planned: 1 + extraTrains, passing_loops_planned: loopsPlanned, cost: (1 + extraTrains) * plan.train.cost,
-      ...(extraTrains < a.trains - 1 ? { note: `single track takes one train per passing loop + 1: ${1 + extraTrains} of ${a.trains}; add --passing_loops ${a.trains - 1}` } : {}) };
+      ...(extraTrains < a.trains - 1 ? { note: `single track takes one train per passing loop + 1: ${1 + extraTrains} of ${a.trains}; ${a.passing_loops >= a.trains - 1 ? 'only some of the --passing_loops fit on the planned line (see warnings)' : `add --passing_loops ${a.trains - 1}`}` } : {}) };
   }
   const estimate = src.cost + dst.cost + lineCheck.cost + depotCheck.cost + plan.train.cost * (1 + extraTrains) + loopCost;
   plan.estimated_cost = estimate;
