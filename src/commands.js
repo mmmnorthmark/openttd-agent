@@ -29,7 +29,7 @@ import { takeOutputArgs, shapeResult } from './output.js';
 import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
-import { townRatingFromRow, authorityNeed, RATING_HINT, moneyDetail, soldText, loadsFromRows, waitMatch, WAIT_STATES } from './fleet.js';
+import { townRatingFromRow, authorityNeed, RATING_HINT, moneyDetail, soldText, loadsFromRows, waitMatch, WAIT_STATES, filterVehicles, sortVehicles, fleetBuckets, VEHICLE_SORTS, parseSelect } from './fleet.js';
 
 // Strict numbers (0.8.0): plain z.number(); runCommand (parseArgs) turns a numeric string ("12", " -3 ")
 // into its number. null, "", false and [] are no longer 0 (company 0 is a real company).
@@ -920,6 +920,14 @@ async function soldNote(s, company, id) {
   const ids = e.stations?.length ? await stationVehicleIds(s, company) : null;
   const serving = ids ? [...new Set(e.stations.flatMap((st) => ids.get(st) ?? []))].sort((p, q) => p - q) : [];
   return soldText(e, serving);
+}
+
+/** Map vehicle -> { load, capacity, pct, cargo } from GS vehicle_loads (v13), or null on an older GameScript. */
+async function vehicleLoads(s, company, vehicles) {
+  try { return loadsFromRows(await s.gs.call('vehicle_loads', { company, ...(vehicles ? { vehicles } : {}) })); } catch (e) {
+    if (/unknown cmd/.test(e.message)) return null;
+    throw e;
+  }
 }
 
 /** Station ids in a vehicle's orders (for the sale ledger); [] when it cannot be read. */
@@ -2115,8 +2123,10 @@ export const COMMANDS = [
   },
   {
     name: 'vehicles', group: 'operate', session: true,
-    description: 'Your vehicles (summary=true or another --company: counts per type and state only, as the company window shows anyone): type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: type, group, state, max_profit_last_year (e.g. 0 = loss makers), min_age_pct (e.g. 90 = due for replacement), max_reliability_pct, name, station (vehicles with an order for it; AgentBridge v12). Breakdown counts and service intervals are not exposed by the game to scripts.',
-    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
+    description: `Your vehicles (summary=true or another --company: counts per type and state only, as the company window shows anyone): type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: ids (A,B), type, group, state, engine, max_profit_last_year (e.g. 0 = loss makers), max_profit_this_year, min_age_pct (e.g. 90 = due for replacement), min_age_days (e.g. 365: old enough to judge its profit), max_reliability_pct, name, station (vehicles with an order for it; AgentBridge v12). --sort ${VEHICLE_SORTS.join('|')} (a leading - sorts high first, e.g. -profit_last_year). Breakdown counts and service intervals are not exposed by the game to scripts.`,
+    args: z.object({ ...who, ids: ids().optional().describe('only these vehicle ids'), type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
+      engine: int().optional(), max_profit_this_year: int().optional(), min_age_days: int().optional(),
+      sort: z.enum([...VEHICLE_SORTS, ...VEHICLE_SORTS.map((k) => `-${k}`)]).optional().describe('sort key; leading - = descending'),
       max_profit_last_year: int().optional(), min_age_pct: int().default(0), max_reliability_pct: int().default(100), name: z.string().optional(), limit: int().min(1).default(1000),
       station: z.coerce.string().optional().describe('only vehicles with an order for this station (id or name; AgentBridge v12)'),
       summary: bool().default(false).describe('counts per type and state only (always so for another company)') }),
@@ -2135,15 +2145,14 @@ export const COMMANDS = [
         if (!ids) throw new Error('refused: vehicles --station needs AgentBridge v12; the host re-runs install-gamescript and loads the game again');
         atStation = new Set(ids.get(st.id) ?? []);
       }
-      const vehicles = all.filter((v) => (!atStation || atStation.has(v.id)) && (!a.type || v.type === a.type) && (a.group === undefined || v.group === a.group) && (!a.state || v.state === a.state)
-        && (a.max_profit_last_year === undefined || v.profit_last_year <= a.max_profit_last_year) && v.age_pct >= a.min_age_pct
-        && v.reliability_pct <= a.max_reliability_pct && (!a.name || lc(v.name).includes(lc(a.name))));
+      let vehicles = filterVehicles(all, a).filter((v) => !atStation || atStation.has(v.id));
+      if (a.sort) vehicles = sortVehicles(vehicles, a.sort);
       return { company, ...listResult('vehicles', all, vehicles, a.limit) };
     },
   },
   {
     name: 'vehicle', group: 'operate', session: true,
-    description: 'One vehicle in detail: status, capacity and load per cargo, wagons, and the full order list with decoded flags.',
+    description: 'One vehicle in detail: status, capacity and load per cargo, load {load, capacity, pct} over all cargo, wagons, and the full order list with decoded flags. A vehicle sold through openttd-agent answers already_sold with the sale date.',
     args: z.object({ ...who, vehicle: int() }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
@@ -2153,12 +2162,14 @@ export const COMMANDS = [
         if (note) return { ok: false, error: note, first_error: 'already_sold', vehicle: a.vehicle, sold: s.soldVehicles.get(`${company}:${a.vehicle}`) };
         throw e;
       }
-      return vehicleDetail(rows, s.cargos);
+      const d = vehicleDetail(rows, s.cargos);
+      const load = d.capacity.reduce((n, c) => n + c.load, 0), capacity = d.capacity.reduce((n, c) => n + c.capacity, 0);
+      return { ...d, load: { load, capacity, pct: capacity ? Math.round((100 * load) / capacity) : 0 } };
     },
   },
   {
     name: 'summary', group: 'operate', session: true,
-    description: 'One compact text line per vehicle and per station, for a quick look without big JSON: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination"; stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
+    description: 'One compact text line per vehicle and per station, for a quick look without big JSON: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination, spd, load now/capacity (AgentBridge v13), order i/n", plus age_buckets, reliability_buckets and low_reliability (below 50%: id, reliability_pct, age_pct); stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
     args: z.object({ ...who, group: int().optional(), vehicles: ids().optional(), stations: z.string().optional().describe('comma-separated station ids or names'),
       what: z.enum(['all', 'vehicles', 'stations']).default('all'), limit: int().min(1).default(200) }),
     run: async (ctx, a) => {
@@ -2172,9 +2183,10 @@ export const COMMANDS = [
       if (wantV) {
         const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
         const hit = all.filter((v) => (a.group === undefined || v.group === a.group) && (!a.vehicles || a.vehicles.includes(v.id))).sort((p, q) => p.profit_last_year - q.profit_last_year);
-        const lines = hit.map((v) => vehicleLine(v, names));
+        const loads = hit.length ? await vehicleLoads(s, company, a.vehicles) : null;
+        const lines = hit.map((v) => vehicleLine(v, names, loads?.get(v.id) ?? null));
         Object.assign(out, { vehicles_total: hit.length, vehicles: lines.slice(0, a.limit),
-          vehicles_profit: `this year ${hit.reduce((n, v) => n + v.profit_this_year, 0)}, last year ${hit.reduce((n, v) => n + v.profit_last_year, 0)}` });
+          vehicles_profit: `this year ${hit.reduce((n, v) => n + v.profit_this_year, 0)}, last year ${hit.reduce((n, v) => n + v.profit_last_year, 0)}`, ...fleetBuckets(hit) });
       }
       if (wantS) {
         const sel = a.stations ? a.stations.split(',').map((t) => findStation(stations, t.trim())) : stations;

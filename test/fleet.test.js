@@ -203,3 +203,23 @@ test('wait: until a state, until loaded, game days, timeout and a paused game', 
   Object.assign(fake.state, { paused: true });
   try { assert.equal((await run('wait', { days: 1 })).first_error, 'paused'); } finally { fake.state.paused = false; fake.state.runningSince = Date.now(); }
 });
+
+// ---- G3 / G4 / R5 / G13: vehicles, summary, vehicle -------------------------------------------
+
+test('vehicles: --ids, --min_age_days, --max_profit_this_year, --sort', async () => {
+  assert.deepEqual((await run('vehicles', { ids: '12' })).vehicles.map((v) => v.id), [12]);
+  assert.deepEqual((await run('vehicles', { min_age_days: 1000 })).vehicles.map((v) => v.id), [11]);
+  assert.deepEqual((await run('vehicles', { max_profit_this_year: 0 })).vehicles.map((v) => v.id), [11]);
+  assert.deepEqual((await run('vehicles', { sort: '-profit_last_year' })).vehicles.map((v) => v.id), [12, 11]);
+  assert.deepEqual((await run('vehicles', { sort: 'reliability' })).vehicles.map((v) => v.id), [11, 12]);
+});
+
+test('summary vehicle lines: speed, load and order; buckets; vehicle has a top-level load', async () => {
+  const res = await run('summary', { what: 'vehicles' });
+  const line = res.vehicles.find((l) => l.includes('id 11 '));
+  assert.match(line, /spd 60 load 40\/120 order 2\/2$/);
+  assert.equal(res.age_buckets['10-20y'], 1);
+  assert.deepEqual(res.reliability_buckets, { '<40%': 0, '40-60%': 0, '60-80%': 1, '80%+': 1 });
+  assert.deepEqual(res.low_reliability, []);
+  assert.deepEqual((await run('vehicle', { vehicle: 11 })).load, { load: 40, capacity: 120, pct: 33 });
+});
