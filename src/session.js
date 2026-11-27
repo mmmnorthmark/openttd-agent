@@ -14,6 +14,7 @@ import { log } from './log.js';
 
 const ECONOMY_TTL_MS = 60_000; // towns/industries refresh at most once a minute (~1 game month)
 const JOB_GAMES_KEPT = 10;      // games remembered per jobs file
+const SOLD_KEPT = 200;          // sold-vehicle ledger entries kept per game (L10)
 
 /** A Map that calls onChange after every set/delete/clear (pending job queues are persisted on change). */
 export class WatchedMap extends Map {
@@ -57,6 +58,8 @@ export class Session {
     this.pendingSales = new WatchedMap(() => this.persistJobs()); // "company:vehicle" -> { company, vehicle, replaced_by, since } (vehicle-replace)
     this._salesTimer = null;
     this.pendingWagons = new WatchedMap(() => this.persistJobs()); // "company:vehicle" -> { company, vehicle, depot, wagon, cargo, count } (train-add-wagons)
+    // Sold-vehicle ledger (L10): "company:vehicle" -> { company, vehicle, unit_number, name, sold_on, income, replaced_by, stations }.
+    this.soldVehicles = new WatchedMap(() => this.persistJobs());
     this.jobLog = [];               // finished pending jobs, last 50
     this.vehicleHistory = new Map(); // vehicle-problems progress samples
     this.stallHistory = new Map();   // vehicle-problems standstill samples
@@ -193,6 +196,8 @@ export class Session {
       i += n;
     }
     this._economy.at = 0; // world changed; refresh on next read
+    // money_after (G20): executeCommand reads the bank balance of the last exec of a call.
+    this.lastExec = { n: (this.lastExec?.n ?? 0) + 1, company, money: replies.at(-1)?.[0]?.money };
     return execSummary(steps, replies, dryRun);
   }
 
@@ -213,9 +218,19 @@ export class Session {
       for (const [k, p] of this.pendingSales) {
         if (p.company !== company) continue;
         if (!state.has(p.vehicle)) { this.pendingSales.delete(k); out.gone.push({ company, vehicle: p.vehicle }); continue; }
-        if (state.get(p.vehicle) !== 2) { out.waiting.push({ company, vehicle: p.vehicle }); continue; }
+        if (state.get(p.vehicle) !== 2) {
+          // vehicle-sell queue (G6): a train with no depot ahead is sent again until it finds one.
+          if (p.send && !p.sent) { const r = await this.exec(company, [['veh_depot', p.vehicle, false]]); if (r.ok) { p.sent = true; this.persistJobs(); } }
+          out.waiting.push({ company, vehicle: p.vehicle });
+          continue;
+        }
         const res = await this.exec(company, [['veh_sell', p.vehicle]]);
-        if (res.ok) { this.pendingSales.delete(k); out.sold.push({ company, vehicle: p.vehicle, income: -res.cost, replaced_by: p.replaced_by }); log.info('session', 'sold replaced vehicle', { company, vehicle: p.vehicle, income: -res.cost }); } else out.waiting.push({ company, vehicle: p.vehicle });
+        if (res.ok) {
+          this.pendingSales.delete(k);
+          out.sold.push({ company, vehicle: p.vehicle, income: -res.cost, replaced_by: p.replaced_by });
+          await this.recordSold({ ...p, income: -res.cost });
+          log.info('session', 'sold queued vehicle', { company, vehicle: p.vehicle, income: -res.cost });
+        } else out.waiting.push({ company, vehicle: p.vehicle });
       }
       for (const [k, p] of this.pendingWagons) {
         if (p.company !== company) continue;
@@ -241,6 +256,17 @@ export class Session {
     }
     if (this.jobLog.length > 50) this.jobLog.splice(0, this.jobLog.length - 50);
     return out;
+  }
+
+  /** Add a sale to the ledger (L10). `p`: { company, vehicle, income, replaced_by?, stations?, unit_number?, name? }. */
+  async recordSold(p) {
+    let soldOn = null;
+    try { const i = await this.gs.call('info'); soldOn = `${i.year}-${String(i.month).padStart(2, '0')}-${String(i.day).padStart(2, '0')}`; } catch { soldOn = null; }
+    const k = `${p.company}:${p.vehicle}`;
+    this.soldVehicles.delete(k);
+    this.soldVehicles.set(k, { company: p.company, vehicle: p.vehicle, unit_number: p.unit_number ?? null, name: p.name ?? null, sold_on: soldOn,
+      income: p.income ?? null, replaced_by: p.replaced_by ?? null, stations: p.stations ?? [] });
+    while (this.soldVehicles.size > SOLD_KEPT) this.soldVehicles.delete(this.soldVehicles.keys().next().value);
   }
 
   /** Check pending vehicle jobs every 20 s while there are any (the daemon or relay keeps running). */
@@ -341,9 +367,9 @@ export class Session {
     const data = readJobs(file);
     const a = this._autoSave;
     const entry = { updated: new Date().toISOString(), map: this.info ? [this.info.map_x, this.info.map_y] : null,
-      pending_sales: [...this.pendingSales.values()], pending_wagons: [...this.pendingWagons.values()],
+      pending_sales: [...this.pendingSales.values()], pending_wagons: [...this.pendingWagons.values()], sold_vehicles: [...this.soldVehicles.values()],
       auto_save: a ? { every_months: a.everyMonths, prefix: a.prefix, last_month: a.lastMonth, last: a.last } : null };
-    const empty = !entry.pending_sales.length && !entry.pending_wagons.length && !entry.auto_save;
+    const empty = !entry.pending_sales.length && !entry.pending_wagons.length && !entry.sold_vehicles.length && !entry.auto_save;
     if (empty && !(this.gameKey in data.games)) return;
     if (empty) delete data.games[this.gameKey]; else data.games[this.gameKey] = entry;
     const keys = Object.keys(data.games).sort((p, q) => String(data.games[q].updated).localeCompare(String(data.games[p].updated)));
@@ -364,6 +390,7 @@ export class Session {
     try {
       for (const p of entry.pending_sales ?? []) this.pendingSales.set(`${p.company}:${p.vehicle}`, p);
       for (const p of entry.pending_wagons ?? []) this.pendingWagons.set(`${p.company}:${p.vehicle}`, p);
+      for (const p of entry.sold_vehicles ?? []) this.soldVehicles.set(`${p.company}:${p.vehicle}`, p);
       const a = entry.auto_save;
       if (a && a.every_months > 0 && a.prefix) {
         this._autoSave = { everyMonths: a.every_months, prefix: a.prefix, lastMonth: a.last_month ?? 0, last: a.last ?? null, errors: 0, timer: null };
@@ -385,7 +412,8 @@ export class Session {
     };
     const sales = mineOnly(this.pendingSales), wagons = mineOnly(this.pendingWagons);
     return {
-      pending_sales: sales.map((p) => ({ company: p.company, vehicle: p.vehicle, replaced_by: p.replaced_by ?? null, since: p.since ?? null })),
+      pending_sales: sales.map((p) => ({ company: p.company, vehicle: p.vehicle, replaced_by: p.replaced_by ?? null, since: p.since ?? null, ...(p.send ? { queued_by: 'vehicle-sell', sent: p.sent ?? false } : {}) })),
+      sold_vehicles: mineOnly(this.soldVehicles).length,
       pending_wagons: wagons.map((p) => ({ company: p.company, vehicle: p.vehicle, count: p.count, sent: p.sent ?? false })),
       other_companies_jobs: this.pendingSales.size + this.pendingWagons.size - sales.length - wagons.length,
       periodic_save: this.autoSaveStatus(),
@@ -424,6 +452,7 @@ export function playerView(base, cfg, throttle) {
   view.economy = (o) => base.economy(o);
   view.exec = (...a) => base.exec(...a);
   view.finishSales = () => base.finishSales();
+  view.recordSold = (p) => base.recordSold(p);
   view.watchSales = () => base.watchSales();
   view.watchVehicles = (c) => base.watchVehicles(c);
   return view;

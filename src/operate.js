@@ -228,11 +228,17 @@ export function findExistingRoute(stations, srcEnd, dstEnd, cargo, { radius = 8,
 
 const money = (n) => (Math.abs(n) >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
 
-/** One compact line per vehicle: "#4 id 31 Train 4 [rail] +1.2k/-3k age 2.1y 40% rel 62% running (22,7) -> North". */
-export function vehicleLine(v, stationNames = new Map()) {
+/**
+ * One compact line per vehicle: "#4 id 31 Train 4 [rail] profit 1.2k/-3k (this/last yr) age 2.1y 40% rel 62% running (22,7) -> North
+ * spd 64 load 40/120 order 2/3". speed and order need AgentBridge v9 rows; `load` ({ load, capacity }, v13) is optional.
+ */
+export function vehicleLine(v, stationNames = new Map(), load = null) {
   const dest = v.dest_station >= 0 && stationNames.has(v.dest_station) ? ` -> ${stationNames.get(v.dest_station)}` : '';
+  const speed = v.speed !== undefined ? ` spd ${v.speed}` : '';
+  const cargo = load ? ` load ${load.load}/${load.capacity}` : '';
+  const order = v.current_order !== undefined && v.current_order >= 0 && v.order_count > 0 ? ` order ${v.current_order + 1}/${v.order_count}` : v.order_count === 0 ? ' no orders' : '';
   return `#${v.unit_number} id ${v.id} ${v.name || v.engine_name} [${v.type}] profit ${money(v.profit_this_year)}/${money(v.profit_last_year)} (this/last yr) `
-    + `age ${(v.age_days / 365).toFixed(1)}y ${v.age_pct}% rel ${v.reliability_pct}% ${v.state} (${v.x},${v.y})${dest}`;
+    + `age ${(v.age_days / 365).toFixed(1)}y ${v.age_pct}% rel ${v.reliability_pct}% ${v.state} (${v.x},${v.y})${dest}${speed}${cargo}${order}`;
 }
 
 /** One compact line per station: "id 3 Bigton Woods [rail] 2 veh: Wood 240 waiting 35%". */
