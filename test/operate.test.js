@@ -109,13 +109,20 @@ test('order-add resolves a station id to its tile; orders-copy shares', async ()
 });
 
 test('a failed step is reported with its error; group-create returns the id', async () => {
-  const res = await run('vehicle-sell', { vehicles: '5,404,6' });
-  assert.equal(res.ok, false);
-  assert.equal(res.steps_done, 2);
-  assert.equal(res.error, 'step 1 (veh_sell): Vehicle not available');
-  assert.equal(res.first_error, 'failed');
-  assert.deepEqual(res.results_failed.map((r) => [r.step, r.ok]), [[1, false]], 'by default only failed steps are listed');
-  assert.equal(res.results, undefined);
+  const res = await run('vehicle-stop', { vehicles: '5,404,6' });
+  fake.state.failOps = [];
+  assert.equal(res.ok, true);
+  fake.state.failOps = ['veh_start_stop'];
+  const bad = await run('vehicle-stop', { vehicles: '5,404,6' });
+  fake.state.failOps = [];
+  assert.equal(bad.ok, false);
+  assert.equal(bad.error, 'step 0 (veh_start_stop): Vehicle not available');
+  assert.equal(bad.first_error, 'failed');
+  assert.deepEqual(bad.results_failed.map((r) => [r.step, r.ok]), [[0, false], [1, false], [2, false]], 'by default only failed steps are listed');
+  assert.equal(bad.results, undefined);
+  // vehicle-sell checks the vehicles first (0.8.0): unknown ones are not_found, nothing is sent.
+  const sell = await run('vehicle-sell', { vehicles: '5,404,6' });
+  assert.deepEqual([sell.ok, sell.first_error, sell.failed.length], [false, 'not_found', 3]);
   const g = await run('group-create', { type: 'rail', name: 'Wood line' });
   assert.equal(g.group, 100);
   assert.deepEqual(lastExec().steps, [['group_create', 0, 'Wood line', -1]]);
@@ -176,7 +183,7 @@ test('turn-advance runs the wanted number of days and leaves the game paused', a
 
 test('loan: show, borrow rounds up, repay, max, dry run', async () => {
   fake.state.money = 100000; fake.state.loan = 300000;
-  assert.deepEqual(await run('loan', {}), { ok: true, error: null, loan: 300000, max_loan: 500000, money: 100000 });
+  assert.deepEqual(await run('loan', {}), { ok: true, error: null, loan: 300000, max_loan: 500000, money: 100000, money_after: 100000 });
   const dry = await run('loan', { borrow: 15000, dry_run: true });
   assert.deepEqual(lastExec().steps, [['loan', 'add', 15000]]);
   assert.equal(lastExec().dry_run, true);
@@ -204,10 +211,12 @@ test('loan: show, borrow rounds up, repay, max, dry run', async () => {
 
 test('loan: refusals, one option only, and an older GameScript', async () => {
   fake.state.money = 5000; fake.state.loan = 300000;
+  // 0.8.0 (L8): more than max_loan borrows up to it.
   const over = await run('loan', { amount: 600000 });
-  assert.equal(over.ok, false);
-  assert.match(over.error, /over max_loan 500000/);
-  assert.deepEqual(over.after, over.before);
+  assert.equal(over.ok, true);
+  assert.deepEqual(over.clamped, { asked: 600000, clamped_to_max_loan: 500000 });
+  assert.equal(over.after.loan, 500000);
+  fake.state.money = 5000; fake.state.loan = 300000;
   assert.match((await run('loan', { amount: -10 })).error, /below 0/);
   const poor = await run('loan', { repay: 100000 });
   assert.equal(poor.ok, false);
@@ -354,7 +363,7 @@ test('status: versions, and a warning when the running AgentBridge is older than
   try {
     const old = await run('status', {});
     assert.match(old.warnings[0], /runs AgentBridge v\d+; this openttd-agent .* ships v\d+/);
-  } finally { fake.state.gsVersion = 12; }
+  } finally { fake.state.gsVersion = 13; }
 });
 
 test('verify-route traces road vehicles and road stops (AgentBridge v11), refuses on older GameScripts', async () => {
@@ -383,7 +392,7 @@ test('verify-route traces road vehicles and road stops (AgentBridge v11), refuse
   try {
     await assert.rejects(run('verify-route', { vehicle: 12 }), /refused: road vehicles .* AgentBridge v11/);
     assert.match((await run('vehicle-problems', {})).road_trace, /^off: /);
-  } finally { fake.state.gsVersion = 12; }
+  } finally { fake.state.gsVersion = 13; }
 });
 
 test('vehicle-depot: idempotent (already heading / in depot) and decoded failures', async () => {
@@ -401,7 +410,7 @@ test('vehicle-depot: idempotent (already heading / in depot) and decoded failure
     assert.deepEqual([old.already_in_depot, old.sent], [[11], [13]]);
     assert.deepEqual(lastExec().steps, [['veh_depot', 13, false]]);
     assert.match(old.note, /older than v11/);
-  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 12; }
+  } finally { fake.state.headingDepot = []; fake.state.brokenDown = []; fake.state.trainInDepot = false; fake.state.gsVersion = 13; }
 });
 
 test('loop-sites: traces the line and explains when no stretch is long enough', async () => {
@@ -457,7 +466,7 @@ test('vehicle-reverse: one veh_reverse step per vehicle; refused on an older Gam
   assert.deepEqual(lastExec().steps, [['veh_reverse', 11], ['veh_reverse', 12]]);
   assert.deepEqual(res.reversed, [11, 12]);
   fake.state.gsVersion = 11;
-  try { await assert.rejects(run('vehicle-reverse', { vehicles: '11' }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
+  try { await assert.rejects(run('vehicle-reverse', { vehicles: '11' }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 13; }
 });
 
 test('rail-tiles: decoded pieces, signals, depot fronts, owner; tiles marks owners (v12)', async () => {
@@ -497,7 +506,7 @@ test('stations carry vehicle_ids (v12); vehicles --station filters by them', asy
   try {
     assert.equal((await run('stations', {})).stations[0].vehicle_ids, undefined);
     await assert.rejects(run('vehicles', { station: 3 }), /needs AgentBridge v12/);
-  } finally { fake.state.gsVersion = 12; }
+  } finally { fake.state.gsVersion = 13; }
 });
 
 test('summary: one line per vehicle and station; filters', async () => {
@@ -573,6 +582,7 @@ test('sign, signs, sign-remove (v12)', async () => {
 
 test('vehicle-problems rows carry as_of and days_watched; --fresh restarts the history', async () => {
   fake.state.trainInDepot = true;
+  (await ctx.session()).pendingSales.clear(); // an earlier vehicle-replace queued train 11 (it would show as pending_sale)
   try {
     const r = await run('vehicle-problems', { trace: false });
     const row = r.problems.find((p) => p.problem === 'stopped_in_depot');

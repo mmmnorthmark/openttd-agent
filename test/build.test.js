@@ -194,7 +194,7 @@ test('purchase-land: dry run normalises corners, estimates cost and buys nothing
   assert.deepEqual(lastExec().steps, [['buy_land', 10, 30, 13, 32]]);
   assert.equal(lastExec().dry_run, true);
   assert.equal(lastExec().company, 0);
-  assert.deepEqual(res, { ok: true, error: null, dry_run: true, company: 0, area: [10, 30, 13, 32], tiles: 12, estimated_cost: 600, money: 100000, affordable: true });
+  assert.deepEqual(res, { ok: true, error: null, dry_run: true, company: 0, area: [10, 30, 13, 32], tiles: 12, estimated_cost: 600, money: 100000, affordable: true, money_after: 100000 });
   assert.equal(fake.state.land.size, 0);
   await assert.rejects(run('purchase-land', { x0: 0, y0: 0, x1: 20, y1: 19, dry_run: true }), /area too large: 21x20 = 420 tiles; purchase-land buys at most 400/);
   await assert.rejects(run('purchase-land', { x0: 60, y0: 0, x1: 64, y1: 1 }), /outside the map/);
@@ -203,7 +203,7 @@ test('purchase-land: dry run normalises corners, estimates cost and buys nothing
 test('purchase-land buys, refuses the whole rectangle on protected tiles, and owned-land lists the plots', async () => {
   try {
     const res = await run('purchase-land', { x0: 10, y0: 30, x1: 13, y1: 32 });
-    assert.deepEqual(res, { ok: true, error: null, dry_run: false, company: 0, area: [10, 30, 13, 32], tiles_bought: 12, cost: 600, money: res.money });
+    assert.deepEqual(res, { ok: true, error: null, dry_run: false, company: 0, area: [10, 30, 13, 32], tiles_bought: 12, cost: 600, money: res.money, money_after: res.money });
     assert.equal(fake.state.land.size, 12);
     // houses at 40..44,10..14, already-owned tiles and another company's tile: nothing is bought
     fake.state.landOwnedBy['20,30'] = 1;
@@ -264,7 +264,7 @@ test('owned land commands explain an older AgentBridge; airport-sites still work
     await assert.rejects(run('owned-land', {}), /older than v10/);
     const res = await run('airport-sites', { town: 'Smallham', limit: 1 });
     assert.ok(res.sites.length && res.sites.every((st) => !('owned' in st)));
-  } finally { fake.state.gsVersion = 12; }
+  } finally { fake.state.gsVersion = 13; }
 });
 
 test('build-signal --remove: no_signal_here instead of ERR_PRECONDITION_FAILED', async () => {
@@ -369,7 +369,7 @@ test('build-hq: one hq step; refused on an older GameScript', async () => {
   assert.equal(res.ok, true);
   assert.deepEqual(fake.received.filter((q) => q.cmd === 'exec').at(-1).args.steps, [['hq', 20, 30]]);
   fake.state.gsVersion = 11;
-  try { await assert.rejects(run('build-hq', { x: 20, y: 30 }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 12; }
+  try { await assert.rejects(run('build-hq', { x: 20, y: 30 }), /needs AgentBridge v12/); } finally { fake.state.gsVersion = 13; }
 });
 
 test('road-types; --road_type reaches exec for road builds; engines --road_type', async () => {

@@ -7,7 +7,7 @@
 //            top-level key applies to the items of every top-level list ("--fields id,name" on
 //            towns). ok, error, first_error and warnings are always kept; failed results are
 //            not projected (their hints matter).
-//   brief    true: one small object: ok, error, first_error, cost, money, ids, total, matched.
+//   brief    true: one small object: ok, error, first_error, cost, money, money_after, ids, total, matched.
 //   compact  true: one-line JSON; false: indented. Only formatting (the surface applies it).
 //   steps    'failed' (default): exec results list only failed steps (results_failed);
 //            'all': the full results list.
@@ -114,7 +114,7 @@ export function briefResult(result) {
     out.error = result.error;
     if (result.first_error !== undefined) out.first_error = result.first_error;
   }
-  for (const k of ['cost', 'money', 'total', 'matched']) if (typeof result[k] === 'number') out[k] = result[k];
+  for (const k of ['cost', 'money', 'money_after', 'total', 'matched']) if (typeof result[k] === 'number') out[k] = result[k];
   const ids = {};
   for (const k of ID_KEYS) {
     const v = result[k];
