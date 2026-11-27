@@ -1,14 +1,39 @@
 // A live connection to one game: admin client + GS RPC + world mirror.
 // Used in-process by the daemon and by the MCP server.
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { AdminClient, UPDATE, FREQ } from './admin-client.js';
+import { CONFIG_DIR } from './config.js';
 import { GSRpc } from './gs-rpc.js';
 import { TileMap, townsFromRows, industriesFromRows } from './world.js';
 import { execSummary, VEHICLE_STATES } from './operate.js';
 import { recordStall } from './problems.js';
+import { diagnoseGs } from './host.js';
 import { log } from './log.js';
 
 const ECONOMY_TTL_MS = 60_000; // towns/industries refresh at most once a minute (~1 game month)
+const JOB_GAMES_KEPT = 10;      // games remembered per jobs file
+
+/** A Map that calls onChange after every set/delete/clear (pending job queues are persisted on change). */
+export class WatchedMap extends Map {
+  constructor(onChange) { super(); this.onChange = onChange; }
+  set(k, v) { super.set(k, v); this.onChange?.(); return this; }
+  delete(k) { const had = super.delete(k); if (had) this.onChange?.(); return had; }
+  clear() { const had = this.size > 0; super.clear(); if (had) this.onChange?.(); }
+}
+
+/** ~/.openttd-agent/jobs-<host>-<port>.json: background jobs per game on that server (D2). */
+export function jobsFile(cfg) {
+  return path.join(CONFIG_DIR, `jobs-${String(cfg.host ?? '127.0.0.1').replace(/[^A-Za-z0-9.-]/g, '_')}-${cfg.admin_port}.json`);
+}
+
+/** Stable identity of the running game from the admin welcome: generation seed + start date (both kept in saves). */
+export const gameKeyOf = (welcome) => (welcome ? `${welcome.seed}-${welcome.startDate}` : null);
+
+function readJobs(file) {
+  try { const j = JSON.parse(fs.readFileSync(file, 'utf8')); return j && typeof j.games === 'object' ? j : { version: 1, games: {} }; } catch { return { version: 1, games: {} }; }
+}
 
 export class Session {
   constructor(cfg) {
@@ -24,9 +49,14 @@ export class Session {
     this._tileLoad = null;   // promise of the initial full dump
     this._refreshTimer = null;
     this._refreshRow = 0;
-    this.pendingSales = new Map(); // "company:vehicle" -> { company, vehicle, replaced_by, since } (vehicle-replace)
+    // Background jobs (pendingSales, pendingWagons, _autoSave) are saved to jobsFile(cfg) under the game's key on every
+    // change and restored on connect to the same game, so they survive a daemon restart (D2).
+    this.gameKey = null;
+    this.jobsRestored = null;
+    this._restoring = false;
+    this.pendingSales = new WatchedMap(() => this.persistJobs()); // "company:vehicle" -> { company, vehicle, replaced_by, since } (vehicle-replace)
     this._salesTimer = null;
-    this.pendingWagons = new Map(); // "company:vehicle" -> { company, vehicle, depot, wagon, cargo, count } (train-add-wagons)
+    this.pendingWagons = new WatchedMap(() => this.persistJobs()); // "company:vehicle" -> { company, vehicle, depot, wagon, cargo, count } (train-add-wagons)
     this.jobLog = [];               // finished pending jobs, last 50
     this.vehicleHistory = new Map(); // vehicle-problems progress samples
     this.stallHistory = new Map();   // vehicle-problems standstill samples
@@ -44,11 +74,13 @@ export class Session {
     });
     this.admin.subscribe(UPDATE.CHAT, FREQ.AUTOMATIC);
     this.gs = new GSRpc(this.admin);
+    this.gs.diagnose = () => diagnoseGs(this.cfg);
     this.info = await this.gs.call('info', {}, 10000).catch((e) => {
       // Close at once: a daemon retrying every call must not pile up admin connections (the
       // server refuses new ones once its admin slots are full: "read ECONNRESET").
       this.close();
-      throw new Error(`connected to admin port but the AgentBridge GameScript did not answer: ${e.message}. The game is running without AgentBridge. `
+      const code = /^(gs_died|gs_timeout):/.exec(e.message)?.[1] ?? 'no_gamescript';
+      throw new Error(`${code}: connected to admin port but the AgentBridge GameScript did not answer: ${e.message}. The game is running without AgentBridge (or it died). `
         + 'On the host: openttd-agent install-gamescript, then start the game again with openttd-agent launch (it writes [game_scripts] so AgentBridge is the only game script; '
         + 'an entry copied from your own openttd.cfg, e.g. "none =", used to win). A loaded save runs the GameScript stored in it: prepare it with scenario-prepare. Then run: openttd-agent guide');
     });
@@ -57,6 +89,8 @@ export class Session {
     this.types = new Map(types.map((t) => [t.id, t]));
     this.map = new TileMap(this.info.map_x, this.info.map_y);
     this.admin.on('newgame', () => { log.warn('session', 'host started or loaded a game; this session is stale'); });
+    this.gameKey = gameKeyOf(this.admin.welcome);
+    try { this.jobsRestored = this.restoreJobs(); } catch (e) { log.warn('session', 'could not restore background jobs', { file: jobsFile(this.cfg), error: e.message }); }
     log.info('session', 'ready', { map: [this.info.map_x, this.info.map_y], year: this.info.year, gs: this.info.bridge_version });
     return this;
   }
@@ -65,7 +99,7 @@ export class Session {
     clearInterval(this._refreshTimer);
     clearInterval(this._salesTimer);
     for (const t of this._watchTimers.values()) clearInterval(t);
-    this.stopAutoSave();
+    this.stopAutoSave({ persist: false }); // the schedule stays in the jobs file for the next session
     this.admin?.close();
   }
 
@@ -187,7 +221,7 @@ export class Session {
         if (p.company !== company) continue;
         if (!state.has(p.vehicle)) { this.pendingWagons.delete(k); out.gone.push({ company, vehicle: p.vehicle }); continue; }
         if (state.get(p.vehicle) !== 2) {
-          if (!p.sent) { const r = await this.exec(company, [['veh_depot', p.vehicle, false]]); if (r.ok) p.sent = true; }
+          if (!p.sent) { const r = await this.exec(company, [['veh_depot', p.vehicle, false]]); if (r.ok) { p.sent = true; this.persistJobs(); } }
           out.waiting.push({ company, vehicle: p.vehicle });
           continue;
         }
@@ -262,9 +296,16 @@ export class Session {
 
   /** Save now and then every `everyMonths` game months. Returns the first save. */
   async startAutoSave({ everyMonths, prefix }) {
-    this.stopAutoSave();
+    this.stopAutoSave({ persist: false });
     this._autoSave = { everyMonths, prefix, lastMonth: 0, last: null, errors: 0, timer: null };
     const first = await this._autoSaveNow(await this.gs.call('info'));
+    this._armAutoSave();
+    this.persistJobs();
+    return first;
+  }
+
+  /** The 20 s check for the periodic save in this._autoSave (started, or restored from the jobs file). */
+  _armAutoSave() {
     let busy = false;
     this._autoSave.timer = setInterval(async () => {
       const a = this._autoSave;
@@ -272,22 +313,85 @@ export class Session {
       busy = true;
       try {
         const info = await this.gs.call('info');
-        if (info.year * 12 + info.month - a.lastMonth >= a.everyMonths) await this._autoSaveNow(info);
+        if (info.year * 12 + info.month - a.lastMonth >= a.everyMonths) { await this._autoSaveNow(info); this.persistJobs(); }
       } catch (e) { a.errors++; log.warn('session', 'periodic save failed', { error: e.message }); }
       busy = false;
     }, 20_000);
     this._autoSave.timer.unref?.();
-    return first;
   }
 
-  stopAutoSave() {
+  stopAutoSave({ persist = true } = {}) {
     if (this._autoSave?.timer) clearInterval(this._autoSave.timer);
+    const had = this._autoSave !== null;
     this._autoSave = null;
+    if (persist && had) this.persistJobs();
   }
 
   autoSaveStatus() {
     const a = this._autoSave;
     return a ? { every_months: a.everyMonths, prefix: a.prefix, last: a.last, errors: a.errors } : null;
+  }
+
+  // ---- persisted background jobs (D2) ------------------------------------------------------
+
+  /** Write this game's jobs to the jobs file (an empty entry is removed). No-op before connect and while restoring. */
+  persistJobs() {
+    if (!this.gameKey || this._restoring) return;
+    const file = jobsFile(this.cfg);
+    const data = readJobs(file);
+    const a = this._autoSave;
+    const entry = { updated: new Date().toISOString(), map: this.info ? [this.info.map_x, this.info.map_y] : null,
+      pending_sales: [...this.pendingSales.values()], pending_wagons: [...this.pendingWagons.values()],
+      auto_save: a ? { every_months: a.everyMonths, prefix: a.prefix, last_month: a.lastMonth, last: a.last } : null };
+    const empty = !entry.pending_sales.length && !entry.pending_wagons.length && !entry.auto_save;
+    if (empty && !(this.gameKey in data.games)) return;
+    if (empty) delete data.games[this.gameKey]; else data.games[this.gameKey] = entry;
+    const keys = Object.keys(data.games).sort((p, q) => String(data.games[q].updated).localeCompare(String(data.games[p].updated)));
+    for (const k of keys.slice(JOB_GAMES_KEPT)) delete data.games[k];
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode: 0o600 });
+      fs.renameSync(tmp, file);
+    } catch (e) { log.warn('session', 'could not save background jobs', { file, error: e.message }); }
+  }
+
+  /** Load this game's jobs from the jobs file and restart their timers. Returns what was restored, or null. */
+  restoreJobs() {
+    const entry = this.gameKey ? readJobs(jobsFile(this.cfg)).games[this.gameKey] : null;
+    if (!entry) return null;
+    this._restoring = true;
+    try {
+      for (const p of entry.pending_sales ?? []) this.pendingSales.set(`${p.company}:${p.vehicle}`, p);
+      for (const p of entry.pending_wagons ?? []) this.pendingWagons.set(`${p.company}:${p.vehicle}`, p);
+      const a = entry.auto_save;
+      if (a && a.every_months > 0 && a.prefix) {
+        this._autoSave = { everyMonths: a.every_months, prefix: a.prefix, lastMonth: a.last_month ?? 0, last: a.last ?? null, errors: 0, timer: null };
+        this._armAutoSave();
+      }
+    } finally { this._restoring = false; }
+    this.watchSales();
+    const out = { pending_sales: this.pendingSales.size, pending_wagons: this.pendingWagons.size, periodic_save: this._autoSave !== null, saved_at: entry.updated };
+    log.info('session', 'restored background jobs', { game: this.gameKey, ...out });
+    return out;
+  }
+
+  /** status.background_jobs: queued vehicle jobs (own company only when one is set), the periodic save, where they are kept. */
+  backgroundJobs() {
+    const mineOnly = (m) => {
+      const all = [...m.values()];
+      const c = this.cfg.company;
+      return c === null || c === undefined ? all : all.filter((p) => p.company === c);
+    };
+    const sales = mineOnly(this.pendingSales), wagons = mineOnly(this.pendingWagons);
+    return {
+      pending_sales: sales.map((p) => ({ company: p.company, vehicle: p.vehicle, replaced_by: p.replaced_by ?? null, since: p.since ?? null })),
+      pending_wagons: wagons.map((p) => ({ company: p.company, vehicle: p.vehicle, count: p.count, sent: p.sent ?? false })),
+      other_companies_jobs: this.pendingSales.size + this.pendingWagons.size - sales.length - wagons.length,
+      periodic_save: this.autoSaveStatus(),
+      vehicle_watch_companies: [...this._watchTimers.keys()],
+      persisted_to: jobsFile(this.cfg), game_key: this.gameKey, restored_on_connect: this.jobsRestored,
+    };
   }
 
   /** Client-side throttle (max_builds_per_minute, 0 = off). Throws when over the limit. */

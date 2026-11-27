@@ -5,9 +5,11 @@
 // ctx: { cfg, session() -> Promise<Session> } — session() connects lazily.
 
 import os from 'node:os';
+import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import * as z from 'zod/v4';
-import { doctor, installGamescript, launch, checkSaveName, bundledGsVersion, TERRAIN_TYPES } from './setup.js';
+import { doctor, installGamescript, launch, checkSaveName, bundledGsVersion, adminHostForBind, profileDir, TERRAIN_TYPES } from './setup.js';
+import { serverTarget, serverStates, profilePorts, serverPids, waitReady, notReadyDetail, stopServer, withAdmin, loadSave, listSaves, companyNew, reloadGamescript, logTail, portOpen } from './host.js';
 import { VERSION } from './version.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
@@ -42,6 +44,7 @@ const idList = (v) => {
 };
 const ids = () => z.preprocess(idList, z.array(int()).min(1));
 const who = { company: int().optional().describe('company id; default: your configured company') };
+const serverArg = { server: z.string().optional().describe('launch profile of the server (launch --server NAME); default: the server at the configured admin_port') };
 const act = { ...who, dry_run: bool().default(false).describe('true = cost/feasibility only, changes nothing') };
 const lc = (v) => String(v).toLowerCase();
 const PAIR_MIN_DIST = 20, PAIR_MAX_DIST = 200; // find-cargo-pairs defaults (tiles, Manhattan)
@@ -51,16 +54,7 @@ const lanAddresses = () => Object.values(os.networkInterfaces()).flat().filter((
 /** Is `company` another company than the caller's own (cfg.company; through the relay the player's)? */
 const isRival = (s, company) => s.cfg.company !== null && s.cfg.company !== undefined && company !== s.cfg.company;
 
-/**
- * Where this machine's CLI reaches the admin port of a server bound to `bind`: 127.0.0.1 for a
- * wildcard or loopback bind, else the bound address itself (a server on 10.0.0.5 only does not
- * answer on 127.0.0.1). Several addresses: the first.
- */
-export function adminHostForBind(bind) {
-  const first = String(bind ?? '').split(',')[0].trim().replace(/^\[|\]$/g, '');
-  if (!first || first === '0.0.0.0' || first === '::' || /^127\./.test(first) || first === 'localhost' || first === '::1') return '127.0.0.1';
-  return first;
-}
+export { adminHostForBind } from './setup.js';
 
 /** Session + company for read commands. */
 async function mine(ctx, a) {
@@ -1252,9 +1246,14 @@ export const COMMANDS = [
   // ---- setup ------------------------------------------------------------------
   {
     name: 'doctor', group: 'setup', session: false,
-    description: 'Check this machine: OpenTTD install, personal dir, original graphics/music, GameScript version. Run first.',
+    description: 'Check this machine: OpenTTD install (and macOS quarantine), personal dir, original graphics/music, GameScript version, and each launch profile\'s server (running, ports, whether its log shows the GameScript died). Run first.',
     args: z.object({}),
-    run: () => doctor(),
+    run: () => {
+      const report = doctor();
+      report.servers = serverStates();
+      for (const sv of report.servers) if (sv.running && sv.gamescript_in_log === 'died') report.next_steps.push(`server '${sv.server}': its log says the GameScript died; load the game again (load${sv.server === 'dedicated' ? '' : ` --server ${sv.server}`} --name <save>) and see server-log --errors true`);
+      return report;
+    },
   },
   {
     name: 'guide', group: 'setup', session: false,
@@ -1265,8 +1264,12 @@ export const COMMANDS = [
   {
     name: 'install-gamescript', group: 'setup', session: false,
     description: 'HOST ONLY: copy the bundled AgentBridge GameScript (and IdleAI test AI) into the OpenTTD personal dir. Re-run after updating openttd-agent.',
-    args: z.object({}),
-    run: () => installGamescript(),
+    args: z.object({
+      reload: bool().default(false).describe('true = also make the running server use it: rescan, save the game, load that save (it starts the newest AgentBridge), wait for the new bridge_version and restore the pause state'),
+      server: serverArg.server,
+      save_name: z.string().optional().describe('--reload: name of the save it makes and loads (default gs-reload-<date>-<time>)'),
+    }),
+    run: async (ctx, a) => (a.reload ? reloadGamescript(serverTarget(ctx.cfg, a.server), { saveName: a.save_name !== undefined ? checkSaveName(a.save_name) : undefined }) : installGamescript()),
   },
   {
     name: 'configure', group: 'setup', session: false,
@@ -1297,9 +1300,12 @@ export const COMMANDS = [
   },
   {
     name: 'launch', group: 'setup', session: false,
-    description: 'Start OpenTTD with the right settings. mode=dedicated: headless LAN server with AgentBridge (everyone joins as a client). mode=host: GUI with server settings preset; then Multiplayer > Start Server. mode=join: GUI client joining join_host. Never edits your own openttd.cfg (uses a profile in ~/.openttd-agent/profiles).',
+    description: 'Start OpenTTD with the right settings. mode=dedicated: headless LAN server with AgentBridge (everyone joins as a client); waits until the admin port and AgentBridge answer (ready, bridge_version, seconds; not_ready with the process state and log tail otherwise). A server already running from this profile is reported (already_running) and left alone unless --restart true. mode=host: GUI with server settings preset; then Multiplayer > Start Server. mode=join: GUI client joining join_host. --server NAME --game_port --admin_port runs another server beside the first (its own profile; host commands take the same --server). Never edits your own openttd.cfg (uses a profile in ~/.openttd-agent/profiles/<server>); rotates the profile\'s openttd.log (keeps 3). --dry_run true writes nothing.',
     args: z.object({
       mode: z.enum(['dedicated', 'host', 'join']).default('dedicated'),
+      server: z.string().optional().describe('launch profile name (default: the mode). A second name with its own --game_port/--admin_port runs a second server on this machine; later host commands pick it with --server NAME'),
+      game_port: int().min(1).max(65535).optional().describe('default 3979, or what this --server used last time'),
+      admin_port: int().min(1).max(65535).optional().describe('default: the configured admin_port (3977), or what this --server used last time'),
       admin_password: z.string().optional().describe('dedicated/host: defaults to the configured admin_password; if there is none, a random one is generated and saved in the config (it never needs to leave this machine)'),
       join_host: z.string().optional().describe('host LAN IP for mode=join; defaults to configured host'),
       seed: int().optional(), map_bits: int().min(6).max(12).default(8).describe('map size as power of two: 8=256, 9=512, 10=1024'),
@@ -1308,27 +1314,70 @@ export const COMMANDS = [
       max_builds_per_day: int().min(0).default(0).describe('GameScript rate limit per company per game day (0 = unlimited)'),
       terrain: z.enum(TERRAIN_TYPES).optional().describe('new maps only; default: whatever your openttd.cfg says (OpenTTD default flat)'),
       script_opcodes: int().min(500).max(250000).default(100000).describe('host: opcodes the GameScript may run per tick (OpenTTD default 10000); higher = faster map mirror and replies'),
-      bind: z.string().default('0.0.0.0'), dry_run: bool().default(false),
+      bind: z.string().default('0.0.0.0'),
+      restart: bool().default(false).describe('true = stop a server already running from this profile (console quit, then SIGTERM by its cfg path) and start again'),
+      wait: bool().optional().describe('wait until ready (default true for mode=dedicated; host/join open a window and are not waited for)'),
+      wait_s: int().min(1).max(280).default(60).describe('how long to wait for ready'),
+      dry_run: bool().default(false).describe('true = show the command line and the files it would write; writes and starts nothing'),
     }),
-    run: (ctx, a) => {
-      let adminPassword = a.admin_password ?? ctx.cfg.admin_password;
+    run: async (ctx, a) => {
       const hosting = a.mode !== 'join';
+      const server = a.server ?? a.mode;
+      const dir = profileDir(server);
+      const prev = a.server ? profilePorts(dir) : {};
+      const adminPort = a.admin_port ?? prev.admin_port ?? ctx.cfg.admin_port;
+      const gamePort = a.game_port ?? prev.game_port ?? 3979;
+      const host = hosting ? adminHostForBind(a.bind) : null;
+      const primary = hosting && adminPort === ctx.cfg.admin_port;
+      let adminPassword = a.admin_password ?? ctx.cfg.admin_password;
       const generated = hosting && !adminPassword;
       if (generated) adminPassword = randomBytes(24).toString('base64url');
-      const result = launch({
-        mode: a.mode, adminPassword, joinHost: a.join_host ?? ctx.cfg.host,
+      const cfgPath = path.join(dir, 'openttd.cfg');
+      const target = { server, dir, cfgPath, host, admin_port: adminPort, game_port: gamePort, password: adminPassword, local: true };
+      const running = serverPids(cfgPath);
+      const opts = {
+        mode: a.mode, server, adminPassword, joinHost: a.join_host ?? ctx.cfg.host, adminPort, gamePort,
         seed: a.seed, mapBits: a.map_bits, load: a.load, commandDelayTicks: a.command_delay_ticks,
-        maxBuildsPerDay: a.max_builds_per_day, scriptOpcodes: a.script_opcodes, terrain: a.terrain, bind: a.bind, adminPort: ctx.cfg.admin_port, dryRun: a.dry_run,
-      });
-      // The relay and the CLI on this machine read the password and admin address from the config, so keep them in step.
-      const host = hosting ? adminHostForBind(a.bind) : null;
-      const updates = {
-        ...(hosting && adminPassword !== ctx.cfg.admin_password ? { admin_password: adminPassword } : {}),
-        ...(host && host !== ctx.cfg.host ? { host } : {}),
+        maxBuildsPerDay: a.max_builds_per_day, scriptOpcodes: a.script_opcodes, terrain: a.terrain, bind: a.bind, dryRun: a.dry_run,
       };
-      if (!a.dry_run && Object.keys(updates).length) saveConfig(updates);
-      return { ...result, ...(generated ? { admin_password: a.dry_run ? 'would be generated' : 'generated and saved in the config' } : {}),
-        ...(updates.host ? { admin_host: a.dry_run ? `would be saved as host: ${host}` : `saved as host: ${host} (the server listens only there)` } : {}) };
+      if (a.dry_run) {
+        const { result } = launch(opts);
+        return { ...result, ...(running?.length ? { running_now: running } : {}), ...(generated ? { admin_password: 'would be generated' } : {}),
+          ...(primary && host !== ctx.cfg.host ? { admin_host: `would be saved as host: ${host}` } : {}) };
+      }
+      let restarted = null;
+      if (hosting && running?.length) {
+        if (!a.restart) {
+          const probe = await waitReady({ ...target, password: ctx.cfg.admin_password || adminPassword }, { timeoutMs: 4000 });
+          return { already_running: true, server, pids: running, admin_port: adminPort, game_port: gamePort, ready: probe.ready,
+            ...(probe.ready ? { bridge_version: probe.bridge_version, paused: probe.paused } : { stage: probe.stage }),
+            note: `a server from profile '${server}' is already running; nothing was started. Use it, or: launch --restart true (or server-stop${a.server ? ` --server ${server}` : ''})` };
+        }
+        restarted = await stopServer({ ...target, password: ctx.cfg.admin_password || adminPassword });
+      }
+      if (hosting) {
+        const busy = [];
+        for (const p of [adminPort, gamePort]) if (await portOpen(host, p)) busy.push(p);
+        if (busy.length) throw new Error(`port_in_use: port ${busy.join(' and ')} on ${host} is taken by another program or server (not profile '${server}'). Pick others: launch --server ${server === a.mode ? 'NAME' : server} --game_port N --admin_port M`);
+      }
+      const { result, child } = launch(opts);
+      let exitCode;
+      child.on('exit', (code, signal) => { exitCode = code ?? signal; });
+      // The relay and the CLI on this machine read the password and admin address from the config, so keep them in step
+      // for the server the config points at (a side server on other ports leaves the config alone).
+      const updates = {
+        ...(hosting && (primary || generated) && adminPassword !== ctx.cfg.admin_password ? { admin_password: adminPassword } : {}),
+        ...(primary && host !== ctx.cfg.host ? { host } : {}),
+      };
+      if (Object.keys(updates).length) saveConfig(updates);
+      const out = { ...result, ...(restarted ? { restarted } : {}), ...(generated ? { admin_password: 'generated and saved in the config' } : {}),
+        ...(updates.host ? { admin_host: `saved as host: ${host} (the server listens only there)` } : {}),
+        ...(hosting && !primary ? { side_server: `the config still points at admin port ${ctx.cfg.admin_port}. Host commands: --server ${server}. Game commands: OPENTTD_AGENT_ADMIN_PORT=${adminPort} openttd-agent <command> --no-daemon` } : {}) };
+      if (!(a.wait ?? a.mode === 'dedicated')) return out;
+      const ready = await waitReady(target, { timeoutMs: a.wait_s * 1000, exited: () => exitCode });
+      if (ready.ready) return { ...out, ...ready };
+      return { ...out, ok: false, error: `not_ready: server '${server}' was not ready within ${a.wait_s}s (stage: ${ready.stage}${ready.last_error ? `: ${ready.last_error}` : ''}). See process and log_tail; server-log${a.server ? ` --server ${server}` : ''} shows more`,
+        ...ready, ...notReadyDetail(target, { pid: result.pid, exitCode }) };
     },
   },
   {
@@ -1342,6 +1391,65 @@ export const COMMANDS = [
       script_opcodes: int().min(500).max(250000).default(100000).describe('GameScript opcodes per tick stored in the copy (a scenario brings its own, usually 10000)'),
     }),
     run: (ctx, a) => prepareScenario(ctx.cfg, { search: a.search, contentId: a.content_id, name: a.name, load: a.load, scriptOpcodes: a.script_opcodes }),
+  },
+
+  // ---- host server control (session: false: own admin connection; refused through the relay) ----
+  {
+    name: 'saves', group: 'host', session: false,
+    description: "HOST ONLY: savegames in the server's save folder (the launch profile's save/), newest first: name (what load --name and launch --load take), bytes, modified.",
+    args: z.object({ ...serverArg, match: z.string().optional().describe('only names containing this text'), limit: int().min(1).max(1000).default(50) }),
+    run: (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      const { folder, saves } = listSaves(t.dir);
+      const matched = a.match ? saves.filter((x) => x.name.toLowerCase().includes(a.match.toLowerCase())) : saves;
+      return { server: t.server, folder, ...listResult('saves', saves, matched, a.limit) };
+    },
+  },
+  {
+    name: 'load', group: 'host', session: false,
+    description: "HOST ONLY: load a save on the running server (console ls, then load by its index) and wait until AgentBridge answers in the new game. Returns loaded, map, date, paused, bridge_version, seconds. --pause true/false sets the pause state after loading (default: as saved; a game saved paused loads paused). Every player's session reconnects on its next call. A save runs the GameScript stored in it: one made without AgentBridge will not answer (scenario-prepare makes a copy that does).",
+    args: z.object({ ...serverArg, name: z.string().describe('save name as `saves` lists it (with or without .sav)'), pause: bool().optional().describe('true = pause after loading, false = unpause; default as saved') }),
+    run: async (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      return { server: t.server, ...(await withAdmin(t, (admin, gs) => loadSave(admin, gs, checkSaveName(a.name), { pause: a.pause }))) };
+    },
+  },
+  {
+    name: 'server-stop', group: 'host', session: false,
+    description: "HOST ONLY: stop the server (console quit; if it does not exit, SIGTERM to the processes started with this profile's openttd.cfg, and nothing else). --save NAME saves first and waits for the file; without the save it does not quit. Returns was_running, stopped, method.",
+    args: z.object({ ...serverArg, save: z.string().optional().describe('save under this name before quitting') }),
+    run: async (ctx, a) => stopServer(serverTarget(ctx.cfg, a.server), { save: a.save !== undefined ? checkSaveName(a.save) : undefined }),
+  },
+  {
+    name: 'console', group: 'host', session: false,
+    description: 'HOST ONLY escape hatch: run one server console command over the admin port (rcon) and return its output lines, e.g. "setting command_pause_level", "list_ai", "companies". Prefer the dedicated commands (load, saves, pause, company-new, server-stop). Console `companies` numbers from 1; every other openttd-agent command from 0.',
+    args: z.object({ ...serverArg, command: z.string().min(1).describe('console command line') }),
+    run: async (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      const lines = await withAdmin(t, (admin) => admin.rcon(a.command, 30000), { name: 'openttd-agent-console' });
+      return { server: t.server, command: a.command, lines };
+    },
+  },
+  {
+    name: 'company-new', group: 'host', session: false,
+    description: 'HOST ONLY: start an AI company on the server (console start_ai) and return its company id (0-based, as every other command uses). IdleAI (installed by install-gamescript) builds nothing: a test company to act as with --company.',
+    args: z.object({ ...serverArg, ai: z.string().default('IdleAI').describe('AI name as `console --command list_ai` shows it') }),
+    run: async (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      return { server: t.server, ...(await withAdmin(t, (admin, gs) => companyNew(admin, gs, a.ai))) };
+    },
+  },
+  {
+    name: 'server-log', group: 'host', session: false,
+    description: "HOST ONLY: the end of the server's openttd.log (the launch profile's; launch rotates it, keeping 3). --errors true keeps only error lines (script errors, crashes); --grep TEXT only lines containing TEXT. `gs` says whether AgentBridge started and whether a script died after that (state started / died / not_started).",
+    args: z.object({ ...serverArg, lines: int().min(1).max(500).default(40), errors: bool().default(false), grep: z.string().optional() }),
+    run: (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      const tail = logTail(t.dir, { lines: a.lines, errors: a.errors, grep: a.grep });
+      if (!tail.exists) return { ok: false, error: `no_log: ${tail.file} does not exist (start the server with openttd-agent launch)`, server: t.server };
+      const pids = serverPids(t.cfgPath);
+      return { server: t.server, running: pids === null ? null : pids.length > 0, ...tail };
+    },
   },
 
   // ---- relay (host only: who may play which company) ---------------------------
@@ -1394,7 +1502,7 @@ export const COMMANDS = [
   // ---- game -------------------------------------------------------------------
   {
     name: 'status', group: 'game', session: true,
-    description: 'Game date, map size, pause state, your company, rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
+    description: 'Game date, map size, pause state, your company, rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge), background_jobs (queued vehicle sales and wagon jobs, the periodic save; kept in ~/.openttd-agent/jobs-<host>-<port>.json per game, so they survive a daemon restart) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
     args: z.object({}),
     run: async (ctx) => {
       const s = await ctx.session();
@@ -1408,7 +1516,7 @@ export const COMMANDS = [
       }
       return { info, my_company: s.cfg.company, companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
         tile_mirror: { rows_loaded: loaded, rows_total: s.map.sizeY, load_ms: s.tileLoadMs ?? null },
-        versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, warnings };
+        versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, background_jobs: s.backgroundJobs(), warnings };
     },
   },
   {
@@ -1555,7 +1663,7 @@ export const COMMANDS = [
 
   {
     name: 'save', group: 'host', session: true,
-    description: "HOST ONLY: save the running server game over the console (`save <name>`). OpenTTD writes it to the launch profile's save folder (save/<name>.sav next to the profile's openttd.cfg); load it again with launch --load <name>. Name: letters, digits, _ . - only (no paths). Periodic saves: --every_months N --prefix P makes the daemon save P-YYYY-MM every N game months (checked every 20 s while the game runs; also once now); --every_months 0 stops; with neither name nor every_months it shows the schedule. The schedule lives in the daemon (or MCP server) and ends when it restarts.",
+    description: "HOST ONLY: save the running server game over the console (`save <name>`). OpenTTD writes it to the launch profile's save folder (save/<name>.sav next to the profile's openttd.cfg); load it again with launch --load <name>. Name: letters, digits, _ . - only (no paths). Periodic saves: --every_months N --prefix P makes the daemon save P-YYYY-MM every N game months (checked every 20 s while the game runs; also once now); --every_months 0 stops; with neither name nor every_months it shows the schedule. The daemon (or MCP server) runs the schedule; it is kept in ~/.openttd-agent/jobs-<host>-<port>.json for this game and resumes when the daemon reconnects to the same game.",
     args: z.object({ name: z.string().optional().describe('save name without extension, e.g. game-night-1'),
       every_months: int().min(0).max(120).optional().describe('periodic save every N game months (0 = stop)'), prefix: z.string().default('autosave').describe('periodic save name prefix') }),
     run: async (ctx, a) => {

@@ -107,9 +107,16 @@ test('every command that changes the game or reads company data takes a company 
   for (const c of COMMANDS) if ('dry_run' in c.args.shape && c.session) assert.ok('company' in c.args.shape, `${c.name} has dry_run but no company`);
 });
 
+test('every host and setup command is host-only in the relay policy', () => {
+  for (const c of COMMANDS.filter((x) => ['host', 'setup', 'relay'].includes(x.group))) {
+    assert.throws(() => relayMod.authorize({ name: 'p', company: 0 }, c.name, {}), relayMod.Refused, c.name);
+  }
+});
+
 test('host-only commands are refused for players', async () => {
   for (const [name, args] of [['launch', { mode: 'dedicated', admin_password: 'sent-by-player' }], ['install-gamescript', {}], ['configure', { admin_password: 'x' }],
-    ['show-config', {}], ['relay-add-player', { name: 'eve', company: 0 }], ['relay-list-players', {}], ['relay-stats', {}], ['rate', { max_builds_per_day: 1 }], ['rcon', { command: 'quit' }], ['scenario-prepare', { search: 'mini' }], ['goal-set', { deadline_year: 1960, targets: 'PASS:1' }], ['goal-clear', {}], ['pause', {}], ['unpause', {}], ['turn-advance', { days: 1 }], ['save', { name: 'x' }]]) {
+    ['show-config', {}], ['relay-add-player', { name: 'eve', company: 0 }], ['relay-list-players', {}], ['relay-stats', {}], ['rate', { max_builds_per_day: 1 }], ['rcon', { command: 'quit' }], ['scenario-prepare', { search: 'mini' }], ['goal-set', { deadline_year: 1960, targets: 'PASS:1' }], ['goal-clear', {}], ['pause', {}], ['unpause', {}], ['turn-advance', { days: 1 }], ['save', { name: 'x' }],
+    ['load', { name: 'x' }], ['saves', {}], ['company-new', {}], ['server-stop', {}], ['console', { command: 'quit' }], ['server-log', {}], ['install-gamescript', { reload: true }]]) {
     const r = await call(tokens.alice, name, args);
     assert.equal(r.status, 403, name);
     assert.match(r.error, /relay refused/, name);
