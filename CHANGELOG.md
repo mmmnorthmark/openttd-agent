@@ -89,6 +89,9 @@ Observation and output (batch 6):
 - `tiles --format text` (up to 80x80): one character per tile (class letter, upper case = owned by
   your company), an x ruler and rows `"y|chars"`. `tiles --x --y --radius R` instead of the corners
   (both formats). The box is clipped to the map.
+- `stations --ids A,B`, `--near_x X --near_y Y [--radius R]` (nearest first, each with `distance`),
+  `--unserved true` and `--max_vehicles N`. **Breaking:** the default `--limit` for your own
+  company rises from 100 to 1000 (another company's stay at 100).
 
 ## 0.7.0 (2026-11-26)
 

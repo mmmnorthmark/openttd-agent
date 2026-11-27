@@ -1983,13 +1983,21 @@ export const COMMANDS = [
   // ---- operate (read) -------------------------------------------------------------
   {
     name: 'stations', group: 'operate', session: true,
-    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving (count, and vehicle_ids with AgentBridge v12: vehicles with an order for it). Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations). --company X shows another company\'s stations as the game window shows them to anyone (location, facilities, waiting cargo, ratings; no vehicle counts); also through the relay. Returns {total, matched, stations, truncated}.',
+    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving (count, and vehicle_ids with AgentBridge v12: vehicles with an order for it). Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations), ids, near_x/near_y/radius (nearest first, with distance), unserved (no vehicle has an order for it), max_vehicles. --company X shows another company\'s stations as the game window shows them to anyone (location, facilities, waiting cargo, ratings; no vehicle counts); also through the relay. Returns {total, matched, stations, truncated}.',
     args: z.object({ ...who, facility: z.enum(FACILITIES).optional(), cargo: z.string().optional(), min_waiting: int().default(0),
-      max_rating_pct: int().default(100), name: z.string().optional(), limit: int().default(100) }),
+      max_rating_pct: int().default(100), name: z.string().optional(),
+      ids: ids().optional().describe('only these station ids'),
+      near_x: int().optional().describe('with near_y: only stations within --radius tiles (Manhattan) of this tile, nearest first, each with distance'), near_y: int().optional(),
+      radius: int().min(0).default(20).describe('tiles around near_x,near_y'),
+      unserved: bool().default(false).describe('only stations no vehicle has an order for (your company)'),
+      max_vehicles: int().min(0).optional().describe('only stations served by at most this many vehicles (your company)'),
+      limit: int().min(1).optional().describe('most stations to return (default 1000 for your company, 100 for another)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargoFilter = a.cargo !== undefined || a.min_waiting > 0 || a.max_rating_pct < 100;
       const rival = isRival(s, company);
+      if (rival && (a.unserved || a.max_vehicles !== undefined)) throw new Error('refused: --unserved and --max_vehicles need vehicle counts, which another company\'s stations do not show');
+      if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('bad_arguments: give --near_x and --near_y together');
       let all = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).map((st) => (rival ? (({ vehicles, ...rest }) => rest)(st) : st));
       if (!rival) {
         const ids = await stationVehicleIds(s, company);
@@ -1997,7 +2005,8 @@ export const COMMANDS = [
       }
       const hits = all.filter((st) => (!a.facility || st.facilities.includes(a.facility)) && (!a.name || lc(st.name).includes(lc(a.name)))
         && (!cargoFilter || st.cargo.some((c) => (!a.cargo || cargoMatches(c.name, a.cargo)) && c.waiting >= a.min_waiting && c.rating_pct <= a.max_rating_pct)));
-      return { company, ...(rival ? { view: 'other company: what the game shows anyone' } : {}), ...listResult('stations', all, hits, a.limit) };
+      const picked = filterStations(hits, a);
+      return { company, ...(rival ? { view: 'other company: what the game shows anyone' } : {}), ...listResult('stations', all, picked, a.limit ?? (rival ? 100 : 1000)) };
     },
   },
   {

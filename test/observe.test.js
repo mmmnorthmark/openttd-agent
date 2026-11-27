@@ -76,3 +76,21 @@ test('tiles --format text and --radius', async () => {
   const json = await run('tiles', { x: 13, y: 20, radius: 1 });
   assert.equal(json.rows.length, 3);
 });
+
+test('filterStations: ids, near (sorted, distance), unserved, max_vehicles', () => {
+  const st = [{ id: 1, x: 10, y: 10, vehicles: 0 }, { id: 2, x: 12, y: 10, vehicles: 3 }, { id: 3, x: 40, y: 40, vehicles: 1 }];
+  assert.deepEqual(filterStations(st, { ids: [1, 3] }).map((s) => s.id), [1, 3]);
+  const near = filterStations(st, { near_x: 13, near_y: 10, radius: 5 });
+  assert.deepEqual(near.map((s) => [s.id, s.distance]), [[2, 1], [1, 3]]);
+  assert.deepEqual(filterStations(st, { unserved: true }).map((s) => s.id), [1]);
+  assert.deepEqual(filterStations(st, { max_vehicles: 1 }).map((s) => s.id), [1, 3]);
+});
+
+test('stations --ids --near_x --near_y --unserved --max_vehicles', async () => {
+  assert.deepEqual((await run('stations', { ids: '3,7' })).stations.map((s) => s.id), [3, 7]);
+  const near = await run('stations', { near_x: 45, near_y: 9, radius: 5 });
+  assert.deepEqual(near.stations.map((s) => [s.id, s.distance]), [[7, 2], [4, 4]]);
+  assert.deepEqual((await run('stations', { max_vehicles: 1 })).stations.map((s) => s.id).sort(), [5, 7]);
+  assert.equal((await run('stations', { unserved: true })).matched, 0);
+  await assert.rejects(run('stations', { near_x: 3 }), /near_x and --near_y together/);
+});
