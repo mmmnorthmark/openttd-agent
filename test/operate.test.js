@@ -114,7 +114,8 @@ test('a failed step is reported with its error; group-create returns the id', as
   assert.equal(res.steps_done, 2);
   assert.equal(res.error, 'step 1 (veh_sell): Vehicle not available');
   assert.equal(res.first_error, 'failed');
-  assert.equal(res.results[1].ok, false);
+  assert.deepEqual(res.results_failed.map((r) => [r.step, r.ok]), [[1, false]], 'by default only failed steps are listed');
+  assert.equal(res.results, undefined);
   const g = await run('group-create', { type: 'rail', name: 'Wood line' });
   assert.equal(g.group, 100);
   assert.deepEqual(lastExec().steps, [['group_create', 0, 'Wood line', -1]]);

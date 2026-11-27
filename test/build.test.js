@@ -26,7 +26,7 @@ before(async () => {
 after(() => { ctx.close(); fake.server.close(); });
 
 test('build-rail: dry run plans over the river with a bridge and reports cost per step', async () => {
-  const res = await run('build-rail', { x1: 24, y1: 20, x2: 36, y2: 20, dry_run: true, margin: 5, bridge: 'fastest', rail_type: 1 });
+  const res = await run('build-rail', { x1: 24, y1: 20, x2: 36, y2: 20, dry_run: true, margin: 5, bridge: 'fastest', rail_type: 1, steps: 'all' });
   assert.equal(res.reachable, true);
   assert.equal(res.bridges, 1);
   assert.equal(res.dry_run, true);

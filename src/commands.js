@@ -23,15 +23,20 @@ import { traceRail, traceRoad, trackExits, adjacencyTrace, mirrorStationTiles, r
 import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
 import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
+import { takeOutputArgs, shapeResult } from './output.js';
+import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
 
-const int = () => z.coerce.number().int();
-const num = () => z.coerce.number();
+// Strict numbers (0.8.0): plain z.number(); runCommand (parseArgs) turns a numeric string ("12", " -3 ")
+// into its number. null, "", false and [] are no longer 0 (company 0 is a real company).
+const toNumber = (v) => (typeof v === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(v) ? Number(v) : v);
+const int = () => z.number().int();
+const num = () => z.number();
 const bool = () => z.preprocess((v) => (v === 'true' ? true : v === 'false' ? false : v), z.boolean());
 const point = { x: int().describe('tile x'), y: int().describe('tile y') };
 /** "1,2,3" | 5 | [1,2] -> [ints] */
-const ids = () => z.preprocess((v) => (Array.isArray(v) ? v : String(v).split(',').filter((t) => t.trim() !== '')), z.array(int()).min(1));
+const ids = () => z.preprocess((v) => (Array.isArray(v) ? v : typeof v === 'number' || typeof v === 'string' ? String(v).split(',').filter((t) => t.trim() !== '') : v).map?.(toNumber) ?? v, z.array(int()).min(1));
 const who = { company: int().optional().describe('company id; default: your configured company') };
 const act = { ...who, dry_run: bool().default(false).describe('true = cost/feasibility only, changes nothing') };
 const lc = (v) => String(v).toLowerCase();
@@ -2906,41 +2911,110 @@ export function aliasArgs(known, raw) {
   return out;
 }
 
-/** zod issues -> "--key: message (got 'raw')" lines, so a bad number shows what was received. */
+/** zod issues -> "--key: message (got 'raw')" lines; a missing key says "required". */
 function argErrors(error, raw) {
   return error.issues.map((i) => {
     const key = i.path[0];
+    if (key !== undefined && i.path.length === 1 && i.code === 'invalid_type' && raw[key] === undefined) return `--${key}: required`;
     const got = key !== undefined && key in raw ? ` (got ${JSON.stringify(raw[key])})` : '';
     return `${key !== undefined ? `--${i.path.join('.')}` : 'arguments'}: ${i.message}${got}`;
   }).join('; ');
 }
 
-/** Validate args and run. Throws with a readable message on bad args. */
-export async function runCommand(ctx, name, rawArgs = {}) {
+/** Drop keys whose value is null or undefined: JSON callers send null for "not given". */
+const dropNulls = (raw) => Object.fromEntries(Object.entries(raw ?? {}).filter(([, v]) => v !== null && v !== undefined));
+
+/**
+ * Validate `args` against the command schema, repairing what has one obvious meaning (zod issue
+ * driven, so it covers every argument): a numeric string for a number arg becomes the number (CLI
+ * flags are text); a JSON number for a string arg becomes its text (P4); ""
+ * for a number counts as not given; an out-of-range number is clamped to the bound (L13) in read
+ * commands and dry runs only (a real build must not silently do something else). Returns
+ * { data, args (repaired raw), clamped } or throws bad_arguments.
+ */
+function parseArgs(cmd, name, args, cls) {
+  const a = { ...args };
+  const clamped = {};
+  const mayClamp = cls === 'read' || a.dry_run === true || a.dry_run === 'true';
+  for (let round = 0; round < 4; round++) {
+    const parsed = cmd.args.safeParse(a);
+    if (parsed.success) return { data: parsed.data, args: a, clamped };
+    let fixed = false;
+    for (const i of parsed.error.issues) {
+      if (i.path.length !== 1) continue;
+      const k = i.path[0];
+      const v = a[k];
+      if (i.code === 'invalid_type' && i.expected === 'number' && typeof toNumber(v) === 'number') { a[k] = toNumber(v); fixed = true; }
+      else if (i.code === 'invalid_type' && i.expected === 'string' && typeof v === 'number') { a[k] = String(v); fixed = true; }
+      else if (i.code === 'invalid_type' && i.expected === 'number' && typeof v === 'string' && v.trim() === '') { delete a[k]; fixed = true; }
+      else if (mayClamp && (i.code === 'too_big' || i.code === 'too_small') && i.origin === 'number' && i.inclusive !== false && typeof toNumber(v) === 'number') {
+        const to = Number(i.code === 'too_big' ? i.maximum : i.minimum);
+        clamped[k] = { from: toNumber(v), to };
+        a[k] = to;
+        fixed = true;
+      }
+    }
+    if (!fixed) throw new Error(`bad_arguments: bad arguments for ${name}: ${argErrors(parsed.error, a)}`);
+  }
+  throw new Error(`bad_arguments: bad arguments for ${name}: could not repair them`);
+}
+
+/**
+ * Validate and run one command; the full enveloped result (no output shaping). The daemon and the
+ * relay serve this; callers shape it once (runCommand / dispatch). opts.readOnly: L12 gate.
+ * Throws with a readable `code: text` message on bad arguments.
+ */
+export async function executeCommand(ctx, name, rawArgs = {}, { readOnly = false } = {}) {
   const cmd = COMMANDS_BY_NAME.get(name);
-  if (!cmd) throw new Error(`unknown command '${name}'. Run: openttd-agent help`);
+  if (!cmd) throw new Error(`unknown_command: unknown command '${name}'. Run: openttd-agent help`);
+  const known = Object.keys(cmd.args.shape ?? {});
+  const cls = commandClass(name, known);
+  let args = aliasArgs(known, dropNulls(rawArgs));
+  // L13: flags that cannot mean anything here are dropped with a note instead of failing the call.
+  const ignored = [];
+  const ignore = (k) => { delete args[k]; ignored.push(k); };
+  if (cls === 'read') for (const k of ['dry_run', 'list']) if (k in args && !known.includes(k)) ignore(k);
+  if (name === 'vehicle-depot' && args.depot === 'auto' && !known.includes('depot')) ignore('depot');
   // Refuse unknown keys: a mistyped or `--help` flag must never run the command with defaults
   // (`turn-advance --help` once advanced the game 30 days).
-  const known = Object.keys(cmd.args.shape ?? {});
-  const args = aliasArgs(known, rawArgs ?? {});
   const unknown = Object.keys(args).filter((k) => !known.includes(k));
   if (unknown.length) {
-    throw new Error(`unknown argument${unknown.length > 1 ? 's' : ''} for ${name}: ${unknown.map((k) => `--${k}`).join(', ')}. Valid: ${known.map((k) => `--${k}`).join(' ') || '(none)'}. Nothing was run.`);
+    throw new Error(`unknown_argument: unknown argument${unknown.length > 1 ? 's' : ''} for ${name}: ${unknown.map((k) => `--${k}`).join(', ')}. Valid: ${known.map((k) => `--${k}`).join(' ') || '(none)'} (and on every command: --fields --brief --compact --steps). Nothing was run.`);
   }
-  const parsed = cmd.args.safeParse(args);
-  if (!parsed.success) throw new Error(`bad arguments for ${name}: ${argErrors(parsed.error, args)}`);
+  let forced = false;
+  if (readOnly) ({ args, forced } = readOnlyGate(name, known, args));
+  const parsed = parseArgs(cmd, name, args, cls);
+  const notes = {
+    ...(forced ? { forced_dry_run: true } : {}),
+    ...(Object.keys(parsed.clamped).length ? { clamped: parsed.clamped } : {}),
+    ...(ignored.length ? { ignored_args: ignored } : {}),
+  };
+  const withNotes = (res) => (Object.keys(notes).length ? { ...res, ...notes } : res);
   // Player with a relay configured: the host's relay runs every game command (it holds the admin connection and the map mirror).
   if (cmd.session && ctx.cfg.relay) {
-    const res = envelope(await callRelay(ctx.cfg, name, args));
+    const res = envelope(await callRelay(ctx.cfg, name, parsed.args));
     const host = res.versions?.openttd_agent;
     if (name === 'status' && host && host !== VERSION) {
       res.warnings = [...(res.warnings ?? []), `the host's relay runs openttd-agent ${host}, you run ${VERSION}: use the same version (npx -y github:mmmnorthmark/openttd-agent#v${host} ...)`];
     }
-    return res;
+    return withNotes(res);
   }
-  return envelope(await cmd.run(ctx, parsed.data));
+  return withNotes(envelope(await cmd.run(ctx, parsed.data)));
 }
 
+/**
+ * Validate, run and shape one command: the library and in-process entry. Takes the reserved
+ * output args (fields, brief, compact, steps; see src/output.js) besides the command's own.
+ */
+export async function runCommand(ctx, name, rawArgs = {}, opts = {}) {
+  const cmd = COMMANDS_BY_NAME.get(name);
+  const { args, output } = takeOutputArgs(rawArgs, cmd ? Object.keys(cmd.args.shape ?? {}) : []);
+  return shapeResult(await executeCommand(ctx, name, args, opts), output);
+}
+
+/** JSON schema of a command's arguments as callers send them (io: 'input', as MCP tools/list shows). */
+export const argsJsonSchema = (cmd) => z.toJSONSchema(cmd.args, { io: 'input' });
+
 export function describeCommands() {
-  return COMMANDS.map((c) => ({ name: c.name, group: c.group, description: c.description, needs_game: c.session, args: z.toJSONSchema(c.args) }));
+  return COMMANDS.map((c) => ({ name: c.name, group: c.group, description: c.description, needs_game: c.session, args: argsJsonSchema(c) }));
 }
