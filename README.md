@@ -19,16 +19,16 @@ release) is refused with `untested_openttd_version` until you pass `--accept_unt
 Nothing to clone: run it straight from GitHub with `npx`, pinned to a release tag.
 
 ```sh
-npx -y github:mmmnorthmark/openttd-agent#v0.7.0 doctor      # checks OpenTTD, graphics, GameScript
+npx -y github:mmmnorthmark/openttd-agent#v0.8.0 doctor      # checks OpenTTD, graphics, GameScript
 ```
 
 Every example below writes `openttd-agent ...`. Either make that a short alias for the `npx` form:
 
 ```sh
-alias openttd-agent='npx -y github:mmmnorthmark/openttd-agent#v0.7.0'   # add to ~/.zshrc or ~/.bashrc
+alias openttd-agent='npx -y github:mmmnorthmark/openttd-agent#v0.8.0'   # add to ~/.zshrc or ~/.bashrc
 ```
 
-or install it once: `npm i -g github:mmmnorthmark/openttd-agent#v0.7.0`.
+or install it once: `npm i -g github:mmmnorthmark/openttd-agent#v0.8.0`.
 
 **Versions.** Releases follow [semver](https://semver.org) and are git tags `vX.Y.Z`
 ([CHANGELOG.md](CHANGELOG.md)); `main` may be ahead of the latest release. To update, change the
@@ -40,10 +40,10 @@ loads the game again (a running game keeps the GameScript it started with).
 Claude Code, as MCP tools:
 
 ```sh
-claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.7.0 mcp
+claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.8.0 mcp
 ```
 
-Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.7.0", "mcp"]`.
+Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.8.0", "mcp"]`.
 For a small or fast model, expose only the tools it needs (unreleased, on `main`):
 `openttd-agent mcp --tools goal-status,stations,vehicles,find-cargo-pairs,build-cargo-route` (or
 `OPENTTD_AGENT_TOOLS=a,b`). MCP results are one-line JSON (`--compact false` indents them);
@@ -173,10 +173,10 @@ starts nothing and prints no secrets; agents should run it first.
 3. Connect your agent. Claude Code:
 
    ```sh
-   claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.7.0 mcp
+   claude mcp add openttd -- npx -y github:mmmnorthmark/openttd-agent#v0.8.0 mcp
    ```
 
-   Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.7.0", "mcp"]`.
+   Any other MCP client: command `npx`, args `["-y", "github:mmmnorthmark/openttd-agent#v0.8.0", "mcp"]`.
    Or let the agent use the CLI directly (`openttd-agent help`; every command prints JSON).
 
 ### Several players or agents on one machine (profiles)
@@ -524,7 +524,7 @@ openttd-agent unpause
 | A command says AgentBridge is older than vN | The host runs `install-gamescript`, then loads the game again (`launch --load <save>`). |
 | GS replies stop; log says "The script died unexpectedly" | Look in the launch profile's `openttd.log`; report it with the command you ran. |
 | Can't join from another machine | Launch with `--bind 0.0.0.0` and allow OpenTTD through the firewall (TCP 3979). |
-| Changed the code, behaviour didn't change | The CLI restarts a daemon whose code differs (unreleased, on `main`); on 0.7.0 and before: `openttd-agent daemon-stop`. |
+| Changed the code, behaviour didn't change | The CLI restarts a daemon whose code differs (0.8.0 and later); on 0.7.0 and before: `openttd-agent daemon-stop`. |
 | `warnings: daemon_config_mismatch` | The background daemon runs with other settings (env such as `OPENTTD_AGENT_COMPANY`); the call ran in its own process. Give those settings their own daemon with `OPENTTD_AGENT_DAEMON_PORT`. |
 | `warnings: background_job_not_kept` | A pending sale, wagon attach or periodic save was started with `--no-daemon` (or a profile) and ends with that process; run it through the daemon or a running MCP server. |
 | `daemon_timeout` | No reply within `OPENTTD_AGENT_CALL_TIMEOUT_S` (default 3600 s); the command may still be running in the daemon. |

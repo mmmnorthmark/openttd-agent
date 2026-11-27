@@ -3,7 +3,24 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
-## 0.8.0 (unreleased)
+## 0.8.0 (2026-11-27)
+
+This release comes from a review of every agent log so far: 6,064 tool calls across a multiplayer game night, the dev sessions and the local-model runs. It is aimed at fewer calls, less output and fewer failures. Headlines:
+- **One contract for CLI and MCP,** enforced by a parity test over every command.
+- **Output controls:** `--fields`, `--brief` and compact output.
+- **Read-only mode,** and forgiving arguments.
+- **Host tools:** load, saves, `server-stop`, `console` and `server-log`; `launch` waits until the game is ready; `install-gamescript --reload`.
+- **Background jobs** persist across restarts.
+- **Rail safety:** loop-aware clone and add-train, and loop-signal protection; route checks come back in build results.
+- **Road and fleet tools:** a sell queue, `wait`, per-route `vehicle-buy`, `road-stop-sites`, explained money and local-authority failures.
+- **`overview`** in one call.
+- **AgentBridge v14,** which also runs on OpenTTD 14.x.
+- **Version gating** and a sandboxed version matrix across 14.0–15.3.
+- **Network diagnostics** (`net-check`).
+- **First-run checks.**
+
+Breaking changes are marked **Breaking** in each section below.
+
 
 Hardening (batch 8):
 
