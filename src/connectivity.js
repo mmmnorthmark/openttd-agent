@@ -282,6 +282,7 @@ export async function traceRoad({ getTile, starts, isGoal, goal, company, maxSte
 
 const SIGNAL_BITS = 0xFF; // rail_tiles signals: bit d one-way, bit 4+d any signal facing trains from neighbour d
 const LOOP_TILE_KINDS = new Set(['t', 's', 'w']);
+const straightPiece = (t) => t.tracks === 1 || t.tracks === 2; // one straight piece: room for a waiting train (curves at the loop ends are not)
 
 /**
  * Walk a branch that leaves tile `from` through edge `d`, following the only track exit on each
@@ -314,8 +315,8 @@ async function walkBranch(getTile, from, d, index, fromIndex, maxBranch) {
  * [{x, y}] in order) where a second track leaves the line and joins it again further along. Not
  * loops: terminus throats (the branch ends in a platform), depot spurs and branches to other lines
  * (they never rejoin), crossings (no branch). getTile(x, y) -> rail_tiles tile (may be async).
- * clear_tiles = min(line tiles between the points, branch tiles minus its two curves) - 1, the
- * room a waiting train has (build-passing-loop's clear_tiles); signals_ok = both sides have a
+ * clear_tiles = min(straight tiles between the points on the line, straight tiles of the branch) - 1,
+ * the room a waiting train has (build-passing-loop's clear_tiles; the same from either side); signals_ok = both sides have a
  * signal (without one on each side the loop is one block and trains cannot pass there).
  * Returns [{ from_index, to_index, at: {x, y}, end: {x, y}, line_tiles, branch_tiles, clear_tiles,
  * line_signal, branch_signal, signals_ok }] in path order.
@@ -339,10 +340,14 @@ export async function findLoops({ path, getTile, maxBranch = 80 }) {
       const w = await walkBranch(getTile, t, b, index, i, maxBranch);
       if (!w) continue;
       const between = path.slice(i + 1, w.to_index);
-      let lineSignal = false;
-      for (const p of between) if (((await getTile(p.x, p.y))?.signals ?? 0) & SIGNAL_BITS) lineSignal = true;
+      let lineSignal = false, lineStraight = 0;
+      for (const p of between) {
+        const q = await getTile(p.x, p.y);
+        if ((q?.signals ?? 0) & SIGNAL_BITS) lineSignal = true;
+        if (q && straightPiece(q)) lineStraight++;
+      }
       const branchSignal = w.tiles.some((q) => (q.signals ?? 0) & SIGNAL_BITS);
-      const clear = Math.max(0, Math.min(between.length, w.tiles.length - 2) - 1);
+      const clear = Math.max(0, Math.min(lineStraight, w.tiles.filter(straightPiece).length) - 1);
       loops.push({ from_index: i, to_index: w.to_index, at: { x: t.x, y: t.y }, end: { x: path[w.to_index].x, y: path[w.to_index].y },
         line_tiles: between.length, branch_tiles: w.tiles.length, clear_tiles: clear, line_signal: lineSignal, branch_signal: branchSignal, signals_ok: lineSignal && branchSignal });
     }

@@ -144,6 +144,10 @@ test('findLoops: a real passing loop, its clear tiles and signals; throats and s
   const [loop, ...rest] = await trace(loopLine());
   assert.equal(rest.length, 0);
   assert.deepEqual([loop.at, loop.end, loop.line_tiles, loop.branch_tiles, loop.clear_tiles, loop.signals_ok], [{ x: 9, y: 5 }, { x: 16, y: 5 }, 6, 8, 5, true]);
+  // The same loop seen from its loop side (a path through the lane): the same clear tiles.
+  const lanePath = [[8, 5], [9, 5], [9, 6], [10, 6], [11, 6], [12, 6], [13, 6], [14, 6], [15, 6], [16, 6], [16, 5], [17, 5]].map(([x, y]) => ({ x, y }));
+  const [fromLane] = await findLoops({ path: lanePath, getTile: world(loopLine()) });
+  assert.deepEqual([fromLane.at, fromLane.end, fromLane.clear_tiles, fromLane.signals_ok], [{ x: 9, y: 5 }, { x: 16, y: 5 }, 5, true]);
   const bare = await trace(loopLine({ signals: false }));
   assert.deepEqual([bare.length, bare[0].signals_ok, bare[0].line_signal], [1, false, false]);
   // A spur to a dead end (or a depot) and a second platform of a terminus never rejoin the line.
