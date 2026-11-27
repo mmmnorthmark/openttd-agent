@@ -71,6 +71,12 @@ runtime library list in it is complete (a failing job prints the missing ones wi
 | 15.2 | verified | 15.2 | 15.2 | v14 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok |
 | 15.3 | verified | 15.3 | 15.3 | v14 | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok | ok |
 
+Re-run on the final 0.8.0 hardening tree (after merging the rail, fleet and observation batches): same result.
+
+Saves do not travel to older versions: 14.1 loading a 15.3 save fails ("Savegame is made with
+newer version"); `load` answers `save_too_new` (the server has started a new random game instead) and
+`launch --load` reports why the server exited.
+
 Not in `TESTED_VERSIONS`, run for information with the acceptance set:
 
 | OpenTTD | result |
