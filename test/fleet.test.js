@@ -116,3 +116,17 @@ test('a road refused on a slope: sloped_tile with at and a hint', async () => {
     assert.match(res.hint, /terraform --op level/);
   } finally { fake.state.slopeOps = []; }
 });
+
+// ---- R1 / G8: ids in build results ------------------------------------------------------------
+
+test('build results carry the station id and the depot tile', async () => {
+  const rs = await run('build-rail-station', { x: 10, y: 20 });
+  assert.deepEqual(rs.station, { id: 3, name: 'Bigton Woods' });
+  const bus = await run('build-road-station', { x: 41, y: 9, front_x: 42, front_y: 9, kind: 'bus', drive_through: true });
+  assert.deepEqual(bus.station, { id: 4, name: 'Bigton Central' });
+  const rd = await run('build-road-depot', { x: 36, y: 8, front_x: 36, front_y: 9 });
+  assert.deepEqual([rd.depot, rd.front], [{ x: 36, y: 8 }, { x: 36, y: 9 }]);
+  const dd = await run('build-rail-depot', { x: 13, y: 22, front_x: 13, front_y: 21 });
+  assert.deepEqual(dd.depot, { x: 13, y: 22 });
+  assert.equal((await run('build-rail-station', { x: 10, y: 20, dry_run: true })).station, undefined);
+});

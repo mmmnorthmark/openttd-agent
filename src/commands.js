@@ -1250,6 +1250,21 @@ async function driveThroughRefusal(s, company, a) {
   return why;
 }
 
+/**
+ * The station a build just made or joined at tile x,y (R1): rail_tiles (v9) / road_tiles (v11) give the
+ * station id on that tile; else the nearest of the company's stations within `reach` tiles. { id, name } or null.
+ */
+async function builtStationAt(s, company, x, y, kind, reach = 2) {
+  const v = (await s.gs.call('info')).bridge_version ?? 0;
+  let id = -1;
+  if (kind === 'rail' && v >= 9) id = (await s.gs.call('rail_tiles', { x0: x, y0: y, x1: x, y1: y }))[0]?.[4] ?? -1;
+  if (kind === 'road' && v >= 11) id = (await s.gs.call('road_tiles', { company, x0: x, y0: y, x1: x, y1: y }))[0]?.[4] ?? -1;
+  const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+  const hit = id >= 0 ? stations.find((st) => st.id === id)
+    : stations.map((st) => ({ st, d: tileDistance(st, { x, y }) })).filter((e) => e.d <= reach).sort((p, q) => p.d - q.d)[0]?.st;
+  return hit ? { id: hit.id, name: hit.name } : null;
+}
+
 /** Run exec steps as the company (client throttle + GS rate gate apply; failures explained, see execExplained). */
 async function run(ctx, a, steps, opts = {}) {
   const { s, company } = await mine(ctx, a);
@@ -2707,9 +2722,14 @@ export const COMMANDS = [
   },
   {
     name: 'build-rail-station', group: 'build', session: true,
-    description: 'Build a rail station with its lowest-x/y corner at x,y. axis=x: platforms run along x and are stacked along y (axis=y: the reverse). Trains enter at either end of a platform.',
+    description: 'Build a rail station with its lowest-x/y corner at x,y. axis=x: platforms run along x and are stacked along y (axis=y: the reverse). Trains enter at either end of a platform. A real build returns station {id, name} (the new or joined station).',
     args: z.object({ ...act, ...borrow, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(20).default(1), length: int().min(1).max(20).default(4), ...join, rail_type: int().optional() }),
-    run: (ctx, a) => run(ctx, a, [['rail_station', a.x, a.y, a.axis === 'y', a.platforms, a.length, joinArg(a.join)]], { railType: a.rail_type }),
+    run: async (ctx, a) => {
+      const res = await run(ctx, a, [['rail_station', a.x, a.y, a.axis === 'y', a.platforms, a.length, joinArg(a.join)]], { railType: a.rail_type });
+      if (!res.ok || a.dry_run) return res;
+      const { s, company } = await mine(ctx, a);
+      return { ...res, station: await builtStationAt(s, company, a.x, a.y, 'rail', a.platforms + a.length) };
+    },
   },
   {
     name: 'build-rail-depot', group: 'build', session: true,
@@ -2719,7 +2739,7 @@ export const COMMANDS = [
       const { s, company } = await mine(ctx, a);
       const res = await run(ctx, a, [['rail_depot', a.x, a.y, a.front_x, a.front_y]], { railType: a.rail_type });
       const dir = TRACE_DIRS.findIndex(([dx, dy]) => a.x + dx === a.front_x && a.y + dy === a.front_y);
-      const out = { ...res, exit_dir: DIR_NAMES[dir] ?? null };
+      const out = { ...res, exit_dir: DIR_NAMES[dir] ?? null, ...(res.ok && !a.dry_run ? { depot: { x: a.x, y: a.y }, next: `vehicle-buy --depot_x ${a.x} --depot_y ${a.y} --engine <id>` } : {}) };
       if (dir < 0 || !res.ok) return out;
       let t = null;
       try { t = (await s.gs.call('rail_tiles', { x0: a.front_x, y0: a.front_y, x1: a.front_x, y1: a.front_y }))[0]; } catch { return out; }
@@ -2967,7 +2987,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-road-station', group: 'build', session: true,
-    description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis; not on junctions). A normal (bay) stop also gets the road piece on front that joins its entrance. Returns connected (AgentBridge v11): true when the entrance (or one end of a drive-through stop) joins a road beyond it. connect=auto builds a road from the entrance to the nearest road when it does not. A refused drive-through stop says why where it can tell (junction, one_way_road, other_owner_road, slope).',
+    description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis; not on junctions). A normal (bay) stop also gets the road piece on front that joins its entrance. Returns station {id, name} (the new or joined station) and connected (AgentBridge v11): true when the entrance (or one end of a drive-through stop) joins a road beyond it. connect=auto builds a road from the entrance to the nearest road when it does not. A refused drive-through stop says why where it can tell (junction, one_way_road, other_owner_road, slope).',
     args: z.object({ ...act, ...borrow, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join,
       connect: z.enum(['none', 'auto']).default('none').describe('auto = when the entrance does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
@@ -2981,18 +3001,22 @@ export const COMMANDS = [
         const why = await driveThroughRefusal(s, company, a);
         if (why.length) return { ...res, error: `drive_through_refused: ${why.join('; ')} (game: ${res.results[0].error ?? 'failed'})`, first_error: 'drive_through_refused', reasons: why };
       }
-      return withRoadJoin(s, company, a, res, a.drive_through ? 'drive_through' : 'bay');
+      const out = await withRoadJoin(s, company, a, res, a.drive_through ? 'drive_through' : 'bay');
+      if (!out.ok || a.dry_run) return out;
+      return { ...out, station: await builtStationAt(s, company, a.x, a.y, 'road') };
     },
   },
   {
     name: 'build-road-depot', group: 'build', session: true,
-    description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile), plus the road piece on front that joins the entrance. Returns connected (AgentBridge v11): true when the front tile joins a road beyond it. connect=auto builds a road from the front tile to the nearest road when it does not.',
+    description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile), plus the road piece on front that joins the entrance. Returns depot {x, y} and front for vehicle-buy, and connected (AgentBridge v11): true when the front tile joins a road beyond it. connect=auto builds a road from the front tile to the nearest road when it does not.',
     args: z.object({ ...act, ...borrow, ...point, ...front,
       connect: z.enum(['none', 'auto']).default('none').describe('auto = when the front tile does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
       const res = await run(ctx, a, [['road_depot', a.x, a.y, a.front_x, a.front_y], ['road', a.front_x, a.front_y, a.x, a.y]], a.road_type !== undefined ? { roadType: a.road_type } : {});
       const { s, company } = await mine(ctx, a);
-      return withRoadJoin(s, company, a, res, 'depot');
+      const out = await withRoadJoin(s, company, a, res, 'depot');
+      if (!out.ok || a.dry_run) return out;
+      return { ...out, depot: { x: a.x, y: a.y }, front: { x: a.front_x, y: a.front_y }, next: `vehicle-buy --depot_x ${a.x} --depot_y ${a.y} --engine <id> (engines --type road)` };
     },
   },
 
