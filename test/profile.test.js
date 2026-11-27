@@ -36,14 +36,31 @@ test('launch (dry run) writes AgentBridge as the only game script and names the 
   fs.mkdirSync(personal);
   fs.writeFileSync(path.join(personal, 'openttd.cfg'), '[game_scripts]\nnone = \n\n[network]\nserver_name = mine\n');
   const env = { OPENTTD_AGENT_HOME: home, OPENTTD_AGENT_LOG: 'error', OPENTTD_EXE: process.execPath, OPENTTD_PERSONAL_DIR: personal };
-  const res = await cli(env, 'launch', '--mode', 'dedicated', '--admin_password', 'pw', '--bind', '10.9.8.7', '--dry_run', 'true');
-  assert.equal(res.admin_host, 'would be saved as host: 10.9.8.7');
+  const res = await cli(env, 'launch', '--mode', 'dedicated', '--admin_password', 'pw', '--bind', '198.51.100.7', '--dry_run', 'true');
+  assert.equal(res.admin_host, 'would be saved as host: 198.51.100.7');
+  assert.ok(res.would_write.some((f) => f.endsWith(path.join('dedicated', 'openttd.cfg'))));
+  assert.equal(fs.existsSync(path.join(home, 'profiles')), false, 'a dry run writes nothing (S1)');
+  assert.equal(fs.existsSync(path.join(home, 'config.json')), false, 'a dry run saves no config');
+  // A real launch (the "executable" is node, which exits at once): no wait, so nothing needs to answer.
+  const real = await cli(env, 'launch', '--mode', 'dedicated', '--admin_password', 'pw', '--bind', '198.51.100.7', '--wait', 'false', '--game_port', '45679', '--admin_port', '45677');
+  assert.equal(real.ok, true);
+  assert.equal(real.server, 'dedicated');
+  assert.match(real.side_server, /--server dedicated/, 'admin port 45677 is not the configured one');
   const cfg = fs.readFileSync(path.join(home, 'profiles', 'dedicated', 'openttd.cfg'), 'utf8');
   assert.match(cfg, /\[game_scripts\]\nAgentBridge = command_delay_ticks=0,max_builds_per_day=0\n/);
   assert.doesNotMatch(cfg, /^none =/m);
+  assert.match(cfg, /server_admin_port = 45677/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(home, 'profiles', 'dedicated', 'server.json'), 'utf8')),
+    { mode: 'dedicated', game_port: 45679, admin_port: 45677, bind: '198.51.100.7', host: '198.51.100.7' });
   const priv = fs.readFileSync(path.join(home, 'profiles', 'dedicated', 'private.cfg'), 'utf8');
   assert.match(priv, /client_name = openttd-agent server/);
   assert.match(priv, /server_name = openttd-agent game/);
+  // A second launch rotates the log.
+  fs.writeFileSync(path.join(home, 'profiles', 'dedicated', 'openttd.log'), 'old run\n');
+  const again = await cli(env, 'launch', '--server', 'dedicated', '--admin_password', 'pw', '--bind', '198.51.100.7', '--wait', 'false');
+  assert.equal(again.admin_port, 45677, '--server reuses the ports it used last time');
+  assert.deepEqual(again.log_rotated, ['openttd.log -> openttd.log.1']);
+  assert.match(fs.readFileSync(path.join(home, 'profiles', 'dedicated', 'openttd.log.1'), 'utf8'), /^old run\n/, 'the first child may still append to it');
   const doc = await cli(env, 'doctor');
   assert.equal(doc.launch_profile_game_scripts, undefined, 'the rewritten profile is fine');
   fs.mkdirSync(path.join(home, 'profiles', 'old'));

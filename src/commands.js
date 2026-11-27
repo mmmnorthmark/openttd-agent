@@ -5,10 +5,15 @@
 // ctx: { cfg, session() -> Promise<Session> } — session() connects lazily.
 
 import os from 'node:os';
+import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import * as z from 'zod/v4';
-import { doctor, installGamescript, launch, checkSaveName, bundledGsVersion, TERRAIN_TYPES } from './setup.js';
+import { doctor, installGamescript, launch, findExecutable, findPersonalDir, checkSaveName, bundledGsVersion, adminHostForBind, profileDir, TERRAIN_TYPES } from './setup.js';
+import { serverTarget, serverStates, profilePorts, serverPids, waitReady, notReadyDetail, stopServer, withAdmin, loadSave, listSaves, companyNew, reloadGamescript, logTail, portOpen } from './host.js';
 import { VERSION } from './version.js';
+import { connectionHint, diagnoseAddress, hostCheck, playerCheck, listeners } from './netcheck.js';
+import { installOpenGfx, findBasesets, freeBytes, diskWarning, keepAwakeHint, portHolderText, loadProblem, loadProblemText } from './preflight.js';
+import { classifyVersion, versionRefusal, acceptUntested, detectInstalledVersion, compareHostClient, installHint } from './versions.js';
 import { saveConfig, redacted, CONFIG_FILE } from './config.js';
 import { callRelay } from './relay-client.js';
 import { prepareScenario } from './scenario.js';
@@ -19,21 +24,35 @@ import { ratingTable, vehicleLine, stationLine, vehicleTypeId, cargoId, cargoMat
   encodeOrderFlags, ORDER_FLAG_HELP, VEHICLE_TYPES, VEHICLE_STATES, FACILITIES, parseGoalTargets, goalFromRow, findExistingRoute } from './operate.js';
 import { planPath, railSteps, roadSteps, terminusSteps, terminusCandidates, terminusFootprint, depotCandidates, depotSteps, passingLoopSteps, passingLoopRemoveSteps, loopSiteProblem, loopSites, spreadLoops, plannedRail, dirIndex, SIGNAL_TYPES, DIR_NAMES } from './planner.js';
 import { overlayMap, terminusCells, pathCells, defaultWagons, pickTrain, routeOrderFlags, oppositeDir } from './route.js';
-import { traceRail, traceRoad, trackExits, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
+import { traceRail, traceRoad, trackExits, trackEdges, findLoops, adjacencyTrace, mirrorStationTiles, railTileFromRow, roadTileFromRow, DIRS as TRACE_DIRS } from './connectivity.js';
 import { recordProgress, recordStall, deadlockPartners, vehicleProblems, manhattan as tileDistance } from './problems.js';
-import { routeEffort, findCargoPairs, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
+import { routeEffort, findCargoPairs, pairKey, townGaps, findFlatSites, manhattan, acceptanceFromRows, ACCEPTED, DEFAULT_COSTS } from './world.js';
 import { envelope, errorCode, listResult } from './envelope.js';
+import { takeOutputArgs, shapeResult } from './output.js';
+import { dateString, meFromCompanies, companyProfit, tilesText, splitBox, tileBox, filterStations, wordList, filterEvents, eventLine,
+  shortStationLine, shortVehicleLine, fleetLine, goalLine, problemGroups, depotsLine, rivalLine } from './observe.js';
+import { commandClass, readOnlyGate } from './readonly.js';
 import { truckStopCandidates, townStopCandidates, roadDepotCandidates, pickTruck, stopConnect } from './truck.js';
 import { normaliseRect, checkLandRect, boughtRects, mergeTiles, ownedLandCandidates, MAX_LAND_TILES } from './land.js';
+import { townRatingFromRow, authorityNeed, RATING_HINT, moneyDetail, soldText, loadsFromRows, waitMatch, WAIT_STATES, filterVehicles, sortVehicles, fleetBuckets, VEHICLE_SORTS, parseSelect } from './fleet.js';
 
-const int = () => z.coerce.number().int();
-const num = () => z.coerce.number();
+// Strict numbers (0.8.0): plain z.number(); runCommand (parseArgs) turns a numeric string ("12", " -3 ")
+// into its number. null, "", false and [] are no longer 0 (company 0 is a real company).
+const toNumber = (v) => (typeof v === 'string' && /^\s*-?\d+(\.\d+)?\s*$/.test(v) ? Number(v) : v);
+const int = () => z.number().int();
+const num = () => z.number();
 const bool = () => z.preprocess((v) => (v === 'true' ? true : v === 'false' ? false : v), z.boolean());
 const point = { x: int().describe('tile x'), y: int().describe('tile y') };
 /** "1,2,3" | 5 | [1,2] -> [ints] */
-const ids = () => z.preprocess((v) => (Array.isArray(v) ? v : String(v).split(',').filter((t) => t.trim() !== '')), z.array(int()).min(1));
+const idList = (v) => {
+  const list = Array.isArray(v) ? v : typeof v === 'number' || typeof v === 'string' ? String(v).split(',').filter((t) => t.trim() !== '') : v;
+  return Array.isArray(list) ? list.map(toNumber) : list;
+};
+const ids = () => z.preprocess(idList, z.array(int()).min(1));
 const who = { company: int().optional().describe('company id; default: your configured company') };
+const serverArg = { server: z.string().optional().describe('launch profile of the server (launch --server NAME); default: the server at the configured admin_port') };
 const act = { ...who, dry_run: bool().default(false).describe('true = cost/feasibility only, changes nothing') };
+const borrow = { borrow_if_needed: bool().default(false).describe('when the game refuses for lack of money, borrow what the rest costs (within max_loan) and carry on') };
 const lc = (v) => String(v).toLowerCase();
 const PAIR_MIN_DIST = 20, PAIR_MAX_DIST = 200; // find-cargo-pairs defaults (tiles, Manhattan)
 /** Non-loopback IPv4 addresses of this machine (what players put in their relay URL). */
@@ -42,16 +61,7 @@ const lanAddresses = () => Object.values(os.networkInterfaces()).flat().filter((
 /** Is `company` another company than the caller's own (cfg.company; through the relay the player's)? */
 const isRival = (s, company) => s.cfg.company !== null && s.cfg.company !== undefined && company !== s.cfg.company;
 
-/**
- * Where this machine's CLI reaches the admin port of a server bound to `bind`: 127.0.0.1 for a
- * wildcard or loopback bind, else the bound address itself (a server on 10.0.0.5 only does not
- * answer on 127.0.0.1). Several addresses: the first.
- */
-export function adminHostForBind(bind) {
-  const first = String(bind ?? '').split(',')[0].trim().replace(/^\[|\]$/g, '');
-  if (!first || first === '0.0.0.0' || first === '::' || /^127\./.test(first) || first === 'localhost' || first === '::1') return '127.0.0.1';
-  return first;
-}
+export { adminHostForBind } from './setup.js';
 
 /** Session + company for read commands. */
 async function mine(ctx, a) {
@@ -121,13 +131,13 @@ async function buildPath(ctx, a, mode) {
   const steps = (mode === 'rail' ? railSteps : roadSteps)(plan, { bridgeType: bridgeType(a.bridge) });
   const out = { reachable: true, ...plan.stats, ...(a.show_path ? { path: plan.tiles } : {}) };
   if (a.plan_only) return { ...out, steps_total: steps.length, steps };
-  if (!a.dry_run) s.throttleBuild();
-  const res = await s.exec(company, steps, { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) });
+  const opts = { dryRun: a.dry_run, ...(a.rail_type !== undefined ? { railType: a.rail_type } : {}), ...(a.road_type !== undefined ? { roadType: a.road_type } : {}) };
+  const res = await vehiclesInTheWay(s, company, steps, await execWaitClear(s, company, steps, opts, a.wait_clear_s ?? 0, a));
   if (!a.dry_run) await s.refreshArea(...box);
   return { ...out, ...res };
 }
 const pathArgs = {
-  ...act, x1: int(), y1: int(), x2: int(), y2: int(),
+  ...act, ...borrow, x1: int(), y1: int(), x2: int(), y2: int(),
   start_dir: z.enum(DIR_NAMES).optional().describe('force the first step out of x1,y1: sw=+x, se=+y, ne=-x, nw=-y'),
   end_dir: z.enum(DIR_NAMES).optional().describe('force the direction of the last step into x2,y2'),
   margin: int().min(2).max(80).default(20).describe('how far outside the two points the path may wander'),
@@ -185,7 +195,20 @@ async function loanState(s, company) {
 }
 
 /** Town by id or exact name (case-insensitive). */
-const findTown = (towns, v) => towns.find((t) => String(t.id) === String(v) || t.name.toLowerCase() === String(v).toLowerCase());
+/**
+ * Town by id or exact name (case-insensitive); else (L13) the longest town name a station-style
+ * name starts with ("Bigton Woods" -> Bigton), else the one town whose name starts with the text.
+ * A fallback match carries matched_from (what was asked).
+ */
+export function findTown(towns, v) {
+  const want = String(v).trim().toLowerCase();
+  const exact = towns.find((t) => String(t.id) === want || t.name.toLowerCase() === want);
+  if (exact || !want) return exact;
+  const prefixOf = towns.filter((t) => want.startsWith(`${t.name.toLowerCase()} `)).sort((p, q) => q.name.length - p.name.length)[0];
+  const startsWith = towns.filter((t) => t.name.toLowerCase().startsWith(want));
+  const hit = prefixOf ?? (startsWith.length === 1 ? startsWith[0] : undefined);
+  return hit ? { ...hit, matched_from: String(v) } : undefined;
+}
 
 /**
  * One end of a line: { industry } | { town } | { x, y } -> { targets: tiles to be near, catchment, what, point: [x,y] }.
@@ -202,7 +225,8 @@ function lineEnd(s, { towns, industries }, end) {
   if (end.town !== undefined) {
     const t = findTown(towns, end.town);
     if (!t) throw new Error(`town '${end.town}' not found; run: openttd-agent towns`);
-    return { targets: [[t.x, t.y]], catchment: 4, what: `${t.name} centre ${t.x},${t.y}`, point: [t.x, t.y], kind: 'town', town: t };
+    const matched = t.matched_from ? ` (matched_town: '${t.matched_from}' -> ${t.name})` : '';
+    return { targets: [[t.x, t.y]], catchment: 4, what: `${t.name} centre ${t.x},${t.y}${matched}`, point: [t.x, t.y], kind: 'town', town: t };
   }
   if (end.x !== undefined && end.y !== undefined) return { targets: [[end.x, end.y]], catchment: 2, what: `tile ${end.x},${end.y}`, point: [end.x, end.y], kind: 'tile' };
   throw new Error('give --industry, --town, or --x and --y');
@@ -212,24 +236,26 @@ function lineEnd(s, { towns, industries }, end) {
  * station-sites: terminus spots near `end`, points facing `toward` (another end, or null), each
  * dry-run checked as `company`. opts: platforms, length, radius, limit. Used by station-sites and build-cargo-route.
  */
-async function stationSites(s, company, end, toward, { platforms = 2, length = 4, radius = 8, limit = 3, railType } = {}) {
+async function stationSites(s, company, end, toward, { platforms = 2, length = 4, radius = 8, limit = 3, railType, join = -1 } = {}) {
   const [economy] = await Promise.all([s.economy(), s.ensureTiles()]);
   const here = lineEnd(s, economy, end);
   const there = toward ? lineEnd(s, economy, toward).point : null;
   const cands = terminusCandidates(s.map, { targets: here.targets, radius, catchment: here.catchment, platforms, length, toward: there, max: 40 });
   const sites = []; let checked = 0;
+  const rejected = {}; // first failing step's error code -> count (L4)
   for (const c of cands) {
     if (sites.length >= limit || checked >= limit * 4) break;
     checked++;
-    const t = terminusSteps({ x: c.x, y: c.y, axis: c.axis, platforms: c.platforms, length: c.length, exitHigh: c.exit === 'high', join: -1 });
+    const t = terminusSteps({ x: c.x, y: c.y, axis: c.axis, platforms: c.platforms, length: c.length, exitHigh: c.exit === 'high', join });
     const res = await s.exec(company, t.steps, { dryRun: true, ...(railType !== undefined ? { railType } : {}) });
     const bad = (res.results ?? []).filter((r) => !r.ok && r.op !== 'signal');
-    if (bad.length) continue;
+    if (bad.length) { const code = errorCode(bad[0].error ?? 'failed') ?? 'failed'; rejected[code] = (rejected[code] ?? 0) + 1; continue; }
     sites.push({ x: c.x, y: c.y, axis: c.axis, exit: c.exit, platforms: c.platforms, length: c.length, cost: res.cost, connect_at: t.connect_at,
       tiles_from_target: c.gap, build: `build-terminus --x ${c.x} --y ${c.y} --axis ${c.axis} --exit ${c.exit} --platforms ${c.platforms} --length ${c.length}` });
   }
-  return { target: here.what, candidates_on_map: cands.length, dry_runs: checked, sites,
-    ...(sites.length ? {} : { hint: `no site passed: try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform` }) };
+  return { target: here.what, candidates_on_map: cands.length, dry_runs: checked, sites, ...(Object.keys(rejected).length ? { rejected } : {}),
+    ...(sites.length ? {} : { hint: cands.length ? 'no site passed its dry run (see rejected): try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform'
+      : 'no flat free spot of that size near the target on the map: try --radius 12, --length 3, --platforms 1, or clear land with demolish/terraform' }) };
 }
 
 /**
@@ -275,41 +301,60 @@ async function buildLineLoops(s, company, from, to, n, length, railType) {
 }
 
 /**
- * Passing loops on a traced line: points (tiles with more than one track piece) on the path, not in
- * a station and not the junction of a depot spur, counted in pairs. A heuristic: other junctions
- * on the line count too.
+ * Passing loops on a traced line (findLoops: a second track that leaves the line at points and
+ * rejoins it). Usable = signals on both sides and, with trainTiles, room for the train
+ * (clear_tiles >= trainTiles + 1). Returns { count: usable loops, loops: [...], unusable_loops: [...] },
+ * each { x, y (first points), end, clear_tiles, signals_ok, why? }.
  */
-async function countLoops(tracer, path) {
-  let points = 0;
-  // Terminus throats (points just outside the platforms) are not loops: skip 5 tiles past the
-  // last station tile at the start and before the first one at the end.
-  const kinds = [];
-  for (const p of path) kinds.push((await tracer.tileAt(p.x, p.y))?.kind ?? null);
-  let startEnd = 0;
-  while (startEnd + 1 < kinds.length && kinds[startEnd + 1] === 's') startEnd++;
-  let endStart = kinds.length - 1;
-  while (endStart - 1 >= 0 && kinds[endStart - 1] === 's') endStart--;
-  for (const [i, p] of path.entries()) {
-    if (i <= startEnd + 5 || i >= endStart - 5) continue;
-    const t = await tracer.tileAt(p.x, p.y);
-    if (!t || t.kind !== 't') continue;
-    const pieces = [1, 2, 4, 8, 16, 32].filter((b) => t.tracks & b).length;
-    if (pieces < 2) continue;
-    let spur = false;
-    for (const [dx, dy] of TRACE_DIRS) {
-      const n = await tracer.tileAt(p.x + dx, p.y + dy);
-      if (n && n.kind === 'd' && n.a === p.x && n.b === p.y) spur = true;
-      // A short spur to a depot one tile away.
-      if (n && n.kind === 't' && !path.some((q) => q.x === n.x && q.y === n.y)) {
-        for (const [ex, ey] of TRACE_DIRS) {
-          const m = await tracer.tileAt(n.x + ex, n.y + ey);
-          if (m && m.kind === 'd' && m.a === n.x && m.b === n.y) spur = true;
-        }
-      }
-    }
-    if (!spur) points++;
+async function lineLoops(tracer, path, { trainTiles = null } = {}) {
+  const out = { count: 0, loops: [], unusable_loops: [] };
+  for (const l of await findLoops({ path, getTile: tracer.tileAt })) {
+    const why = !l.signals_ok ? `no_signals: ${l.line_signal ? 'the loop side' : l.branch_signal ? 'the line side' : 'neither side'} has a signal, so trains cannot pass there`
+      : trainTiles && l.clear_tiles < trainTiles + 1 ? `too_short: ${l.clear_tiles} clear tiles; a ${trainTiles}-tile train needs ${trainTiles + 1}` : null;
+    const row = { x: l.at.x, y: l.at.y, end: l.end, clear_tiles: l.clear_tiles, signals_ok: l.signals_ok, ...(why ? { why } : {}) };
+    (why ? out.unusable_loops : out.loops).push(row);
   }
-  return Math.floor(points / 2);
+  out.count = out.loops.length;
+  return out;
+}
+
+/** Is `veh` (a vehicles row) losing money for a year or more? (vehicle-clone / add-train guard, L14) */
+const unprofitable = (veh) => veh.age_days >= 365 && veh.profit_last_year < 0 && veh.profit_this_year < 0;
+
+/** source_unprofitable refusal for cloning `veh`, or null. */
+const unprofitableRefusal = (veh) => (unprofitable(veh)
+  ? `source_unprofitable: vehicle ${veh.id} lost money last year (${veh.profit_last_year}) and this year (${veh.profit_this_year}); a clone copies a losing route. Check it with vehicle-problems --vehicles ${veh.id}, or pass --force true`
+  : null);
+
+/**
+ * Can `count` more trains run on vehicle `id`'s line? Trains on the line (same order stations,
+ * AgentBridge v12) against usable passing loops between its first two stations (v9 trace) and the
+ * longest train there. Returns { check, refusal (needs_loop text or null), tracer, stops }.
+ */
+async function lineCapacity(s, company, id, count, { cmd = 'add-train' } = {}) {
+  const info = await s.gs.call('info');
+  const stops = await orderStations(s, company, id);
+  if (stops.length < 2) return { check: null, refusal: null, tracer: null, stops };
+  const ids = await stationVehicleIds(s, company);
+  const sameLine = ids ? (ids.get(stops[0].id) ?? []).filter((v) => stops.every((st) => (ids.get(st.id) ?? []).includes(v))) : null;
+  const tracer = (info.bridge_version ?? 0) >= 9 ? await makeTracer(s, company, info) : null;
+  let loops = null, train = null;
+  if (tracer) {
+    const r = await tracer.trace(await tracer.stationStarts(stops[0]), stops[1]);
+    if (r.connected) {
+      train = await longestTrainOnLine(s, company, id);
+      loops = await lineLoops(tracer, r.path, { trainTiles: train.tiles });
+    }
+  }
+  const trains = sameLine ? sameLine.length : null;
+  const check = { trains_on_line: trains, passing_loops: loops?.count ?? null, after: trains === null ? null : trains + count, allowed: loops === null ? null : loops.count + 1,
+    ...(train ? { train_tiles: train.tiles } : {}), ...(loops ? { loops: loops.loops, unusable_loops: loops.unusable_loops } : {}) };
+  let refusal = null;
+  if (trains !== null && loops !== null && trains + count > loops.count + 1) {
+    const unusable = loops.unusable_loops.length ? ` (${loops.unusable_loops.length} more loop${loops.unusable_loops.length === 1 ? ' is' : 's are'} unusable: see check.unusable_loops)` : '';
+    refusal = `needs_loop: the line already runs ${trains} train${trains === 1 ? '' : 's'} with ${loops.count} usable passing loop${loops.count === 1 ? '' : 's'}${unusable}; ${trains + count} trains on single track need ${trains + count - 1} loops. Build one first: loop-sites --vehicle ${id}, or ${cmd} --force true`;
+  }
+  return { check, refusal, tracer, stops };
 }
 
 /** finishSales() result trimmed to one company (the relay serves several players from one session). */
@@ -388,21 +433,75 @@ export async function vehicleServing(s, company, stations, aId, bId) {
 }
 
 /**
+ * build-cargo-route --trains: clone `loco` up to `n` times in `depot` (shared orders) and start them,
+ * but only as many as the built line's usable passing loops allow (loops + 1 trains in all).
+ * Returns { vehicles, usable_loops, cost, warning?, error? }.
+ */
+async function cloneOnLine(s, company, from, to, depot, loco, n, trainTiles, exec) {
+  const tracer = await makeTracer(s, company, await s.gs.call('info'));
+  const r = await tracer.trace(await tracer.stationStarts(from), to);
+  const loops = r.connected && tracer.tileAt ? await lineLoops(tracer, r.path, { trainTiles }) : { count: 0, loops: [], unusable_loops: [] };
+  const k = Math.min(n, loops.count);
+  const out = { vehicles: [], usable_loops: loops.count, cost: 0 };
+  if (k < n) out.warning = `${1 + k} of ${1 + n} trains: the line has ${loops.count} usable passing loop${loops.count === 1 ? '' : 's'}${loops.unusable_loops.length ? ` (${loops.unusable_loops.length} unusable)` : ''} and single track takes loops + 1 trains; build more with loop-sites --vehicle ${loco}, then add-train --vehicle ${loco}`;
+  if (!k) return out;
+  const res = await exec(Array.from({ length: k }, () => ['veh_clone', depot.x, depot.y, loco, true]));
+  out.cost = res.cost;
+  out.vehicles = res.results.filter((q) => q.ok && q.value !== undefined).map((q) => q.value);
+  if (out.vehicles.length) await exec(out.vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
+  if (!res.ok) out.error = res.error;
+  return out;
+}
+
+/**
+ * Why build-cargo-route found no terminus at one end (L4): candidates and dry runs over every option
+ * set tried, rejected counts by error code, your stations near the end, and a hint that lists only
+ * what was not tried yet. `tried`: [{ opts, res }] (res = stationSites result).
+ */
+function noSiteReport(tried, ownNear) {
+  const rejected = {};
+  for (const { res } of tried) for (const [k, n] of Object.entries(res.rejected ?? {})) rejected[k] = (rejected[k] ?? 0) + n;
+  const opts = tried.map((t) => t.opts);
+  const maxR = Math.max(...opts.map((o) => o.radius)), minL = Math.min(...opts.map((o) => o.length)), minP = Math.min(...opts.map((o) => o.platforms));
+  const untried = [...(maxR < 24 ? [`--radius ${Math.min(24, maxR + 4)}`] : []), ...(minL > 2 ? ['--length 2'] : []), ...(minP > 1 ? ['--platforms 1'] : [])];
+  const hint = [untried.length ? `not tried yet: ${untried.join(', ')}` : 'every size and radius was tried',
+    ...(ownNear.length ? [`your station ${ownNear[0].name} (${ownNear[0].id}) is ${ownNear[0].tiles} tiles away: --reuse_stations auto joins a new platform to it`] : []),
+    'or clear land with demolish/terraform, or pick another end'].join('; ');
+  return { candidates_on_map: Math.max(...tried.map((t) => t.res.candidates_on_map)), dry_runs: tried.reduce((n, t) => n + t.res.dry_runs, 0), rejected,
+    tried: opts.map((o) => ({ radius: o.radius, length: o.length, platforms: o.platforms })), own_station_near: ownNear, hint };
+}
+
+/**
  * build-cargo-route: plan everything as a dry run (both termini, the line between their connect_at
  * anchors, a depot beside the line near the source, a train), then, unless dryRun, build it step by
  * step. On a failure it stops and reports the step and everything already built; it never demolishes.
  */
-async function buildCargoRoute(s, company, a) {
+async function buildCargoRoute(s, company, a, ctx) {
   const plan = { dry_run: a.dry_run, company };
   const built = [];
   const vehiclesBought = () => built.filter((b) => b.step === 'buy_locomotive').map((b) => b.vehicle);
   const fail = (step, error, extra = {}) => ({ ok: false, failed_step: step, error, first_error: errorCode(error), cost: extra.spent ?? 0, vehicles: vehiclesBought(), built, ...plan, ...extra,
-    hint: built.length ? 'nothing was demolished: continue from the failed step by hand (build-rail, build-line-depot, vehicle-buy, order-add, vehicle-start) using the ids and tiles in built' : 'nothing was built' });
+    hint: extra.hint ?? (built.length ? 'nothing was demolished: continue from the failed step by hand (build-rail, build-line-depot, vehicle-buy, order-add, vehicle-start) using the ids and tiles in built' : 'nothing was built') });
   const from = a.from_industry !== undefined ? { industry: a.from_industry } : a.from_town !== undefined ? { town: a.from_town } : null;
   const to = a.to_industry !== undefined ? { industry: a.to_industry } : a.to_town !== undefined ? { town: a.to_town } : null;
   if (!from || !to) throw new Error('give one source (--from_industry <id> or --from_town <name>) and one destination (--to_industry <id> or --to_town <name>)');
   const cargo = cargoId(s.cargos, a.cargo);
   const cargoInfo = s.cargos.get(cargo);
+  // L14: a source that makes nothing of this cargo (a sawmill before any wood arrives) gives an empty line.
+  if (from.industry !== undefined && !a.force) {
+    const ind = (await s.economy()).industries.find((i) => i.id === from.industry);
+    const prod = ind?.produces.find((p) => p.cargo === cargo);
+    const what = ind ? `${ind.type_name} ${ind.id}` : `industry ${from.industry}`;
+    if (ind && !prod) {
+      return fail('source', `source_produces_nothing: ${what} does not produce ${cargoInfo?.name ?? a.cargo} (it produces ${ind.produces.map((p) => p.cargo_name).join(', ') || 'nothing'})`,
+        { first_error: 'source_produces_nothing', hint: `pick a producer of ${cargoInfo?.name ?? a.cargo}: find-cargo-pairs --cargo ${a.cargo}` });
+    }
+    if (ind?.secondary && prod.last_month === 0) {
+      const inputs = ind.accepts.join(', ') || 'its input cargo';
+      return fail('source', `source_produces_nothing: ${what} made no ${prod.cargo_name} last month; it makes it only from deliveries of ${inputs}`,
+        { first_error: 'source_produces_nothing', feeder: { accepts: ind.accepts }, hint: `feed it first: find-cargo-pairs --cargo "${ind.accepts[0] ?? ''}" --dest_id ${ind.id} lists producers of its input; or pass --force true to build anyway` });
+    }
+  }
   const railTypes = await s.gs.call('rail_types', { company });
   // Default: the cheapest track (the plain build-rail default is the game's first listed type, often electrified).
   const railType = a.rail_type ?? [...railTypes].sort((p, q) => p[3] - q[3])[0]?.[0];
@@ -411,24 +510,43 @@ async function buildCargoRoute(s, company, a) {
 
   // 0. Already running this route? A second line beside the first doubles the cost for little
   // more cargo; more trains on the first line is the usual answer (a live agent built one twice).
-  if (!a.allow_existing) {
+  // --if_exists (L2): refuse (default) | skip (ok, action exists) | add_train (add-train on the line) | build.
+  const ifExists = a.allow_existing ? 'build' : a.if_exists;
+  if (ifExists !== 'build') {
     const economy = await s.economy();
     const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
     const bothWays = !!(cargoInfo?.passengers || cargoInfo?.mail);
     const existing = findExistingRoute(stations, lineEnd(s, economy, from), lineEnd(s, economy, to), cargo, { radius: a.radius + 2, bothWays });
     const servedBy = existing ? await vehicleServing(s, company, stations, existing.from_station.id, existing.to_station.id) : null;
     if (existing && servedBy !== null) {
+      const found = { ...existing, served_by: servedBy };
+      if (ifExists === 'skip') {
+        return { ok: true, action: 'exists', dry_run: a.dry_run, company, existing: found, cost: 0, vehicles: [], built: [],
+          note: `you already run this route (vehicle ${servedBy}); nothing was built. --if_exists add_train adds a train to it` };
+      }
+      if (ifExists === 'add_train') {
+        const res = await addTrain(ctx, s, company, { company, vehicle: servedBy, count: 1, force: false, dry_run: a.dry_run });
+        return { ...res, action: 'add_train', existing: found };
+      }
       return fail('existing_route', `refused: you already run this route: ${existing.from_station.name} (${existing.from_station.id}) and ${existing.to_station.name} (${existing.to_station.id}), served by vehicle ${servedBy}`,
         { existing: { ...existing, served_by: servedBy }, first_error: 'existing_route',
-          hint: `add capacity instead: vehicle-clone --vehicle ${servedBy} --depot auto --start true; or pass --allow_existing true to build a second line anyway` });
+          hint: `add capacity instead: the same command with --if_exists add_train (or add-train --vehicle ${servedBy}); --if_exists skip returns ok; --if_exists build builds a second line anyway` });
     }
-    if (existing) plan.existing_unserved = { ...existing, note: 'your stations there have no vehicle serving both, so a new line is built (they are not reused)' };
+    if (existing) plan.existing_unserved = { ...existing, note: 'your stations there have no vehicle serving both, so a new line is built (with --reuse_stations auto the new termini join them where they fit)' };
   }
 
   // 1. Stations: best dry-run-checked site at each end, facing the other end, not overlapping.
   // A town end that has no site (houses everywhere) is retried wider, shorter and with one platform.
   const opts = { platforms: a.platforms, length: a.length, radius: a.radius, limit: 3, railType };
-  const tries = (end) => (end.town === undefined ? [opts] : siteFallbacks(opts));
+  // Every end (town or industry, C8) is retried wider, shorter and with one platform.
+  const tries = () => siteFallbacks(opts);
+  const economy0 = await s.economy();
+  const ownRail = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).filter((st) => st.facilities.includes('rail'));
+  const ownNear = (end) => {
+    const here = lineEnd(s, economy0, end);
+    return ownRail.map((st) => ({ id: st.id, name: st.name, tiles: Math.min(...here.targets.map(([x, y]) => Math.max(Math.abs(st.x - x), Math.abs(st.y - y)))) }))
+      .filter((st) => st.tiles <= a.radius + 8).sort((p, q) => p.tiles - q.tiles).slice(0, 3);
+  };
   const accepts = new Map();
   const acceptOf = async (d) => {
     const along = d.axis === 'y';
@@ -436,32 +554,50 @@ async function buildCargoRoute(s, company, a) {
     return lists ? (lists[0][0]?.acceptance ?? 0) : null;
   };
   let srcSites = null, dstSites = null, accepting = [];
-  for (const o of tries(from)) {
-    srcSites = await stationSites(s, company, from, to, o);
-    if (srcSites.sites.length) { if (o !== opts) plan.source_fallback = fallbackNote(opts, o); break; }
+  const srcTried = [], dstTried = [];
+  // L3: an end next to one of your rail stations joins a new platform group to it (join = its id;
+  // the game needs the result within station_spread). Tried with the first two option sets, then a new station.
+  const reuseAt = (end) => (a.reuse_stations === 'never' ? null : ownNear(end).find((st) => st.tiles <= a.radius) ?? null);
+  const joinsFor = (reuse) => (reuse ? [...tries().slice(0, 2).map((o) => ({ o, join: reuse.id })), ...tries().map((o) => ({ o, join: -1 }))] : tries().map((o) => ({ o, join: -1 })));
+  const reuseNote = (reuse, join) => (reuse ? (join >= 0 ? { reused_station: { id: reuse.id, name: reuse.name } } : { reuse_failed: { id: reuse.id, name: reuse.name, note: 'no terminus joined to it passed its dry run (too far apart for station_spread, or no room); a new station is built' } }) : {});
+  const srcReuse = reuseAt(from), dstReuse = reuseAt(to);
+  let srcJoin = -1, dstJoin = -1;
+  for (const { o, join } of joinsFor(srcReuse)) {
+    srcSites = await stationSites(s, company, from, to, { ...o, join });
+    srcTried.push({ opts: o, res: srcSites });
+    if (srcSites.sites.length) { srcJoin = join; if (o !== opts) plan.source_fallback = fallbackNote(opts, o); break; }
   }
-  if (!srcSites.sites.length) return fail('source_station', `no terminus site passed near ${srcSites.target}${from.town !== undefined ? ' (also tried wider, shorter and single-platform termini)' : ''}`, { hint_sites: srcSites.hint });
-  for (const o of tries(to)) {
-    dstSites = await stationSites(s, company, to, from, o);
+  const noSite = (which, sites, tried, end) => {
+    const report = noSiteReport(tried, ownNear(end));
+    const rej = Object.entries(report.rejected).map(([k, n]) => `${k} ${n}`).join(', ');
+    return fail(which, `no terminus site passed near ${sites.target}: ${report.candidates_on_map} candidate spots on the map, ${report.dry_runs} dry runs over ${tried.length} size/radius options${rej ? ` (rejected: ${rej})` : ''}`,
+      { first_error: 'no_terminus_site', no_site: report, hint_sites: report.hint });
+  };
+  if (!srcSites.sites.length) return noSite('source_station', srcSites, srcTried, from);
+  for (const { o, join } of joinsFor(dstReuse)) {
+    dstSites = await stationSites(s, company, to, from, { ...o, join });
+    dstTried.push({ opts: o, res: dstSites });
     // Destination sites must accept the cargo (AgentBridge v7; null = not checkable, kept with a note).
     for (const d of dstSites.sites) accepts.set(d, await acceptOf(d));
     accepting = dstSites.sites.filter((d) => accepts.get(d) === null || accepts.get(d) >= ACCEPTED);
-    if (accepting.length) { if (o !== opts) plan.dest_fallback = fallbackNote(opts, o); break; }
+    if (accepting.length) { dstJoin = join; if (o !== opts) plan.dest_fallback = fallbackNote(opts, o); break; }
   }
-  if (!dstSites.sites.length) return fail('dest_station', `no terminus site passed near ${dstSites.target}${to.town !== undefined ? ' (also tried wider, shorter and single-platform termini)' : ''}`, { hint_sites: dstSites.hint });
+  if (!dstSites.sites.length) return noSite('dest_station', dstSites, dstTried, to);
   if (!accepting.length) {
     return fail('dest_station', `no terminus site near ${dstSites.target} accepts ${cargoInfo?.name ?? a.cargo} (acceptance ${[...accepts.values()].join(', ')}; ${ACCEPTED} needed)`);
   }
   let src = null, dst = null;
   for (const p of srcSites.sites) { const q = accepting.find((d) => !sitesOverlap(p, d)); if (q) { src = p; dst = q; break; } }
   if (!src) return fail('dest_station', 'every source and destination site overlap: the two ends are too close for two termini');
-  plan.source_site = { target: srcSites.target, ...src };
-  plan.dest_site = { target: dstSites.target, ...dst, acceptance: accepts.get(dst) };
+  src.join = srcJoin; dst.join = dstJoin;
+  plan.source_site = { target: srcSites.target, ...src, ...reuseNote(srcReuse, srcJoin) };
+  plan.dest_site = { target: dstSites.target, ...dst, acceptance: accepts.get(dst), ...reuseNote(dstReuse, dstJoin) };
   // Warn when a new terminus lands next to one of our stations: often a second line to the same place.
   const ownStations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
   const warnings = [];
   for (const [end, site] of [['source', src], ['dest', dst]]) {
     for (const st of ownStations) {
+      if (st.id === site.join) continue;
       const d = tileDistance(st, site);
       if (d <= 8) warnings.push({ near_own_station: { id: st.id, name: st.name, x: st.x, y: st.y }, end, tiles: d });
     }
@@ -518,7 +654,15 @@ async function buildCargoRoute(s, company, a) {
     plan.passing_loops_note = 'sites on the planned line; the real build picks them again on the built track (positions can move a few tiles); cost counts the loop track only';
     if (picks.length < a.passing_loops) (plan.warnings ??= []).push({ passing_loops: `only ${picks.length} of ${a.passing_loops} loops fit on straight stretches of the planned line (each needs ${loopLength + 4} straight tiles)` });
   }
-  const estimate = src.cost + dst.cost + lineCheck.cost + depotCheck.cost + plan.train.cost + loopCost;
+  // C13: --trains K: more trains only as far as the loops allow (single track: loops + 1 trains).
+  let extraTrains = 0;
+  if (a.trains > 1) {
+    const loopsPlanned = (plan.passing_loops ?? []).filter((l) => !l.dry_run_error).length;
+    extraTrains = Math.min(a.trains - 1, loopsPlanned);
+    plan.trains = { asked: a.trains, planned: 1 + extraTrains, passing_loops_planned: loopsPlanned, cost: (1 + extraTrains) * plan.train.cost,
+      ...(extraTrains < a.trains - 1 ? { note: `single track takes one train per passing loop + 1: ${1 + extraTrains} of ${a.trains}; ${a.passing_loops >= a.trains - 1 ? 'only some of the --passing_loops fit on the planned line (see warnings)' : `add --passing_loops ${a.trains - 1}`}` } : {}) };
+  }
+  const estimate = src.cost + dst.cost + lineCheck.cost + depotCheck.cost + plan.train.cost * (1 + extraTrains) + loopCost;
   plan.estimated_cost = estimate;
   plan.money = lineCheck.money;
   plan.affordable = lineCheck.money === null || lineCheck.money >= estimate;
@@ -529,10 +673,11 @@ async function buildCargoRoute(s, company, a) {
   const exec = async (steps, opts2 = {}) => { s.throttleBuild(); return s.exec(company, steps, { railType, ...opts2 }); };
   let spent = 0;
   const station = async (name, site) => {
-    const t = terminusSteps({ x: site.x, y: site.y, axis: site.axis, platforms: site.platforms, length: site.length, exitHigh: site.exit === 'high', join: -1 });
+    const t = terminusSteps({ x: site.x, y: site.y, axis: site.axis, platforms: site.platforms, length: site.length, exitHigh: site.exit === 'high', join: site.join ?? -1 });
     const res = await exec(t.steps);
     spent += res.cost;
-    const st = res.results.some((r) => r.op === 'rail_station' && r.ok) ? await stationAt(s, company, site) : null;
+    const placed = res.results.some((r) => r.op === 'rail_station' && r.ok);
+    const st = !placed ? null : site.join >= 0 ? stationsFromRows(await s.gs.call('stations', { company }), s.cargos).find((q) => q.id === site.join) ?? null : await stationAt(s, company, site);
     if (st || res.results.some((r) => r.ok)) built.push({ step: name, station: st?.id ?? null, x: site.x, y: site.y, connect_at: site.connect_at, complete: res.ok, cost: res.cost });
     return { res, st };
   };
@@ -580,8 +725,29 @@ async function buildCargoRoute(s, company, a) {
     const startRes = await exec([['veh_start_stop', loco, 1]]);
     if (!startRes.ok) return fail('start', startRes.error, { spent, vehicle: loco });
     built.push({ step: 'start', vehicle: loco, complete: true });
-    return { ok: true, ...plan, dry_run: false, source_station: A.st?.id ?? null, dest_station: B.st?.id ?? null, depot: dep.depot, vehicle: loco, vehicles: [loco],
-      cost: spent, total_cost: spent, built, next: `vehicle-clone --depot_x ${dep.depot.x} --depot_y ${dep.depot.y} --vehicle ${loco} --start true adds trains with the same orders` };
+    // C1: trace the built line both ways (and the depot's first leg) instead of leaving it to the caller.
+    let verify = { connected: null, note: 'not traced: a new station id was not found on its site' };
+    if (A.st && B.st) {
+      try { verify = await lineVerify(s, company, A.st, B.st, dep.depot); } catch (e) { verify = { connected: null, error: e.message }; }
+    }
+    if (verify.first_leg?.warning) (plan.warnings ??= []).push({ depot_exit_detour: verify.first_leg.warning });
+    const vehicles = [loco];
+    if (a.trains > 1 && verify.connected) {
+      const more = await cloneOnLine(s, company, A.st, B.st, dep.depot, loco, a.trains - 1, trainTiles, exec);
+      spent += more.cost;
+      vehicles.push(...more.vehicles);
+      built.push({ step: 'more_trains', vehicles: more.vehicles, usable_loops: more.usable_loops, complete: !more.error, cost: more.cost, ...(more.error ? { error: more.error } : {}) });
+      if (more.warning) (plan.warnings ??= []).push({ trains: more.warning });
+    } else if (a.trains > 1) {
+      (plan.warnings ??= []).push({ trains: `only 1 of ${a.trains} trains: the line was not traced exactly (${verify.connected === false ? 'it is broken' : 'needs AgentBridge v9'}), so the passing loops were not counted` });
+    }
+    const done = { ...plan, dry_run: false, source_station: A.st?.id ?? null, dest_station: B.st?.id ?? null, depot: dep.depot, vehicle: loco, vehicles,
+      cost: spent, total_cost: spent, built, verify, next: `add-train --vehicle ${loco} adds a train with the same orders (checks passing loops)` };
+    if (verify.connected === false) {
+      return { ok: false, ...done, failed_step: 'verify', first_error: 'route_broken',
+        error: `route_broken: the new line does not trace ${verify.there ? `back from ${B.st.name} to ${A.st.name}` : `from ${A.st.name} to ${B.st.name}`}${verify.first_gap ? ` (first gap at (${verify.first_gap.x},${verify.first_gap.y}): ${verify.first_gap.reason})` : ''}; train ${loco} is running. Fix the gap with build-track, then verify-route --vehicle ${loco}` };
+    }
+    return { ok: true, ...done };
   } catch (e) {
     const last = built.at(-1)?.step ?? null;
     return fail(last ? `after ${last}` : 'source_station', e.message, { spent });
@@ -886,13 +1052,131 @@ async function longestTrainOnLine(s, company, id) {
   return { ...best, trains_checked: others.length + 1 };
 }
 
+/**
+ * Longest train on the line through track tile (x, y): trace to the nearest station of `company`
+ * and on to a second one, then the trains with orders at both (AgentBridge v12 counts, v9 trace).
+ * Returns { tiles, vehicle, stations: [{ id }], trains_checked } or { reason } when unknown.
+ */
+async function longestTrainAt(s, company, x, y) {
+  const info = await s.gs.call('info');
+  if ((info.bridge_version ?? 0) < 9) return { reason: 'the running AgentBridge is older than v9 (no rail_tiles)' };
+  const tracer = await makeTracer(s, company, info);
+  const t = await tracer.tileAt(x, y);
+  if (!t || t.kind !== 't') return { reason: `(${x},${y}) has no track yet, so no line or train is known` };
+  const stationOf = async (skip) => {
+    const r = await traceRail({ getTile: tracer.tileAt, starts: [{ x, y }], isGoal: (q) => q.kind === 's' && q.owner === company && q.station >= 0 && q.station !== skip, company });
+    return r.connected ? (await tracer.tileAt(r.reached.x, r.reached.y)).station : null;
+  };
+  const a = await stationOf(-1);
+  const b = a === null ? null : await stationOf(a);
+  if (a === null || b === null) return { reason: `the track at (${x},${y}) does not lead to two of your stations` };
+  const ids = await stationVehicleIds(s, company);
+  if (!ids) return { reason: 'the running AgentBridge is older than v12 (no station_vehicles)' };
+  const trains = (ids.get(a) ?? []).filter((v) => (ids.get(b) ?? []).includes(v));
+  for (const v of trains) {
+    const veh = vehiclesFromRows(await s.gs.call('vehicles', { company })).find((q) => q.id === v);
+    if (veh?.type === 'rail') return { ...(await longestTrainOnLine(s, company, v)), stations: [{ id: a }, { id: b }] };
+  }
+  return { reason: `no train of yours has orders at both stations ${a} and ${b} of this line` };
+}
+
+/**
+ * First leg of a new train (C9): trace from the depot to its first station. detour_ratio = path tiles
+ * / straight-line tiles; a big one means the depot exit faces away and every new or serviced train
+ * runs to the far end first (warning depot_exit_detour). null when the tracer is not exact (< v9).
+ */
+async function firstLeg(tracer, depot, station) {
+  if (!tracer || tracer.method !== 'rail_tracks' || !depot || !station) return null;
+  const r = await tracer.trace([{ x: depot.x, y: depot.y }], station);
+  if (!r.connected) return { connected: false, to: station.name ?? station.id, first_gap: r.first_gap ?? null };
+  const direct = Math.max(1, tileDistance(depot, station));
+  const ratio = Math.round((10 * r.path.length) / direct) / 10;
+  const detour = ratio >= 2.5 && r.path.length - direct >= 12;
+  return { connected: true, to: station.name ?? station.id, tiles: r.path.length, direct_tiles: direct, detour_ratio: ratio,
+    ...(detour ? { warning: `depot_exit_detour: a train leaving the depot at (${depot.x},${depot.y}) runs ${r.path.length} tiles to reach ${station.name ?? `station ${station.id}`} (${direct} tiles away): the depot exit leads away from it, so every new or serviced train goes the long way first. Join the depot front toward the station (build-track) or build the depot on the other side` } : {}) };
+}
+
+/**
+ * Trace a built two-station line both ways and its depot's first leg (build-cargo-route, C1).
+ * Returns { connected (null when only a coarse trace was possible), there, back, first_gap, first_leg?, method, note? }.
+ */
+async function lineVerify(s, company, from, to, depot) {
+  const tracer = await makeTracer(s, company, await s.gs.call('info'));
+  const there = await tracer.trace(await tracer.stationStarts(from), to);
+  const back = await tracer.trace(await tracer.stationStarts(to), from);
+  const coarse = tracer.method !== 'rail_tracks';
+  const bad = !there.connected ? there : !back.connected ? back : null;
+  const leg = await firstLeg(tracer, depot, from);
+  return { connected: coarse && !bad ? null : !bad, there: there.connected, back: back.connected, first_gap: bad?.first_gap ?? null, method: tracer.method,
+    ...(leg ? { first_leg: leg } : {}), ...(coarse ? { note: OLD_GS_TRACE } : {}) };
+}
+
 // ---- depot guard (vehicle-clone, vehicle-buy --route_of) ---------------------------------
 
-/** Source vehicle row (type, position) of this company. */
+/** Source vehicle row (type, position) of this company. A sold vehicle's error says when and who serves its stations now (L10). */
 async function vehicleOf(s, company, id) {
   const veh = vehiclesFromRows(await s.gs.call('vehicles', { company })).find((v) => v.id === id);
-  if (!veh) throw new Error(`vehicle ${id} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
+  if (!veh) throw new Error((await soldNote(s, company, id)) ?? `vehicle ${id} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
   return veh;
+}
+
+/** Ledger text (L10) for a vehicle id this session sold, or null: sale date, replacement, vehicles now serving its stations. */
+async function soldNote(s, company, id) {
+  const e = s.soldVehicles?.get(`${company}:${id}`);
+  if (!e) return null;
+  const ids = e.stations?.length ? await stationVehicleIds(s, company) : null;
+  const serving = ids ? [...new Set(e.stations.flatMap((st) => ids.get(st) ?? []))].sort((p, q) => p - q) : [];
+  return soldText(e, serving);
+}
+
+/** Map vehicle -> { load, capacity, pct, cargo } from GS vehicle_loads (v13), or null on an older GameScript. */
+async function vehicleLoads(s, company, vehicles) {
+  try { return loadsFromRows(await s.gs.call('vehicle_loads', { company, ...(vehicles ? { vehicles } : {}) })); } catch (e) {
+    if (/unknown cmd/.test(e.message)) return null;
+    throw e;
+  }
+}
+
+/**
+ * --select FILTER (parseSelect) over the company's vehicles, minus vehicles queued for sale, at most `max`.
+ * Returns { ids, matched, skipped_queued }.
+ */
+async function selectVehicles(s, company, text, max) {
+  const f = parseSelect(text);
+  const hit = filterVehicles(vehiclesFromRows(await s.gs.call('vehicles', { company })), f);
+  const free = hit.filter((v) => !s.pendingSales.has(`${company}:${v.id}`));
+  return { ids: free.slice(0, max).map((v) => v.id), matched: hit.length, skipped_queued: hit.length - free.length };
+}
+const selectArgs = (what, max) => ({
+  select: z.string().optional().describe(`instead of --vehicles: ${what} the vehicles matching key=value filters, comma-separated (keys as vehicles: ids=1|2, type, group, state, engine, name, max_profit_last_year, max_profit_this_year, min_age_pct, min_age_days, max_reliability_pct); e.g. "type=road,min_age_pct=100"`),
+  max: int().min(1).max(100).default(max).describe('with --select: at most this many vehicles'),
+});
+
+/**
+ * vehicle-clone --station (R11): the best vehicle to copy among those with an order for `station`:
+ * not queued for sale, not crashed, carrying `cargo` when given (vehicle_loads, v13), highest profit last year.
+ * Returns { vehicle, unit_number, profit_last_year, candidates } or throws a refusal.
+ */
+async function cloneSourceAt(s, company, station, cargo) {
+  const st = findStation(stationsFromRows(await s.gs.call('stations', { company }), s.cargos), station);
+  const ids = await stationVehicleIds(s, company, st.id);
+  if (!ids) throw new Error('refused: vehicle-clone --station needs AgentBridge v12; give --vehicle ID instead');
+  const serving = new Set(ids.get(st.id) ?? []);
+  let cands = vehiclesFromRows(await s.gs.call('vehicles', { company })).filter((v) => serving.has(v.id) && v.state !== 'crashed' && !s.pendingSales.has(`${company}:${v.id}`));
+  if (cargo !== undefined) {
+    const want = cargoId(s.cargos, cargo);
+    const loads = await vehicleLoads(s, company, cands.map((v) => v.id));
+    if (!loads) throw new Error('refused: --cargo with --station needs AgentBridge v13; give --vehicle ID instead');
+    cands = cands.filter((v) => loads.get(v.id)?.cargo.some((c) => c.cargo === want));
+  }
+  if (!cands.length) throw new Error(`refused: no vehicle of yours with an order for ${st.name} (${st.id})${cargo !== undefined ? ` carries ${cargo}` : ''} that is not queued for sale; build one with vehicle-buy --orders`);
+  const best = [...cands].sort((p, q) => q.profit_last_year - p.profit_last_year || q.profit_this_year - p.profit_this_year)[0];
+  return { vehicle: best.id, unit_number: best.unit_number, profit_last_year: best.profit_last_year, station: { id: st.id, name: st.name }, candidates: cands.length };
+}
+
+/** Station ids in a vehicle's orders (for the sale ledger); [] when it cannot be read. */
+async function orderStationIds(s, company, id) {
+  try { return [...new Set((await currentOrderOf(s, company, id)).orders.filter((o) => o.kind === 'station').map((o) => o.station))]; } catch { return []; }
 }
 
 /** A vehicle's order stations, in order, as rows from `stations`. */
@@ -986,6 +1270,26 @@ async function depotForRoute(s, company, a, id, { cmd }) {
 }
 
 /** "1951 Q2" for the quarter `back` quarters before the running one (GS quarter numbering: 0 = running). */
+/** airport-sites for one town name: flat, noise-checked and (with your company) dry-run checked sites. */
+async function airportSitesNear(s, towns, name, at, a) {
+  const town = towns.find((t) => t.name.toLowerCase().includes(name.toLowerCase()));
+  if (!town) throw new Error(`no town matching '${name}'`);
+  const company = s.cfg.company;
+  const hasCompany = company !== null && company !== undefined;
+  // Own owned land counts as buildable (airports clear it); company from the config, so the relay binds it.
+  const pad = Math.max(at.width, at.height);
+  const box = { x0: town.x - a.radius, y0: town.y - a.radius, x1: town.x + a.radius + pad, y1: town.y + a.radius + pad };
+  const owned = hasCompany ? await ownedLandAt(s, company, ownedLandCandidates(s.map, box)) : null;
+  const sites = findFlatSites(s.map, { cx: town.x, cy: town.y, width: at.width, height: at.height, radius: a.radius, maxHeightSpread: a.max_height_spread, limit: a.limit * 3, owned });
+  const checked = [];
+  for (const site of sites) {
+    const chk = await s.gs.call('check_airport', { x: site.x, y: site.y, type: at.type, ...(hasCompany ? { company } : {}) });
+    checked.push({ ...site, ...chk, noise_ok: chk.noise_increase <= chk.town_allowed_noise });
+    if (checked.filter((c) => c.noise_ok && c.buildable !== false).length >= a.limit) break;
+  }
+  return { town: { name: town.name, x: town.x, y: town.y, population: town.population, pax_unserved: town.pax_unserved, allowed_noise: town.allowed_noise }, sites: checked };
+}
+
 export function quarterLabel(info, back) {
   const idx = info.year * 4 + Math.floor((info.month - 1) / 3) - back;
   return `${Math.floor(idx / 4)} Q${(idx % 4) + 1}`;
@@ -1138,6 +1442,37 @@ async function signalRemoveRefusal(s, a) {
 }
 
 /**
+ * The passing loop whose track holds the signal tile (x, y), or null: walk the track both ways to
+ * the nearest points, then findLoops on that stretch (AgentBridge v9). Used to refuse removing a
+ * loop's signal (without it both trains enter the loop from opposite ends and crash or jam).
+ */
+async function loopOfTile(s, x, y) {
+  const getTile = railTileSource(s);
+  const t = await getTile(x, y);
+  if (!t || t.kind !== 't') return null;
+  const edges = [...trackEdges(t.tracks)];
+  if (edges.length !== 2) return null;
+  const toPoints = async (edge) => {
+    const out = [];
+    let cx = x + TRACE_DIRS[edge][0], cy = y + TRACE_DIRS[edge][1], entry = (edge + 2) % 4;
+    for (let n = 0; n < 60; n++) {
+      const u = await getTile(cx, cy);
+      if (!u || !['t', 's', 'w'].includes(u.kind) || !trackEdges(u.tracks).has(entry)) return null;
+      out.push({ x: u.x, y: u.y });
+      if (trackEdges(u.tracks).size >= 3) return out;
+      const ex = trackExits(u.tracks, entry);
+      if (ex.length !== 1) return null;
+      cx += TRACE_DIRS[ex[0]][0]; cy += TRACE_DIRS[ex[0]][1]; entry = (ex[0] + 2) % 4;
+    }
+    return null;
+  };
+  const back = await toPoints(edges[0]), ahead = await toPoints(edges[1]);
+  if (!back || !ahead) return null;
+  const path = [...back.reverse(), { x, y }, ...ahead];
+  return (await findLoops({ path, getTile })).find((l) => l.from_index === 0 && l.to_index === path.length - 1) ?? null;
+}
+
+/**
  * vehicle-buy --attach_to: the train must be stopped inside the depot the wagon is bought in, or the
  * game sells the wagon and then refuses to couple it. Returns the refusal text, or null.
  */
@@ -1232,20 +1567,335 @@ async function driveThroughRefusal(s, company, a) {
   return why;
 }
 
-/** Run exec steps as the company (client throttle + GS rate gate apply). */
+/**
+ * The station a build just made or joined at tile x,y (R1): rail_tiles (v9) / road_tiles (v11) give the
+ * station id on that tile; else the nearest of the company's stations within `reach` tiles. { id, name } or null.
+ */
+async function builtStationAt(s, company, x, y, kind, reach = 2) {
+  const v = (await s.gs.call('info')).bridge_version ?? 0;
+  let id = -1;
+  if (kind === 'rail' && v >= 9) id = (await s.gs.call('rail_tiles', { x0: x, y0: y, x1: x, y1: y }))[0]?.[4] ?? -1;
+  if (kind === 'road' && v >= 11) id = (await s.gs.call('road_tiles', { company, x0: x, y0: y, x1: x, y1: y }))[0]?.[4] ?? -1;
+  const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+  const hit = id >= 0 ? stations.find((st) => st.id === id)
+    : stations.map((st) => ({ st, d: tileDistance(st, { x, y }) })).filter((e) => e.d <= reach).sort((p, q) => p.d - q.d)[0]?.st;
+  return hit ? { id: hit.id, name: hit.name } : null;
+}
+
+/** Run exec steps as the company (client throttle + GS rate gate apply; failures explained, see execExplained). */
 async function run(ctx, a, steps, opts = {}) {
   const { s, company } = await mine(ctx, a);
-  if (!a.dry_run) s.throttleBuild();
-  return s.exec(company, steps, { dryRun: a.dry_run, ...opts });
+  return execExplained(s, company, steps, { dryRun: a.dry_run, ...opts }, a);
+}
+
+/** The tile a step acts on: [op, x, y, ...] for most ops; rail [op, fx, fy, x, y, ...]; bridge/tunnel [op, type, x, y, ...]. */
+function stepTile(step) {
+  if (step[0] === 'rail' || step[0] === 'rail_remove') return { x: step[3], y: step[4] };
+  if (step[0] === 'bridge' || step[0] === 'tunnel') return { x: step[2], y: step[3] };
+  return typeof step[1] === 'number' && typeof step[2] === 'number' ? { x: step[1], y: step[2] } : null;
+}
+
+/** Tiles from (x1,y1) to (x2,y2) in a straight line (a road step), at most 200. */
+function lineTiles(x1, y1, x2, y2) {
+  const out = [];
+  const dx = Math.sign(x2 - x1), dy = Math.sign(y2 - y1);
+  for (let x = x1, y = y1; out.length < 200; x += dx, y += dy) { out.push({ x, y }); if (x === x2 && y === y2) break; if (!dx && !dy) break; }
+  return out;
+}
+
+/** Local-authority detail for a refused step at `tile` (GS v13 town_rating), or a note on an older GameScript. */
+async function authorityDetail(s, company, step, tile) {
+  const need = authorityNeed(step[0]);
+  let row;
+  try { [row] = await s.gs.call('town_rating', { company, points: [[tile.x, tile.y]] }); } catch (e) {
+    if (/unknown cmd/.test(e.message)) return { ...need, note: 'the running AgentBridge is older than v13: it cannot read town ratings; the host re-runs install-gamescript and loads the game again' };
+    throw e;
+  }
+  const r = townRatingFromRow(row);
+  if (r.town < 0) return { ...need, town: null };
+  const { towns } = await s.economy();
+  const name = towns.find((t) => t.id === r.town)?.name ?? `town ${r.town}`;
+  return { town: r.town, town_name: name, rating: r.rating, rating_value: r.rating_value, ...need, hint: RATING_HINT };
+}
+
+/**
+ * s.exec plus what a failure means (0.8.0):
+ * - ERR_LOCAL_AUTHORITY_REFUSES (R8): local_authority { town, town_name, rating, rating_value, needed }.
+ * - ERR_NOT_ENOUGH_CASH (L8): needed, money, loan, max_loan, loan_headroom, next; with a.borrow_if_needed
+ *   the loan is raised by what the rest of the steps cost (dry run) and the rest is run once more.
+ * - a dry run that costs more than the bank balance: the same money fields and a warning.
+ * - a road step refused on a slope (R15): first_error sloped_tile, at, hint.
+ */
+async function execExplained(s, company, steps, opts, a = {}) {
+  if (!opts.dryRun) s.throttleBuild();
+  let res = await s.exec(company, steps, opts);
+  const failed = (res.results ?? []).find((r) => !r.ok);
+  if (opts.dryRun) {
+    if (res.ok && res.money !== null && res.money !== undefined && res.cost > res.money) {
+      const m = moneyDetail({ cost: res.cost, ...(await loanState(s, company)), money: res.money });
+      res = { ...res, ...m, warnings: [...(res.warnings ?? []), `not_enough_money: this costs ${res.cost}, the bank has ${res.money}${m.next ? `; ${m.next}` : ''}`] };
+    }
+    return res;
+  }
+  if (!failed) return res;
+  const step = steps[failed.step];
+  const tile = stepTile(step);
+  const err = String(failed.error ?? '');
+  if (/ERR_NOT_ENOUGH_CASH/.test(err)) {
+    const rest = steps.slice(failed.step);
+    const est = await s.exec(company, rest, { ...opts, dryRun: true, keepGoing: true });
+    const loan = await loanState(s, company);
+    const m = moneyDetail({ cost: est.cost > 0 ? est.cost : null, ...loan });
+    if (a.borrow_if_needed && m.needed && m.needed <= m.loan_headroom) {
+      const lr = await s.exec(company, [['loan', 'add', m.needed]]);
+      if (lr.ok) {
+        const again = await s.exec(company, rest, opts);
+        const done = res.results.slice(0, failed.step);
+        const results = [...done, ...again.results.map((r) => ({ ...r, step: r.step + failed.step }))];
+        return { ...again, borrowed: lr.results[0]?.value !== undefined ? lr.results[0].value - loan.loan : m.needed, cost: res.cost + again.cost,
+          steps_total: steps.length, steps_done: done.filter((r) => r.ok).length + again.steps_done, results };
+      }
+      return { ...res, ...m, borrow_failed: lr.error };
+    }
+    return { ...res, ...m };
+  }
+  if (/ERR_LOCAL_AUTHORITY_REFUSES/.test(err) && tile) {
+    const la = await authorityDetail(s, company, step, tile);
+    const who = la.town_name ? `${la.town_name} rates you ${la.rating} (${la.rating_value}); ` : '';
+    return { ...res, error: `${res.error}: local authority refuses: ${who}${la.needed_text}`, local_authority: la };
+  }
+  if (/ERR_LAND_SLOPED_WRONG|ERR_FLAT_LAND_REQUIRED/.test(err) && ['road', 'road_station', 'road_depot'].includes(step[0])) {
+    const line = step[0] === 'road' ? lineTiles(step[1], step[2], step[3], step[4]) : [tile];
+    const xs = line.map((t) => t.x), ys = line.map((t) => t.y);
+    await s.refreshArea(Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys));
+    const at = line.find((t) => s.map.inBounds(t.x, t.y) && s.map.slopeAt(t.x, t.y)) ?? tile;
+    return { ...res, error: `sloped_tile: (${at.x},${at.y}) is sloped the wrong way for ${step[0] === 'road' ? 'this road' : 'a stop or depot'} (game: ${err})`, first_error: 'sloped_tile', at,
+      hint: step[0] === 'road' ? `level it first (terraform --op level --x0 ${at.x} --y0 ${at.y}), or plan round it with build-road-path (it reuses roads and goes round obstacles)` : `pick a flat tile (road-stop-sites finds dry-run-checked spots), or terraform --op level --x0 ${at.x} --y0 ${at.y}` };
+  }
+  return res;
+}
+
+/**
+ * OpenTTD versions for status: the server's (admin welcome) and, when this process runs on a
+ * machine with OpenTTD, the local one. A mismatch matters to anyone joining from here.
+ */
+function openttdVersions(s, warnings) {
+  const server = s.admin?.welcome?.revision ?? null;
+  const cls = s.openttd ?? classifyVersion(server);
+  let local = null;
+  try { local = detectInstalledVersion(findExecutable()).version; } catch { /* no local OpenTTD */ }
+  const cmp = compareHostClient(server, local);
+  if (!cls.tested && cls.class !== 'unknown') warnings.push(cls.message);
+  if (cmp.match === false) warnings.push(cmp.message);
+  return { server, server_class: cls.class, local, match: cmp.match };
+}
+
+// ---- vehicles in the way (C5) ------------------------------------------------------------
+
+const IN_THE_WAY = /ERR_VEHICLE_IN_THE_WAY/;
+const blockedByVehicle = (res) => (res.results ?? []).some((r) => !r.ok && IN_THE_WAY.test(r.error ?? ''));
+
+/** Tile box an exec step works on: { x0, y0, x1, y1 }. */
+function stepBox(st) {
+  const box = (ax, ay, bx = ax, by = ay) => ({ x0: Math.min(ax, bx), y0: Math.min(ay, by), x1: Math.max(ax, bx), y1: Math.max(ay, by) });
+  if (st[0] === 'rail' || st[0] === 'rail_remove') return box(st[3], st[4], st[5], st[6]);
+  if (st[0] === 'road' || st[0] === 'road_remove') return box(st[1], st[2], st[3], st[4]);
+  if (st[0] === 'bridge') return box(st[2], st[3], st[4], st[5]);
+  if (st[0] === 'tunnel') return box(st[2], st[3]);
+  return box(st[1], st[2]);
+}
+
+/**
+ * ERR_VEHICLE_IN_THE_WAY on an exec result: add transient: true, blocked_at (the failed steps' tiles),
+ * vehicles_in_the_way (your vehicles within 6 tiles of them; a train's position is its front) and,
+ * in a dry run, blocked_by_vehicle: true. Other results come back unchanged.
+ */
+async function vehiclesInTheWay(s, company, steps, res) {
+  if (!blockedByVehicle(res)) return res;
+  const boxes = res.results.filter((r) => !r.ok && IN_THE_WAY.test(r.error ?? '')).map((r) => stepBox(steps[r.step]));
+  const off = (v, b) => Math.max(b.x0 - v.x, 0, v.x - b.x1) + Math.max(b.y0 - v.y, 0, v.y - b.y1);
+  let near = [];
+  try {
+    near = vehiclesFromRows(await s.gs.call('vehicles', { company }))
+      .map((v) => ({ id: v.id, type: v.type, state: v.state, x: v.x, y: v.y, ...(v.speed !== undefined ? { speed: v.speed } : {}), tiles_away: Math.min(...boxes.map((b) => off(v, b))) }))
+      .filter((v) => v.tiles_away <= 6).sort((p, q) => p.tiles_away - q.tiles_away).slice(0, 8);
+  } catch { near = []; }
+  return { ...res, transient: true, ...(res.dry_run ? { blocked_by_vehicle: true } : {}), blocked_at: boxes, vehicles_in_the_way: near,
+    hint: 'a vehicle is on the tiles: wait until it has passed and run the same command again (or pass --wait_clear_s 30); a dry run cannot reserve the tiles' };
+}
+
+/**
+ * s.exec that, when a step fails with ERR_VEHICLE_IN_THE_WAY, waits up to waitS seconds (real
+ * time, game running) and retries from the failed step every 2 s; earlier steps are not repeated.
+ * Returns an exec result over all steps, plus waited_s (and wait_note when the game is paused).
+ */
+async function execWaitClear(s, company, steps, opts, waitS, a = {}) {
+  let res = await execExplained(s, company, steps, opts, a);
+  if (opts.dryRun || !waitS || res.ok || !blockedByVehicle(res)) return res;
+  if ((await s.gs.call('info')).paused) return { ...res, waited_s: 0, wait_note: 'the game is paused, so the vehicle will not move: unpause (or turn-advance) and run it again' };
+  const t0 = Date.now();
+  const done = [];
+  let offset = 0, rest = steps;
+  while (!res.ok && blockedByVehicle(res) && Date.now() - t0 < waitS * 1000) {
+    const failed = res.results.find((r) => !r.ok);
+    done.push(...res.results.filter((r) => r.step < failed.step).map((r) => ({ ...r, step: r.step + offset })));
+    offset += failed.step;
+    rest = rest.slice(failed.step);
+    await sleep(2000);
+    res = await execExplained(s, company, rest, opts, a);
+  }
+  const results = [...done, ...res.results.map((r) => ({ ...r, step: r.step + offset }))];
+  const bad = results.find((r) => !r.ok);
+  return { ...res, results, cost: done.reduce((n, r) => n + (r.cost ?? 0), 0) + res.cost, steps_total: steps.length, steps_done: results.filter((r) => r.ok).length,
+    error: bad ? `step ${bad.step} (${bad.op}): ${bad.error ?? 'failed'}` : res.error, waited_s: Math.round((Date.now() - t0) / 1000) };
+}
+
+/** run() for track builds: --wait_clear_s and the vehicles-in-the-way report. */
+async function runClear(ctx, a, steps, opts = {}) {
+  const { s, company } = await mine(ctx, a);
+  const res = await execWaitClear(s, company, steps, { dryRun: a.dry_run, ...opts }, a.wait_clear_s ?? 0, a);
+  return vehiclesInTheWay(s, company, steps, res);
+}
+
+const waitClear = { wait_clear_s: int().min(0).max(300).default(0).describe('when a vehicle is in the way (ERR_VEHICLE_IN_THE_WAY), wait up to this many seconds for it to pass and retry from that step') };
+
+/**
+ * add-train (also build-cargo-route --if_exists add_train): line capacity and profit checks, clone at a
+ * depot on the route, start, verify. `a`: { company, vehicle, count, force, dry_run }.
+ */
+async function addTrain(ctx, s, company, a) {
+  const cap = await lineCapacity(s, company, a.vehicle, a.count, { cmd: 'add-train' });
+  if (cap.stops.length < 2) throw new Error(`refused: vehicle ${a.vehicle} has fewer than two station orders`);
+  const { check, tracer } = cap;
+  if (!a.force && cap.refusal) return { ok: false, dry_run: a.dry_run, error: cap.refusal, first_error: 'needs_loop', check };
+  const why = a.force ? null : unprofitableRefusal(await vehicleOf(s, company, a.vehicle));
+  if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: 'source_unprofitable', check };
+  const { depot, ...routeCheck } = await depotForRoute(s, company, { depot: 'auto', check_route: true }, a.vehicle, { cmd: 'vehicle-clone' });
+  const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, true]));
+  const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
+  const out = { ...res, check, depot, ...routeCheck, vehicles };
+  if (a.dry_run || !vehicles.length) return out;
+  const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
+  out.started = started.ok;
+  if (tracer) {
+    let leg = null;
+    try { leg = await firstLeg(tracer, depot, cap.stops[0]); } catch { leg = null; }
+    if (leg?.warning) out.warnings = [...(out.warnings ?? []), { depot_exit_detour: leg.warning }];
+    try {
+      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const legs = await routeLegs(s, company, tracer, stations, await vehicleOf(s, company, vehicles[0]));
+      out.verify = { connected: legs.connected, ...(legs.connected ? {} : { legs: legs.legs.filter((l) => !l.connected) }), ...(leg ? { first_leg: leg } : {}) };
+      if (!legs.connected) { out.ok = false; out.error = `route_broken: the new train ${vehicles[0]} has no path to all its stations; see verify`; out.first_error = 'route_broken'; }
+    } catch (e) { out.verify = { connected: null, error: e.message, ...(leg ? { first_leg: leg } : {}) }; }
+  }
+  return out;
+}
+
+/** "Wood: Forest 1 (10,20) -> Sawmill 2 (50,20) ..." for find-cargo-pairs --format lines. */
+function pairLine(pr) {
+  const end = (e) => `${e.kind === 'town' ? e.name : e.type} ${e.id} (${e.x},${e.y})`;
+  const dry = pr.dry_run ? (pr.dry_run.ok ? `; dry run ok, cost ${pr.dry_run.estimated_cost}, ${pr.dry_run.line_tiles} tiles of track` : `; dry run failed at ${pr.dry_run.failed_step}: ${pr.dry_run.error}`) : '';
+  const yours = pr.yours ? `; yours: ${pr.yours.from_station.name} -> ${pr.yours.to_station.name}${pr.yours.served_by !== null ? ` served by ${pr.yours.served_by}` : ' (unserved)'}` : '';
+  const effort = pr.route?.reachable ? `, effort ${pr.route.effort_per_tile}/tile` : pr.route ? ', no route' : '';
+  return `${pr.cargo}: ${end(pr.source)} -> ${end(pr.dest)}, ${pr.distance} tiles, ${pr.source_last_month}/month ${pr.source_transported_pct}% moved${effort}${yours}${dry} | ${pr.build}`;
+}
+
+/** build-cargo-route arguments for a find-cargo-pairs pair. */
+const pairRouteArgs = (pr) => ({ ...(pr.source.kind === 'town' ? { from_town: pr.source.name } : { from_industry: pr.source.id }),
+  ...(pr.dest.kind === 'town' ? { to_town: pr.dest.name } : { to_industry: pr.dest.id }), cargo: pr.cargo });
+
+const quoteArg = (v) => (typeof v === 'string' && /\s/.test(v) ? `"${v}"` : String(v));
+
+/** Why an empty find-cargo-pairs found nothing (L17): the biggest exclusion first, with the flag that loosens it. */
+function pairsHint(excluded, a) {
+  const fix = { distance: `--min_distance / --max_distance (now ${a.min_distance ?? PAIR_MIN_DIST}..${a.max_distance ?? PAIR_MAX_DIST})`, transported_pct: `--max_transported_pct (now ${a.max_transported_pct})`,
+    min_production: `--min_production (now ${a.min_production})`, town_acceptance: '--dest_kind industry, or bigger towns', near: `--radius (now ${a.radius})`, region: 'a bigger --x0 --y0 --x1 --y1 box',
+    yours: '--exclude_yours false (you already serve them)' };
+  const parts = Object.entries(excluded).sort((p, q) => q[1] - p[1]).map(([k, n]) => `${n} by ${k} (${fix[k] ?? k})`);
+  return parts.length ? `no pair left: ${parts.join('; ')}` : 'no producer of that cargo matched (check --cargo / --source_type / --source_id against industries)';
+}
+
+/**
+ * find-cargo-pairs: findCargoPairs over the economy, plus your stations (yours / --exclude_yours),
+ * --dry_run_top (build-cargo-route dry runs) and --format lines.
+ */
+async function findCargoPairsCommand(ctx, a) {
+  const s = await ctx.session();
+  const economy = await s.economy();
+  const { industries, towns } = economy;
+  if (a.with_effort) await s.ensureTiles();
+  let townAcceptance = new Map();
+  if (a.dest_kind !== 'industry' && towns.length) {
+    const lists = await acceptanceAt(s, towns.map((t) => [t.x, t.y]), { radius: 4 });
+    townAcceptance = lists && new Map(towns.map((t, i) => [t.id, Object.fromEntries(lists[i].map((c) => [c.cargo, c.acceptance]))]));
+  }
+  const townCargoFallback = new Set([...s.cargos.values()].filter((c) => c.town_effect > 0).map((c) => c.id));
+  if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
+  const box = [a.x0, a.y0, a.x1, a.y1];
+  if (box.some((v) => v !== undefined) && box.some((v) => v === undefined)) throw new Error('a region needs all four of --x0 --y0 --x1 --y1');
+  const region = a.x0 !== undefined ? { x0: Math.min(a.x0, a.x1), y0: Math.min(a.y0, a.y1), x1: Math.max(a.x0, a.x1), y1: Math.max(a.y0, a.y1) } : null;
+  const minDist = a.min_distance ?? PAIR_MIN_DIST, maxDist = a.max_distance ?? PAIR_MAX_DIST;
+  const query = { industries, types: s.types, towns, cargos: s.cargos, townAcceptance, townCargoFallback, map: s.map, cargo: a.cargo, sourceType: a.source_type,
+    destType: a.dest_type, destKind: a.dest_kind, minDist, maxDist, maxTransportedPct: a.max_transported_pct, minProduction: a.min_production,
+    near: a.near_x !== undefined ? { x: a.near_x, y: a.near_y, radius: a.radius } : null, sourceId: a.source_id, destId: a.dest_id, region, sort: a.sort };
+  // L1: pairs where your rail stations already sit at both ends, and whether a vehicle serves them.
+  // No company arg: this stays a world query; the configured company is "you" (the relay sets it per player).
+  const company = s.cfg.company ?? null;
+  const yours = new Map();
+  if (company !== null) {
+    const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).filter((st) => st.facilities.includes('rail'));
+    if (stations.length) {
+      const ends = new Map();
+      const endOf = (e) => { const k = `${e.kind ?? 'industry'}:${e.id}`; if (!ends.has(k)) ends.set(k, lineEnd(s, economy, e.kind === 'town' ? { town: String(e.id) } : { industry: e.id })); return ends.get(k); };
+      const served = new Map();
+      for (const pr of findCargoPairs({ ...query, limit: 1e6, withEffort: false }).pairs) {
+        const c = [...s.cargos.values()].find((q) => q.name === pr.cargo);
+        const existing = findExistingRoute(stations, endOf(pr.source), endOf(pr.dest), c?.id, { radius: 10, bothWays: !!(c?.passengers || c?.mail) });
+        if (!existing) continue;
+        const sk = `${existing.from_station.id}>${existing.to_station.id}`;
+        if (!served.has(sk)) served.set(sk, await vehicleServing(s, company, stations, existing.from_station.id, existing.to_station.id));
+        yours.set(pairKey(pr), { ...existing, served_by: served.get(sk) });
+      }
+    }
+  }
+  const exclude = a.exclude_yours ? new Set([...yours].filter(([, y]) => y.served_by !== null).map(([k]) => k)) : null;
+  const res = findCargoPairs({ ...query, limit: a.limit, withEffort: a.with_effort, exclude });
+  for (const pr of res.pairs) {
+    const y = yours.get(pairKey(pr));
+    if (y) pr.yours = y;
+    pr.build = `build-cargo-route ${Object.entries(pairRouteArgs(pr)).map(([k, v]) => `--${k} ${quoteArg(v)}`).join(' ')}`;
+  }
+  if (a.dry_run_top > 0) {
+    const me = s.companyOrThrow();
+    const schema = COMMANDS_BY_NAME.get('build-cargo-route').args;
+    for (const pr of res.pairs.slice(0, a.dry_run_top)) {
+      try {
+        const r = await buildCargoRoute(s, me, schema.parse({ ...pairRouteArgs(pr), company: me, dry_run: true }), ctx);
+        pr.dry_run = { ok: r.ok, estimated_cost: r.estimated_cost ?? null, line_tiles: r.line?.tiles ?? null, failed_step: r.failed_step ?? null,
+          ...(r.ok ? { affordable: r.affordable } : { error: r.first_error ?? errorCode(r.error ?? 'failed') ?? r.error }) };
+      } catch (e) { pr.dry_run = { ok: false, estimated_cost: null, line_tiles: null, failed_step: 'arguments', error: e.message }; }
+    }
+  }
+  const head = { distance_bounds: { min: minDist, max: maxDist, ...(a.min_distance === undefined || a.max_distance === undefined ? { defaulted: 'pass --min_distance / --max_distance to change' } : {}) },
+    ...(a.near_x !== undefined ? { near: { x: a.near_x, y: a.near_y, radius: a.radius } } : {}), ...(region ? { region } : {}),
+    ...(yours.size ? { yours_found: yours.size } : {}), ...(company === null ? { yours_note: 'no company set, so your own routes are not marked or excluded' } : {}) };
+  const out = { ...head, ...res, ...(res.excluded ? { hint: pairsHint(res.excluded, a) } : {}) };
+  if (a.format === 'lines') { const { pairs, ...rest } = out; return { ...rest, lines: pairs.map(pairLine) }; }
+  return out;
 }
 
 export const COMMANDS = [
   // ---- setup ------------------------------------------------------------------
   {
     name: 'doctor', group: 'setup', session: false,
-    description: 'Check this machine: OpenTTD install, personal dir, original graphics/music, GameScript version. Run first.',
+    description: 'Check this machine: OpenTTD install (and macOS quarantine), personal dir, original graphics/music, GameScript version, and each launch profile\'s server (running, ports, whether its log shows the GameScript died). Run first.',
     args: z.object({}),
-    run: () => doctor(),
+    run: () => {
+      const report = doctor();
+      report.servers = serverStates();
+      for (const sv of report.servers) if (sv.running && sv.gamescript_in_log === 'died') report.next_steps.push(`server '${sv.server}': its log says the GameScript died; load the game again (load${sv.server === 'dedicated' ? '' : ` --server ${sv.server}`} --name <save>) and see server-log --errors true`);
+      return report;
+    },
   },
   {
     name: 'guide', group: 'setup', session: false,
@@ -1256,28 +1906,66 @@ export const COMMANDS = [
   {
     name: 'install-gamescript', group: 'setup', session: false,
     description: 'HOST ONLY: copy the bundled AgentBridge GameScript (and IdleAI test AI) into the OpenTTD personal dir. Re-run after updating openttd-agent.',
-    args: z.object({}),
-    run: () => installGamescript(),
+    args: z.object({
+      reload: bool().default(false).describe('true = also make the running server use it: rescan, save the game, load that save (it starts the newest AgentBridge), wait for the new bridge_version and restore the pause state'),
+      server: serverArg.server,
+      save_name: z.string().optional().describe('--reload: name of the save it makes and loads (default gs-reload-<date>-<time>)'),
+    }),
+    run: async (ctx, a) => (a.reload ? reloadGamescript(serverTarget(ctx.cfg, a.server), { saveName: a.save_name !== undefined ? checkSaveName(a.save_name) : undefined }) : installGamescript()),
+  },
+  {
+    name: 'install-opengfx', group: 'setup', session: false,
+    description: 'Download the free OpenGFX base graphics (official release from cdn.openttd.org, sha256 checked against its manifest) into your OpenTTD baseset folder. Needed when OpenTTD has no base graphics (doctor: base_graphics.found false); a dedicated server does not start without one. Does nothing when OpenGFX is already there. --dry_run true says what it would download.',
+    args: z.object({ dry_run: bool().default(false).describe('true = only say what it would download and where') }),
+    run: (_ctx, a) => installOpenGfx(findPersonalDir(), { dryRun: a.dry_run }),
   },
   {
     name: 'configure', group: 'setup', session: false,
     description: `Save settings to ${CONFIG_FILE} (with the global --profile NAME or OPENTTD_AGENT_PROFILE: to ~/.openttd-agent/players/NAME.json instead, so several players or agents on one machine each keep their own relay token). PLAYER: relay (http://<host-LAN-IP>:<port>) and token, both from the host; game commands then go through the host's relay as the company the host bound you to. HOST: admin_password (stays on this machine), admin_port, relay_port. Either: max_builds_per_minute (0 = unlimited). relay "" switches back to the admin port directly.`,
     args: z.object({
-      relay: z.string().optional().describe('player: relay URL, e.g. http://192.168.1.20:47978 ("" = off)'),
+      relay: z.string().optional().describe('player: relay URL, e.g. http://192.0.2.20:47978 ("" = off)'),
       token: z.string().optional().describe('player: token from the host (relay-add-player)'),
       host: z.string().optional(), admin_port: int().optional(), admin_password: z.string().optional().describe('host only'),
       relay_port: int().min(1).max(65535).optional().describe('host: port the relay listens on'),
       company: int().optional().describe('direct mode only; with a relay the host decides your company'),
       max_builds_per_minute: int().min(0).optional(), tile_refresh_rows_per_sec: int().min(0).optional(),
+      accept_untested: bool().optional().describe('true = connect to / launch an OpenTTD version openttd-agent was not tested with (beta, nightly, newer release); also OPENTTD_AGENT_ACCEPT_UNTESTED=1'),
     }),
     run: (_ctx, { token, ...a }) => {
       if (a.relay) {
         let url;
-        try { url = new URL(a.relay); } catch { throw new Error(`relay must be a URL like http://192.168.1.20:47978, got '${a.relay}'`); }
+        try { url = new URL(a.relay); } catch { throw new Error(`relay must be a URL like http://192.0.2.20:47978, got '${a.relay}'`); }
         if (url.protocol !== 'http:') throw new Error('relay must be an http:// URL (the relay speaks plain HTTP on the LAN)');
         a.relay = url.origin;
       }
-      return redacted(saveConfig({ ...a, ...(token !== undefined ? { relay_token: token } : {}) }));
+      const saved = redacted(saveConfig({ ...a, ...(token !== undefined ? { relay_token: token } : {}) }));
+      const net = a.relay ? diagnoseAddress(a.relay) : null;
+      return net?.hint ? { ...saved, network: net, hint: net.hint } : saved;
+    },
+  },
+  {
+    name: 'net-check', group: 'setup', session: false,
+    description: "Network diagnosis, read-only and without admin rights. --role player (default when a relay is configured): classifies the host address (loopback, private LAN, CGNAT/mesh VPN, link-local, public) against this machine's subnets and test-connects the relay and game ports; a private address on another network gets hint + options (OpenTTD invite codes for the game; a mesh VPN or tunnel for the relay, links only). --role host: who listens on the game/admin/relay ports and on which address (lsof), a self-connect on the LAN address, the firewall state (macOS socketfilterfw incl. whether OpenTTD and node are blocked; Linux ufw/firewalld; Windows netsh) and `fixes`: allow the app or port on private networks, never turn the firewall off.",
+    args: z.object({
+      role: z.enum(['host', 'player']).optional().describe('default: player when a relay is configured, else host'),
+      target: z.string().optional().describe('player: host address or relay URL to check (default: the configured relay, else host)'),
+      ...serverArg,
+      game_port: int().min(1).max(65535).optional().describe('default: the server profile\'s, else 3979'),
+      relay_port: int().min(1).max(65535).optional().describe('default: the port in the relay URL, else the configured relay_port'),
+      probe: bool().optional().describe('player: also test-connect a private address that is on none of this machine\'s subnets (skipped by default: it is almost always another LAN)'),
+    }),
+    run: async (ctx, a) => {
+      const role = a.role ?? (ctx.cfg.relay ? 'player' : 'host');
+      if (role === 'player') {
+        const target = a.target ?? (ctx.cfg.relay || ctx.cfg.host);
+        let relayPort = a.relay_port;
+        if (relayPort === undefined) { try { relayPort = Number(new URL(/^[a-z]+:\/\//i.test(target) ? target : `http://${target}`).port) || ctx.cfg.relay_port; } catch { relayPort = ctx.cfg.relay_port; } }
+        return playerCheck({ target, probe: a.probe, ports: [{ port: relayPort, role: 'relay' }, { port: a.game_port ?? 3979, role: 'game' }] });
+      }
+      let t = null;
+      try { t = serverTarget(ctx.cfg, a.server); } catch (e) { if (a.server) throw e; }
+      const ports = [{ port: a.game_port ?? t?.game_port ?? 3979, role: 'game' }, { port: t?.admin_port ?? ctx.cfg.admin_port, role: 'admin' }, { port: a.relay_port ?? ctx.cfg.relay_port, role: 'relay' }];
+      return { server: t?.server ?? null, ...(await hostCheck({ ports, exe: findExecutable() })) };
     },
   },
   {
@@ -1288,9 +1976,12 @@ export const COMMANDS = [
   },
   {
     name: 'launch', group: 'setup', session: false,
-    description: 'Start OpenTTD with the right settings. mode=dedicated: headless LAN server with AgentBridge (everyone joins as a client). mode=host: GUI with server settings preset; then Multiplayer > Start Server. mode=join: GUI client joining join_host. Never edits your own openttd.cfg (uses a profile in ~/.openttd-agent/profiles).',
+    description: 'Start OpenTTD with the right settings. mode=dedicated: headless LAN server with AgentBridge (everyone joins as a client); waits until the admin port and AgentBridge answer (ready, bridge_version, seconds; not_ready with the process state and log tail otherwise). A server already running from this profile is reported (already_running) and left alone unless --restart true. mode=host: GUI with server settings preset; then Multiplayer > Start Server. mode=join: GUI client joining join_host. --server NAME --game_port --admin_port runs another server beside the first (its own profile; host commands take the same --server). Never edits your own openttd.cfg (uses a profile in ~/.openttd-agent/profiles/<server>); rotates the profile\'s openttd.log (keeps 3). --dry_run true writes nothing.',
     args: z.object({
       mode: z.enum(['dedicated', 'host', 'join']).default('dedicated'),
+      server: z.string().optional().describe('launch profile name (default: the mode). A second name with its own --game_port/--admin_port runs a second server on this machine; later host commands pick it with --server NAME'),
+      game_port: int().min(1).max(65535).optional().describe('default 3979, or what this --server used last time'),
+      admin_port: int().min(1).max(65535).optional().describe('default: the configured admin_port (3977), or what this --server used last time'),
       admin_password: z.string().optional().describe('dedicated/host: defaults to the configured admin_password; if there is none, a random one is generated and saved in the config (it never needs to leave this machine)'),
       join_host: z.string().optional().describe('host LAN IP for mode=join; defaults to configured host'),
       seed: int().optional(), map_bits: int().min(6).max(12).default(8).describe('map size as power of two: 8=256, 9=512, 10=1024'),
@@ -1299,27 +1990,87 @@ export const COMMANDS = [
       max_builds_per_day: int().min(0).default(0).describe('GameScript rate limit per company per game day (0 = unlimited)'),
       terrain: z.enum(TERRAIN_TYPES).optional().describe('new maps only; default: whatever your openttd.cfg says (OpenTTD default flat)'),
       script_opcodes: int().min(500).max(250000).default(100000).describe('host: opcodes the GameScript may run per tick (OpenTTD default 10000); higher = faster map mirror and replies'),
-      bind: z.string().default('0.0.0.0'), dry_run: bool().default(false),
+      bind: z.string().default('0.0.0.0'),
+      restart: bool().default(false).describe('true = stop a server already running from this profile (console quit, then SIGTERM by its cfg path) and start again'),
+      wait: bool().optional().describe('wait until ready (default true for mode=dedicated; host/join open a window and are not waited for)'),
+      wait_s: int().min(1).max(280).default(60).describe('how long to wait for ready'),
+      accept_untested: bool().optional().describe('true = start an OpenTTD version openttd-agent was not tested with (beta, nightly, newer release); default: config accept_untested or OPENTTD_AGENT_ACCEPT_UNTESTED=1'),
+      dry_run: bool().default(false).describe('true = show the command line and the files it would write; writes and starts nothing'),
     }),
-    run: (ctx, a) => {
-      let adminPassword = a.admin_password ?? ctx.cfg.admin_password;
+    run: async (ctx, a) => {
       const hosting = a.mode !== 'join';
+      const exe = findExecutable();
+      const ottd = classifyVersion(exe ? detectInstalledVersion(exe).version : null);
+      const refusal = exe ? versionRefusal(ottd, acceptUntested({ arg: a.accept_untested, cfg: ctx.cfg.accept_untested }), `installed OpenTTD (${exe})`) : null;
+      if (!exe && !a.dry_run) throw new Error(`openttd_not_found: ${installHint()}`);
+      if (refusal && !a.dry_run) throw new Error(refusal);
+      const server = a.server ?? a.mode;
+      const dir = profileDir(server);
+      const prev = a.server ? profilePorts(dir) : {};
+      const adminPort = a.admin_port ?? prev.admin_port ?? ctx.cfg.admin_port;
+      const gamePort = a.game_port ?? prev.game_port ?? 3979;
+      const host = hosting ? adminHostForBind(a.bind) : null;
+      const primary = hosting && adminPort === ctx.cfg.admin_port;
+      let adminPassword = a.admin_password ?? ctx.cfg.admin_password;
       const generated = hosting && !adminPassword;
       if (generated) adminPassword = randomBytes(24).toString('base64url');
-      const result = launch({
-        mode: a.mode, adminPassword, joinHost: a.join_host ?? ctx.cfg.host,
+      const cfgPath = path.join(dir, 'openttd.cfg');
+      const target = { server, dir, cfgPath, host, admin_port: adminPort, game_port: gamePort, password: adminPassword, local: true };
+      const running = serverPids(cfgPath);
+      const opts = {
+        mode: a.mode, server, adminPassword, joinHost: a.join_host ?? ctx.cfg.host, adminPort, gamePort,
         seed: a.seed, mapBits: a.map_bits, load: a.load, commandDelayTicks: a.command_delay_ticks,
-        maxBuildsPerDay: a.max_builds_per_day, scriptOpcodes: a.script_opcodes, terrain: a.terrain, bind: a.bind, adminPort: ctx.cfg.admin_port, dryRun: a.dry_run,
-      });
-      // The relay and the CLI on this machine read the password and admin address from the config, so keep them in step.
-      const host = hosting ? adminHostForBind(a.bind) : null;
-      const updates = {
-        ...(hosting && adminPassword !== ctx.cfg.admin_password ? { admin_password: adminPassword } : {}),
-        ...(host && host !== ctx.cfg.host ? { host } : {}),
+        maxBuildsPerDay: a.max_builds_per_day, scriptOpcodes: a.script_opcodes, terrain: a.terrain, bind: a.bind, dryRun: a.dry_run,
       };
-      if (!a.dry_run && Object.keys(updates).length) saveConfig(updates);
-      return { ...result, ...(generated ? { admin_password: a.dry_run ? 'would be generated' : 'generated and saved in the config' } : {}),
-        ...(updates.host ? { admin_host: a.dry_run ? `would be saved as host: ${host}` : `saved as host: ${host} (the server listens only there)` } : {}) };
+      if (a.dry_run) {
+        const { result } = launch(opts);
+        return { ...result, openttd: { version: ottd.version, class: ottd.class, ...(refusal ? { would_refuse: refusal } : {}) }, ...(running?.length ? { running_now: running } : {}), ...(generated ? { admin_password: 'would be generated' } : {}),
+          ...(primary && host !== ctx.cfg.host ? { admin_host: `would be saved as host: ${host}` } : {}) };
+      }
+      let restarted = null;
+      if (hosting && running?.length) {
+        if (!a.restart) {
+          const probe = await waitReady({ ...target, password: ctx.cfg.admin_password || adminPassword }, { timeoutMs: 4000 });
+          return { already_running: true, server, pids: running, admin_port: adminPort, game_port: gamePort, ready: probe.ready,
+            ...(probe.ready ? { bridge_version: probe.bridge_version, paused: probe.paused } : { stage: probe.stage }),
+            note: `a server from profile '${server}' is already running; nothing was started. Use it, or: launch --restart true (or server-stop${a.server ? ` --server ${server}` : ''})` };
+        }
+        restarted = await stopServer({ ...target, password: ctx.cfg.admin_password || adminPassword });
+      }
+      if (hosting) {
+        const busy = [];
+        for (const p of [adminPort, gamePort]) if (await portOpen(host, p)) busy.push(p);
+        if (busy.length) throw new Error(`port_in_use: ${busy.map((p) => portHolderText(p, listeners(p))).join(' and ')} on ${host} is taken by another program or server (not profile '${server}'). Pick others: launch --server ${server === a.mode ? 'NAME' : server} --game_port N --admin_port M`);
+      }
+      const { result, child } = launch(opts);
+      result.openttd = { version: ottd.version, class: ottd.class };
+      const notes = [];
+      if (hosting && !findBasesets(findPersonalDir()).length) notes.push('no base graphics found: a dedicated server will not start without one. Run openttd-agent install-opengfx, then launch again');
+      const low = diskWarning(freeBytes(dir), `saves in ${dir}`);
+      if (low) notes.push(low);
+      if (hosting) { const awake = keepAwakeHint(result.pid); if (awake) result.keep_awake = awake; }
+      if (notes.length) result.warnings = notes;
+      let exitCode;
+      child.on('exit', (code, signal) => { exitCode = code ?? signal; });
+      // The relay and the CLI on this machine read the password and admin address from the config, so keep them in step
+      // for the server the config points at (a side server on other ports leaves the config alone).
+      const updates = {
+        ...(hosting && (primary || generated) && adminPassword !== ctx.cfg.admin_password ? { admin_password: adminPassword } : {}),
+        ...(primary && host !== ctx.cfg.host ? { host } : {}),
+      };
+      if (Object.keys(updates).length) saveConfig(updates);
+      const out = { ...result, ...(restarted ? { restarted } : {}), ...(generated ? { admin_password: 'generated and saved in the config' } : {}),
+        ...(updates.host ? { admin_host: `saved as host: ${host} (the server listens only there)` } : {}),
+        ...(hosting && !primary ? { side_server: `the config still points at admin port ${ctx.cfg.admin_port}. Host commands: --server ${server}. Game commands: OPENTTD_AGENT_ADMIN_PORT=${adminPort} openttd-agent <command> --no-daemon` } : {}) };
+      if (!(a.wait ?? a.mode === 'dedicated')) return out;
+      const ready = await waitReady(target, { timeoutMs: a.wait_s * 1000, exited: () => exitCode });
+      if (ready.ready) return { ...out, ...ready };
+      const detail = notReadyDetail(target, { pid: result.pid, exitCode });
+      // launch --load with a save it cannot read: the server logs why and exits (verified on 14.1 with a 15.3 save).
+      const why = a.load ? loadProblem(detail.log_tail.join('\n')) : null;
+      if (why) return { ...out, ok: false, error: `${loadProblemText(why)} (${a.load}); the server exited`, ...ready, ...detail };
+      return { ...out, ok: false, error: `not_ready: server '${server}' was not ready within ${a.wait_s}s (stage: ${ready.stage}${ready.last_error ? `: ${ready.last_error}` : ''}). See process and log_tail; server-log${a.server ? ` --server ${server}` : ''} shows more`,
+        ...ready, ...detail };
     },
   },
   {
@@ -1333,6 +2084,65 @@ export const COMMANDS = [
       script_opcodes: int().min(500).max(250000).default(100000).describe('GameScript opcodes per tick stored in the copy (a scenario brings its own, usually 10000)'),
     }),
     run: (ctx, a) => prepareScenario(ctx.cfg, { search: a.search, contentId: a.content_id, name: a.name, load: a.load, scriptOpcodes: a.script_opcodes }),
+  },
+
+  // ---- host server control (session: false: own admin connection; refused through the relay) ----
+  {
+    name: 'saves', group: 'host', session: false,
+    description: "HOST ONLY: savegames in the server's save folder (the launch profile's save/), newest first: name (what load --name and launch --load take), bytes, modified.",
+    args: z.object({ ...serverArg, match: z.string().optional().describe('only names containing this text'), limit: int().min(1).max(1000).default(50) }),
+    run: (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      const { folder, saves } = listSaves(t.dir);
+      const matched = a.match ? saves.filter((x) => x.name.toLowerCase().includes(a.match.toLowerCase())) : saves;
+      return { server: t.server, folder, ...listResult('saves', saves, matched, a.limit) };
+    },
+  },
+  {
+    name: 'load', group: 'host', session: false,
+    description: "HOST ONLY: load a save on the running server (console ls, then load by its index) and wait until AgentBridge answers in the new game. Returns loaded, map, date, paused, bridge_version, seconds. --pause true/false sets the pause state after loading (default: as saved; a game saved paused loads paused). Every player's session reconnects on its next call. A save runs the GameScript stored in it: one made without AgentBridge will not answer (scenario-prepare makes a copy that does).",
+    args: z.object({ ...serverArg, name: z.string().describe('save name as `saves` lists it (with or without .sav)'), pause: bool().optional().describe('true = pause after loading, false = unpause; default as saved') }),
+    run: async (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      return { server: t.server, ...(await withAdmin(t, (admin, gs) => loadSave(admin, gs, checkSaveName(a.name), { pause: a.pause, dir: t.dir }))) };
+    },
+  },
+  {
+    name: 'server-stop', group: 'host', session: false,
+    description: "HOST ONLY: stop the server (console quit; if it does not exit, SIGTERM to the processes started with this profile's openttd.cfg, and nothing else). --save NAME saves first and waits for the file; without the save it does not quit. Returns was_running, stopped, method.",
+    args: z.object({ ...serverArg, save: z.string().optional().describe('save under this name before quitting') }),
+    run: async (ctx, a) => stopServer(serverTarget(ctx.cfg, a.server), { save: a.save !== undefined ? checkSaveName(a.save) : undefined }),
+  },
+  {
+    name: 'console', group: 'host', session: false,
+    description: 'HOST ONLY escape hatch: run one server console command over the admin port (rcon) and return its output lines, e.g. "setting command_pause_level", "list_ai", "companies". Prefer the dedicated commands (load, saves, pause, company-new, server-stop). Console `companies` numbers from 1; every other openttd-agent command from 0.',
+    args: z.object({ ...serverArg, command: z.string().min(1).describe('console command line') }),
+    run: async (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      const lines = await withAdmin(t, (admin) => admin.rcon(a.command, 30000), { name: 'openttd-agent-console' });
+      return { server: t.server, command: a.command, lines };
+    },
+  },
+  {
+    name: 'company-new', group: 'host', session: false,
+    description: 'HOST ONLY: start an AI company on the server (console start_ai) and return its company id (0-based, as every other command uses). IdleAI (installed by install-gamescript) builds nothing: a test company to act as with --company.',
+    args: z.object({ ...serverArg, ai: z.string().default('IdleAI').describe('AI name as `console --command list_ai` shows it') }),
+    run: async (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      return { server: t.server, ...(await withAdmin(t, (admin, gs) => companyNew(admin, gs, a.ai))) };
+    },
+  },
+  {
+    name: 'server-log', group: 'host', session: false,
+    description: "HOST ONLY: the end of the server's openttd.log (the launch profile's; launch rotates it, keeping 3). --errors true keeps only error lines (script errors, crashes); --grep TEXT only lines containing TEXT. `gs` says whether AgentBridge started and whether a script died after that (state started / died / not_started).",
+    args: z.object({ ...serverArg, lines: int().min(1).max(500).default(40), errors: bool().default(false), grep: z.string().optional() }),
+    run: (ctx, a) => {
+      const t = serverTarget(ctx.cfg, a.server);
+      const tail = logTail(t.dir, { lines: a.lines, errors: a.errors, grep: a.grep });
+      if (!tail.exists) return { ok: false, error: `no_log: ${tail.file} does not exist (start the server with openttd-agent launch)`, server: t.server };
+      const pids = serverPids(t.cfgPath);
+      return { server: t.server, running: pids === null ? null : pids.length > 0, ...tail };
+    },
   },
 
   // ---- relay (host only: who may play which company) ---------------------------
@@ -1385,7 +2195,7 @@ export const COMMANDS = [
   // ---- game -------------------------------------------------------------------
   {
     name: 'status', group: 'game', session: true,
-    description: 'Game date, map size, pause state, your company, rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
+    description: 'Game date (`date` "YYYY-MM-DD"; raw in info), map size, pause state, your company (`me`: money, loan, max_loan, value, cargo_delivered, performance, profit of the last full quarter; never read companies[0], it is not necessarily you), rate limits, tile-mirror progress, versions (openttd-agent, running and bundled AgentBridge), background_jobs (queued vehicle sales and wagon jobs, the periodic save; kept in ~/.openttd-agent/jobs-<host>-<port>.json per game, so they survive a daemon restart) and warnings (an outdated GameScript or, through a relay, a different openttd-agent version on the host).',
     args: z.object({}),
     run: async (ctx) => {
       const s = await ctx.session();
@@ -1397,14 +2207,14 @@ export const COMMANDS = [
       if (bundled !== null && running !== null && running < bundled) {
         warnings.push(`the game runs AgentBridge v${running}; this openttd-agent ${VERSION} ships v${bundled}. Host: openttd-agent install-gamescript, then load or launch the game again (a running game keeps its GameScript); until then newer features say so or fall back`);
       }
-      return { info, my_company: s.cfg.company, companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
+      return { date: dateString(info), info, my_company: s.cfg.company, me: meFromCompanies(companies, s.cfg.company), companies, rate, client_max_builds_per_minute: s.cfg.max_builds_per_minute,
         tile_mirror: { rows_loaded: loaded, rows_total: s.map.sizeY, load_ms: s.tileLoadMs ?? null },
-        versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, warnings };
+        versions: { openttd_agent: VERSION, gamescript_running: running, gamescript_bundled: bundled }, openttd: openttdVersions(s, warnings), background_jobs: s.backgroundJobs(), warnings };
     },
   },
   {
     name: 'companies', group: 'game', session: true,
-    description: 'All companies: money, loan, and for the last full quarter (`period`, e.g. "1951 Q2") income, expenses (negative), company value, cargo delivered and performance rating; station_count and vehicles_by_type {rail, road, water, air} (AgentBridge v12; the company window shows both to anyone). --history N adds the last N quarters per company (`history`: period, value, income, expenses, delivered, performance; newest first; AgentBridge v12). Use for competitor assessment.',
+    description: 'All companies (and the game `date`): money, loan, and for the last full quarter (`period`, e.g. "1951 Q2") income, expenses (negative), profit (income + expenses), company value, cargo delivered and performance rating; station_count and vehicles_by_type {rail, road, water, air} (AgentBridge v12; the company window shows both to anyone). --history N adds the last N quarters per company (`history`: period, value, income, expenses, profit, delivered, performance; newest first; AgentBridge v12). Use for competitor assessment.',
     args: z.object({ history: int().min(0).max(24).default(0).describe('quarters of history per company (0 = none)') }),
     run: async (ctx, a) => {
       const s = await ctx.session();
@@ -1412,12 +2222,12 @@ export const COMMANDS = [
       const out = [];
       for (const c of rows) {
         const { vehicles_by_type: vt, ...rest } = c;
-        const row = { ...rest, period: quarterLabel(info, 1), ...(vt ? { vehicles_by_type: { rail: vt[0], road: vt[1], water: vt[2], air: vt[3] } } : {}) };
+        const row = { ...rest, profit: companyProfit(c), period: quarterLabel(info, 1), ...(vt ? { vehicles_by_type: { rail: vt[0], road: vt[1], water: vt[2], air: vt[3] } } : {}) };
         if (a.history > 0) {
           try {
             const h = await s.gs.call('company_history', { company: c.id, quarters: a.history });
             row.history = h.filter((r) => r[0] >= 1).sort((p, q) => p[0] - q[0])
-              .map(([q, value, income, expenses, delivered, performance]) => ({ period: quarterLabel(info, q), value, income, expenses, delivered, performance }));
+              .map(([q, value, income, expenses, delivered, performance]) => ({ period: quarterLabel(info, q), value, income, expenses, profit: income + expenses, delivered, performance }));
           } catch (e) {
             if (!/unknown cmd/.test(e.message)) throw e;
             row.history = null;
@@ -1426,7 +2236,7 @@ export const COMMANDS = [
         }
         out.push(row);
       }
-      return listResult('companies', out, out);
+      return { date: dateString(info), ...listResult('companies', out, out) };
     },
   },
   {
@@ -1546,7 +2356,7 @@ export const COMMANDS = [
 
   {
     name: 'save', group: 'host', session: true,
-    description: "HOST ONLY: save the running server game over the console (`save <name>`). OpenTTD writes it to the launch profile's save folder (save/<name>.sav next to the profile's openttd.cfg); load it again with launch --load <name>. Name: letters, digits, _ . - only (no paths). Periodic saves: --every_months N --prefix P makes the daemon save P-YYYY-MM every N game months (checked every 20 s while the game runs; also once now); --every_months 0 stops; with neither name nor every_months it shows the schedule. The schedule lives in the daemon (or MCP server) and ends when it restarts.",
+    description: "HOST ONLY: save the running server game over the console (`save <name>`). OpenTTD writes it to the launch profile's save folder (save/<name>.sav next to the profile's openttd.cfg); load it again with launch --load <name>. Name: letters, digits, _ . - only (no paths). Periodic saves: --every_months N --prefix P makes the daemon save P-YYYY-MM every N game months (checked every 20 s while the game runs; also once now); --every_months 0 stops; with neither name nor every_months it shows the schedule. The daemon (or MCP server) runs the schedule; it is kept in ~/.openttd-agent/jobs-<host>-<port>.json for this game and resumes when the daemon reconnects to the same game.",
     args: z.object({ name: z.string().optional().describe('save name without extension, e.g. game-night-1'),
       every_months: int().min(0).max(120).optional().describe('periodic save every N game months (0 = stop)'), prefix: z.string().default('autosave').describe('periodic save name prefix') }),
     run: async (ctx, a) => {
@@ -1577,17 +2387,30 @@ export const COMMANDS = [
   },
   {
     name: 'towns', group: 'world', session: true,
-    description: 'Towns with population and last-month passenger/mail production and transported %. Filter by min_population, name, id, near_x/near_y within radius (each row then has distance); sorted by population (by distance with near_x/near_y).',
-    args: z.object({ min_population: int().default(0), limit: int().default(50), name: z.string().optional(), id: int().optional(),
+    description: 'Towns with population and last-month passenger/mail production and transported %. Filter by min_population, name, id, near_x/near_y within radius (each row then has distance); sorted by population (by distance with near_x/near_y). With a company (yours by default): my_rating {rating, value, rated} = what the town\'s local authority thinks of the company (the town window\'s word: none, appalling, very_poor, poor, mediocre, good, very_good, excellent, outstanding; value -1000..1000; a new station needs more than -200). AgentBridge v13.',
+    args: z.object({ ...who, min_population: int().default(0), limit: int().default(50), name: z.string().optional(), id: int().optional(),
       near_x: int().optional(), near_y: int().optional(), radius: int().min(1).default(50) }),
     run: async (ctx, a) => {
       if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
-      const { towns } = await (await ctx.session()).economy();
+      const s = await ctx.session();
+      const { towns } = await s.economy();
       const near = a.near_x !== undefined ? { x: a.near_x, y: a.near_y } : null;
-      const hits = towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())) && (a.id === undefined || t.id === a.id))
+      let hits = towns.filter((t) => t.population >= a.min_population && (!a.name || t.name.toLowerCase().includes(a.name.toLowerCase())) && (a.id === undefined || t.id === a.id))
         .map((t) => (near ? { ...t, distance: manhattan(t, near) } : t)).filter((t) => !near || t.distance <= a.radius)
         .sort((x, y) => (near ? x.distance - y.distance : y.population - x.population));
-      return listResult('towns', towns, hits, a.limit);
+      const company = a.company ?? s.cfg.company;
+      let note = null;
+      if (company !== null && company !== undefined && hits.length) {
+        const shown = hits.slice(0, a.limit);
+        try {
+          const rows = new Map((await s.gs.call('town_rating', { company, towns: shown.map((t) => t.id) })).map((r) => [r[0], townRatingFromRow(r)]));
+          hits = [...shown.map((t) => { const r = rows.get(t.id); return r ? { ...t, my_rating: { rating: r.rating, value: r.rating_value, rated: r.rated } } : t; }), ...hits.slice(a.limit)];
+        } catch (e) {
+          if (!/unknown cmd/.test(e.message)) throw e;
+          note = 'my_rating needs AgentBridge v13; the host re-runs install-gamescript and loads the game again';
+        }
+      }
+      return { ...(company !== null && company !== undefined ? { company } : {}), ...listResult('towns', towns, hits, a.limit), ...(note ? { my_rating_note: note } : {}) };
     },
   },
   {
@@ -1611,32 +2434,21 @@ export const COMMANDS = [
   },
   {
     name: 'find-cargo-pairs', group: 'world', session: true,
-    description: `Opportunity finder: under-served producers of a cargo paired with destinations min_distance..max_distance tiles away: industries that accept it, and towns whose centre area accepts it (acceptance >= ${ACCEPTED} within radius 4; goods, passengers, mail, food...). Ranked by terrain effort of the route (water, hills, towns, existing track). Each dest has kind industry|town. Passengers and mail pair town with town (source kind town, source_last_month = the town's last-month production); feed both names to build-cargo-route --from_town --to_town. Secondary producers (sawmill, factory, refinery...) are marked secondary: true; they show last_month 0 until supplied. Distance defaults to ${PAIR_MIN_DIST}..${PAIR_MAX_DIST} tiles (distance_bounds says which applied); --near_x/--near_y/--radius keeps sources near a tile (e.g. your network). Example: cargo=goods, dest_kind=town, min_distance=20.`,
+    description: `Opportunity finder: under-served producers of a cargo paired with destinations min_distance..max_distance tiles away: industries that accept it, and towns whose centre area accepts it (acceptance >= ${ACCEPTED} within radius 4; goods, passengers, mail, food...). Ranked by terrain effort of the route (water, hills, towns, existing track). Each dest has kind industry|town. Passengers and mail pair town with town (source kind town, source_last_month = the town's last-month production); feed both names to build-cargo-route --from_town --to_town. Secondary producers (sawmill, factory, refinery...) are marked secondary: true; they show last_month 0 until supplied. Distance defaults to ${PAIR_MIN_DIST}..${PAIR_MAX_DIST} tiles (distance_bounds says which applied); --near_x/--near_y/--radius keeps sources near a tile (e.g. your network). Example: cargo=goods, dest_kind=town, min_distance=20. Filters: --source_id / --dest_id (industry or town id), a region box --x0 --y0 --x1 --y1 (both ends inside), --sort effort|revenue|distance|production. yours {from_station, to_station, served_by} marks pairs where your rail stations already sit at both ends; --exclude_yours true (default) drops the ones a vehicle of yours serves. When nothing is left, excluded counts each reason (distance, transported_pct, min_production, town_acceptance, near, region, yours) with a hint. --dry_run_top N dry-runs build-cargo-route for the first N pairs (dry_run {ok, estimated_cost, line_tiles, failed_step, error}). --format lines gives one line per pair (lines[]) instead of pairs[]. Each pair has build (the build-cargo-route command).`,
     args: z.object({
       cargo: z.string().optional(), source_type: z.string().optional(), dest_type: z.string().optional().describe("industry type name, or 'town' / a town name"),
       dest_kind: z.enum(['any', 'industry', 'town']).default('any'),
       min_distance: int().optional().describe(`default ${PAIR_MIN_DIST}`), max_distance: int().optional().describe(`default ${PAIR_MAX_DIST} (a train route of 900 tiles takes years per trip)`), max_transported_pct: int().default(100),
       near_x: int().optional(), near_y: int().optional(), radius: int().min(1).default(60).describe('with near_x/near_y: sources within this many tiles'),
       min_production: int().default(0).describe('primary sources only; secondary ones are kept'), limit: int().default(10), with_effort: bool().default(true),
+      source_id: int().optional().describe('only this source (industry id; town id for passengers/mail)'), dest_id: int().optional().describe('only this destination (industry or town id)'),
+      x0: int().optional(), y0: int().optional(), x1: int().optional(), y1: int().optional().describe('region box x0,y0..x1,y1: both ends inside'),
+      sort: z.enum(['effort', 'revenue', 'distance', 'production']).default('effort').describe('effort: easiest terrain per tile (default); revenue: unserved volume x distance; distance: shortest first; production: biggest source first'),
+      exclude_yours: bool().default(true).describe('drop pairs one of your vehicles already serves (your rail stations at both ends)'),
+      dry_run_top: int().min(0).max(5).default(0).describe('dry-run build-cargo-route for the first N pairs: dry_run {ok, estimated_cost, line_tiles, failed_step}'),
+      format: z.enum(['json', 'lines']).default('json').describe('lines: one text line per pair instead of pairs[]'),
     }),
-    run: async (ctx, a) => {
-      const s = await ctx.session();
-      const { industries, towns } = await s.economy();
-      if (a.with_effort) await s.ensureTiles();
-      let townAcceptance = new Map();
-      if (a.dest_kind !== 'industry' && towns.length) {
-        const lists = await acceptanceAt(s, towns.map((t) => [t.x, t.y]), { radius: 4 });
-        townAcceptance = lists && new Map(towns.map((t, i) => [t.id, Object.fromEntries(lists[i].map((c) => [c.cargo, c.acceptance]))]));
-      }
-      const townCargoFallback = new Set([...s.cargos.values()].filter((c) => c.town_effect > 0).map((c) => c.id));
-      if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('give both --near_x and --near_y');
-      const minDist = a.min_distance ?? PAIR_MIN_DIST, maxDist = a.max_distance ?? PAIR_MAX_DIST;
-      const res = findCargoPairs({ industries, types: s.types, towns, cargos: s.cargos, townAcceptance, townCargoFallback, map: s.map, cargo: a.cargo, sourceType: a.source_type,
-        destType: a.dest_type, destKind: a.dest_kind, minDist, maxDist, maxTransportedPct: a.max_transported_pct,
-        minProduction: a.min_production, limit: a.limit, withEffort: a.with_effort, near: a.near_x !== undefined ? { x: a.near_x, y: a.near_y, radius: a.radius } : null });
-      return { distance_bounds: { min: minDist, max: maxDist, ...(a.min_distance === undefined || a.max_distance === undefined ? { defaulted: 'pass --min_distance / --max_distance to change' } : {}) },
-        ...(a.near_x !== undefined ? { near: { x: a.near_x, y: a.near_y, radius: a.radius } } : {}), ...res };
-    },
+    run: (ctx, a) => findCargoPairsCommand(ctx, a),
   },
   {
     name: 'acceptance', group: 'world', session: true,
@@ -1684,58 +2496,65 @@ export const COMMANDS = [
   },
   {
     name: 'airport-sites', group: 'world', session: true,
-    description: 'Find places to build an airport near a town: flat buildable rectangles of the airport size within radius, each checked for town noise limit and (with your company) a dry-run build with cost. With your company (AgentBridge v10), your owned land counts as buildable and each site has owned: true when its whole footprint is your owned land; those sites come first.',
+    description: 'Find places to build an airport near a town: flat buildable rectangles of the airport size within radius, each checked for town noise limit and (with your company) a dry-run build with cost. With your company (AgentBridge v10), your owned land counts as buildable and each site has owned: true when its whole footprint is your owned land; those sites come first. --towns A,B checks several towns in one call.',
     args: z.object({
-      town: z.string().describe('town name (substring)'), airport: z.string().default('small').describe('airport type name, see airport-types'),
-      radius: int().default(20), max_height_spread: int().default(0), limit: int().default(5),
+      town: z.string().optional().describe('town name (substring)'),
+      towns: z.string().optional().describe('comma-separated town names: one call checks several towns (result: towns[{town, sites}])'),
+      airport: z.string().default('small').describe('airport type name, see airport-types'),
+      radius: int().default(20), max_height_spread: int().default(0), limit: int().default(5).describe('sites per town'),
     }),
     run: async (ctx, a) => {
       const s = await ctx.session();
+      const names = a.towns !== undefined ? a.towns.split(',').map((t) => t.trim()).filter(Boolean) : a.town !== undefined ? [a.town] : [];
+      if (!names.length) throw new Error('bad_arguments: give --town NAME or --towns A,B');
       const [{ towns }, types] = await Promise.all([s.economy(), s.gs.call('airport_types'), s.ensureTiles()]);
-      const town = towns.find((t) => t.name.toLowerCase().includes(a.town.toLowerCase()));
-      if (!town) throw new Error(`no town matching '${a.town}'`);
       const at = types.find((t) => t.name === a.airport.toLowerCase());
       if (!at) throw new Error(`unknown airport '${a.airport}'. Available: ${types.map((t) => t.name).join(', ')}`);
-      const company = s.cfg.company;
-      const hasCompany = company !== null && company !== undefined;
-      // Own owned land counts as buildable (airports clear it); company from the config, so the relay binds it.
-      const pad = Math.max(at.width, at.height);
-      const box = { x0: town.x - a.radius, y0: town.y - a.radius, x1: town.x + a.radius + pad, y1: town.y + a.radius + pad };
-      const owned = hasCompany ? await ownedLandAt(s, company, ownedLandCandidates(s.map, box)) : null;
-      const sites = findFlatSites(s.map, { cx: town.x, cy: town.y, width: at.width, height: at.height, radius: a.radius, maxHeightSpread: a.max_height_spread, limit: a.limit * 3, owned });
-      const checked = [];
-      for (const site of sites) {
-        const chk = await s.gs.call('check_airport', { x: site.x, y: site.y, type: at.type, ...(hasCompany ? { company } : {}) });
-        checked.push({ ...site, ...chk, noise_ok: chk.noise_increase <= chk.town_allowed_noise });
-        if (checked.filter((c) => c.noise_ok && c.buildable !== false).length >= a.limit) break;
+      if (a.towns === undefined) return { ...(await airportSitesNear(s, towns, names[0], at, a)), airport: at };
+      const out = [];
+      for (const name of names) {
+        try { out.push(await airportSitesNear(s, towns, name, at, a)); } catch (e) { out.push({ town: { name }, error: e.message, sites: [] }); }
       }
-      return { town: { name: town.name, x: town.x, y: town.y, population: town.population, pax_unserved: town.pax_unserved, allowed_noise: town.allowed_noise },
-        airport: at, sites: checked };
+      return { airport: at, towns: out };
     },
   },
   {
     name: 'tiles', group: 'world', session: true,
-    description: 'Raw terrain mirror for a small rectangle: height, slope and class per tile (water, clear, trees, other=houses/objects, rail, road, station, industry...), and (AgentBridge v12) who owns it: "*" = your company, "#" = another company (rail rows in an area are not necessarily yours). Max 40x40.',
-    args: z.object({ ...who, x0: int(), y0: int(), x1: int(), y1: int(), refresh: bool().default(true) }),
+    description: 'Terrain mirror for a rectangle (--x0 --y0 --x1 --y1, or --x --y --radius R): --format json (default, max 40x40): height, slope and class per tile (water, clear, trees, other=houses/objects, rail, road, station, industry...), and (AgentBridge v12) who owns it: "*" = your company, "#" = another company (rail rows in an area are not necessarily yours). --format text (max 80x80): one character per tile (the class letter, UPPER case = owned by your company), an x ruler (one line per digit, read downwards) and rows "y|chars"; heights are left out.',
+    args: z.object({ ...who, x0: int().optional(), y0: int().optional(), x1: int().optional(), y1: int().optional(),
+      x: int().optional().describe('centre x (with --y and --radius, instead of x0..y1)'), y: int().optional(), radius: int().min(0).max(40).optional().describe('tiles around x,y (default 5)'),
+      format: z.enum(['json', 'text']).default('json').describe('text = one character per tile with rulers (max 80x80)'),
+      refresh: bool().default(true) }),
     run: async (ctx, a) => {
-      if ((a.x1 - a.x0 + 1) * (a.y1 - a.y0 + 1) > 1600) throw new Error('area too large; max 40x40 tiles');
       const s = await ctx.session();
+      const box = tileBox(a, s.map.sizeX, s.map.sizeY);
+      const max = a.format === 'text' ? 80 : 40;
+      if (box.x1 - box.x0 + 1 > max || box.y1 - box.y0 + 1 > max) throw new Error(`area too large; max ${max}x${max} tiles${a.format === 'text' ? '' : ' (--format text takes up to 80x80)'}`);
       const me = a.company ?? s.cfg.company;
-      if (a.refresh) await s.refreshArea(a.x0, a.y0, a.x1, a.y1); else await s.ensureTiles();
-      let owners = null;
-      try { owners = new Map((await s.gs.call('tile_owners', { x0: a.x0, y0: a.y0, x1: a.x1, y1: a.y1 })).map(([x, y, o]) => [`${x},${y}`, o])); } catch (e) { if (!/unknown cmd/.test(e.message)) throw e; }
-      const mark = (x, y) => { const o = owners?.get(`${x},${y}`); return o === undefined ? '' : o === me ? '*' : '#'; };
+      if (a.refresh) await s.refreshArea(box.x0, box.y0, box.x1, box.y1); else await s.ensureTiles();
+      let owners = new Map();
+      try {
+        for (const part of splitBox(box, 40)) for (const [x, y, o] of await s.gs.call('tile_owners', part)) owners.set(`${x},${y}`, o);
+      } catch (e) { if (!/unknown cmd/.test(e.message)) throw e; owners = null; }
+      const ownerAt = owners ? (x, y) => owners.get(`${x},${y}`) : null;
+      const oldGs = owners ? {} : { owners: 'not shown: the running AgentBridge is older than v12' };
+      const classes = 'w water c coast i industry s station r rail d road t trees f farm k rocks h rough b clear o other(houses/objects)';
+      if (a.format === 'text') {
+        const text = tilesText(box, (x, y) => s.map.classAt(x, y), ownerAt, me);
+        return { legend: `one character per tile: ${classes}${owners ? '; UPPER case = owned by your company' : ''}. x ruler: one line per digit, read downwards; rows: "y|tiles"`,
+          ...oldGs, ...box, ...text };
+      }
+      const mark = (x, y) => { const o = ownerAt?.(x, y); return o === undefined ? '' : o === me ? '*' : '#'; };
       const rows = [];
-      for (let y = a.y0; y <= a.y1; y++) {
+      for (let y = box.y0; y <= box.y1; y++) {
         const r = [];
-        for (let x = a.x0; x <= a.x1; x++) r.push(`${s.map.classAt(x, y)}${s.map.heightAt(x, y)}${s.map.slopeAt(x, y) ? '/' : ''}${mark(x, y)}`);
+        for (let x = box.x0; x <= box.x1; x++) r.push(`${s.map.classAt(x, y)}${s.map.heightAt(x, y)}${s.map.slopeAt(x, y) ? '/' : ''}${mark(x, y)}`);
         rows.push({ y, tiles: r.join(' ') });
       }
-      return { legend: `class letter + height, "/" = sloped${owners ? ', "*" = owned by your company, "#" = by another company' : ''}. w water c coast i industry s station r rail d road t trees f farm k rocks h rough b clear o other(houses/objects)`,
-        ...(owners ? {} : { owners: 'not shown: the running AgentBridge is older than v12' }), x0: a.x0, rows };
+      return { legend: `class letter + height, "/" = sloped${owners ? ', "*" = owned by your company, "#" = by another company' : ''}. ${classes}`,
+        ...oldGs, x0: box.x0, rows };
     },
   },
-
   {
     name: 'rail-tiles', group: 'world', session: true,
     description: 'Exact rail on a small rectangle (max 32x32), one row per tile with rail: kind (track, station, waypoint, depot, crossing, bridge, tunnel), track pieces (x = along x, y = along y, n/s/e/w = the corner pieces), signals (facing trains that come from which side: from_sw/from_se/from_ne/from_nw, one_way true for one-way path signals), depot front, bridge/tunnel other end, station id, rail type and owner (mine true/false). --mine true keeps only your tiles. AgentBridge v9.',
@@ -1836,13 +2655,21 @@ export const COMMANDS = [
   // ---- operate (read) -------------------------------------------------------------
   {
     name: 'stations', group: 'operate', session: true,
-    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving (count, and vehicle_ids with AgentBridge v12: vehicles with an order for it). Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations). --company X shows another company\'s stations as the game window shows them to anyone (location, facilities, waiting cargo, ratings; no vehicle counts); also through the relay. Returns {total, matched, stations, truncated}.',
+    description: 'Your stations: location, facilities (rail/truck/bus/airport/dock), per-cargo waiting amount and rating %, vehicles serving (count, and vehicle_ids with AgentBridge v12: vehicles with an order for it). Filter with facility, cargo (name), min_waiting, max_rating_pct (e.g. find poorly served stations), ids, near_x/near_y/radius (nearest first, with distance), unserved (no vehicle has an order for it), max_vehicles. --company X shows another company\'s stations as the game window shows them to anyone (location, facilities, waiting cargo, ratings; no vehicle counts); also through the relay. Returns {total, matched, stations, truncated}.',
     args: z.object({ ...who, facility: z.enum(FACILITIES).optional(), cargo: z.string().optional(), min_waiting: int().default(0),
-      max_rating_pct: int().default(100), name: z.string().optional(), limit: int().default(100) }),
+      max_rating_pct: int().default(100), name: z.string().optional(),
+      ids: ids().optional().describe('only these station ids'),
+      near_x: int().optional().describe('with near_y: only stations within --radius tiles (Manhattan) of this tile, nearest first, each with distance'), near_y: int().optional(),
+      radius: int().min(0).default(20).describe('tiles around near_x,near_y'),
+      unserved: bool().default(false).describe('only stations no vehicle has an order for (your company)'),
+      max_vehicles: int().min(0).optional().describe('only stations served by at most this many vehicles (your company)'),
+      limit: int().min(1).optional().describe('most stations to return (default 1000 for your company, 100 for another)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargoFilter = a.cargo !== undefined || a.min_waiting > 0 || a.max_rating_pct < 100;
       const rival = isRival(s, company);
+      if (rival && (a.unserved || a.max_vehicles !== undefined)) throw new Error('refused: --unserved and --max_vehicles need vehicle counts, which another company\'s stations do not show');
+      if ((a.near_x === undefined) !== (a.near_y === undefined)) throw new Error('bad_arguments: give --near_x and --near_y together');
       let all = stationsFromRows(await s.gs.call('stations', { company }), s.cargos).map((st) => (rival ? (({ vehicles, ...rest }) => rest)(st) : st));
       if (!rival) {
         const ids = await stationVehicleIds(s, company);
@@ -1850,13 +2677,16 @@ export const COMMANDS = [
       }
       const hits = all.filter((st) => (!a.facility || st.facilities.includes(a.facility)) && (!a.name || lc(st.name).includes(lc(a.name)))
         && (!cargoFilter || st.cargo.some((c) => (!a.cargo || cargoMatches(c.name, a.cargo)) && c.waiting >= a.min_waiting && c.rating_pct <= a.max_rating_pct)));
-      return { company, ...(rival ? { view: 'other company: what the game shows anyone' } : {}), ...listResult('stations', all, hits, a.limit) };
+      const picked = filterStations(hits, a);
+      return { company, ...(rival ? { view: 'other company: what the game shows anyone' } : {}), ...listResult('stations', all, picked, a.limit ?? (rival ? 100 : 1000)) };
     },
   },
   {
     name: 'vehicles', group: 'operate', session: true,
-    description: 'Your vehicles (summary=true or another --company: counts per type and state only, as the company window shows anyone): type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: type, group, state, max_profit_last_year (e.g. 0 = loss makers), min_age_pct (e.g. 90 = due for replacement), max_reliability_pct, name, station (vehicles with an order for it; AgentBridge v12). Breakdown counts and service intervals are not exposed by the game to scripts.',
-    args: z.object({ ...who, type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
+    description: `Your vehicles (summary=true or another --company: counts per type and state only, as the company window shows anyone): type, engine, age (days and % of max age), reliability, profit this/last year, value, running cost, state, location, group, order count. Filters: ids (A,B), type, group, state, engine, max_profit_last_year (e.g. 0 = loss makers), max_profit_this_year, min_age_pct (e.g. 90 = due for replacement), min_age_days (e.g. 365: old enough to judge its profit), max_reliability_pct, name, station (vehicles with an order for it; AgentBridge v12). --sort ${VEHICLE_SORTS.join('|')} (a leading - sorts high first, e.g. -profit_last_year). Breakdown counts and service intervals are not exposed by the game to scripts.`,
+    args: z.object({ ...who, ids: ids().optional().describe('only these vehicle ids'), type: z.enum(VEHICLE_TYPES).optional(), group: int().optional(), state: z.enum(VEHICLE_STATES).optional(),
+      engine: int().optional(), max_profit_this_year: int().optional(), min_age_days: int().optional(),
+      sort: z.enum([...VEHICLE_SORTS, ...VEHICLE_SORTS.map((k) => `-${k}`)]).optional().describe('sort key; leading - = descending'),
       max_profit_last_year: int().optional(), min_age_pct: int().default(0), max_reliability_pct: int().default(100), name: z.string().optional(), limit: int().min(1).default(1000),
       station: z.coerce.string().optional().describe('only vehicles with an order for this station (id or name; AgentBridge v12)'),
       summary: bool().default(false).describe('counts per type and state only (always so for another company)') }),
@@ -1875,40 +2705,49 @@ export const COMMANDS = [
         if (!ids) throw new Error('refused: vehicles --station needs AgentBridge v12; the host re-runs install-gamescript and loads the game again');
         atStation = new Set(ids.get(st.id) ?? []);
       }
-      const vehicles = all.filter((v) => (!atStation || atStation.has(v.id)) && (!a.type || v.type === a.type) && (a.group === undefined || v.group === a.group) && (!a.state || v.state === a.state)
-        && (a.max_profit_last_year === undefined || v.profit_last_year <= a.max_profit_last_year) && v.age_pct >= a.min_age_pct
-        && v.reliability_pct <= a.max_reliability_pct && (!a.name || lc(v.name).includes(lc(a.name))));
+      let vehicles = filterVehicles(all, a).filter((v) => !atStation || atStation.has(v.id));
+      if (a.sort) vehicles = sortVehicles(vehicles, a.sort);
       return { company, ...listResult('vehicles', all, vehicles, a.limit) };
     },
   },
   {
     name: 'vehicle', group: 'operate', session: true,
-    description: 'One vehicle in detail: status, capacity and load per cargo, wagons, and the full order list with decoded flags.',
+    description: 'One vehicle in detail: status, capacity and load per cargo, load {load, capacity, pct} over all cargo, wagons, and the full order list with decoded flags. A vehicle sold through openttd-agent answers already_sold with the sale date.',
     args: z.object({ ...who, vehicle: int() }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      return vehicleDetail(await s.gs.call('vehicle', { company, vehicle: a.vehicle }), s.cargos);
+      let rows;
+      try { rows = await s.gs.call('vehicle', { company, vehicle: a.vehicle }); } catch (e) {
+        const note = /does not exist/.test(e.message) ? await soldNote(s, company, a.vehicle) : null;
+        if (note) return { ok: false, error: note, first_error: 'already_sold', vehicle: a.vehicle, sold: s.soldVehicles.get(`${company}:${a.vehicle}`) };
+        throw e;
+      }
+      const d = vehicleDetail(rows, s.cargos);
+      const load = d.capacity.reduce((n, c) => n + c.load, 0), capacity = d.capacity.reduce((n, c) => n + c.capacity, 0);
+      return { ...d, load: { load, capacity, pct: capacity ? Math.round((100 * load) / capacity) : 0 } };
     },
   },
   {
     name: 'summary', group: 'operate', session: true,
-    description: 'One compact text line per vehicle and per station, for a quick look without big JSON: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination"; stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
+    description: 'One compact text line per vehicle and per station, for a quick look without big JSON. Header: date and me (money, loan, max_loan, value, performance, profit of the last quarter). Lines: vehicles "#unit id N name [type] profit this/last yr, age (years, % of max), reliability, state, (x,y) -> destination, spd, load now/capacity (AgentBridge v13), order i/n", plus age_buckets, reliability_buckets and low_reliability (below 50%: id, reliability_pct, age_pct); stations "id name [facilities] N veh: cargo waiting rating%". Pick with --group G, --vehicles A,B, --stations A,B (ids or names) or --what vehicles|stations; with none, all your vehicles and stations. Sorted: vehicles by profit last year (worst first), stations by lowest rating.',
     args: z.object({ ...who, group: int().optional(), vehicles: ids().optional(), stations: z.string().optional().describe('comma-separated station ids or names'),
       what: z.enum(['all', 'vehicles', 'stations']).default('all'), limit: int().min(1).default(200) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
+      const [stationRows, info, companyRows] = await Promise.all([s.gs.call('stations', { company }), s.gs.call('info'), s.gs.call('companies')]);
+      const stations = stationsFromRows(stationRows, s.cargos);
       const names = new Map(stations.map((st) => [st.id, st.name]));
       const picked = a.group !== undefined || a.vehicles || a.stations;
       const wantV = a.what !== 'stations' && (!picked || a.group !== undefined || a.vehicles);
       const wantS = a.what !== 'vehicles' && (!picked || a.stations);
-      const out = { company };
+      const out = { company, date: dateString(info), me: meFromCompanies(companyRows, company) };
       if (wantV) {
         const all = vehiclesFromRows(await s.gs.call('vehicles', { company }));
         const hit = all.filter((v) => (a.group === undefined || v.group === a.group) && (!a.vehicles || a.vehicles.includes(v.id))).sort((p, q) => p.profit_last_year - q.profit_last_year);
-        const lines = hit.map((v) => vehicleLine(v, names));
+        const loads = hit.length ? await vehicleLoads(s, company, a.vehicles) : null;
+        const lines = hit.map((v) => vehicleLine(v, names, loads?.get(v.id) ?? null));
         Object.assign(out, { vehicles_total: hit.length, vehicles: lines.slice(0, a.limit),
-          vehicles_profit: `this year ${hit.reduce((n, v) => n + v.profit_this_year, 0)}, last year ${hit.reduce((n, v) => n + v.profit_last_year, 0)}` });
+          vehicles_profit: `this year ${hit.reduce((n, v) => n + v.profit_this_year, 0)}, last year ${hit.reduce((n, v) => n + v.profit_last_year, 0)}`, ...fleetBuckets(hit) });
       }
       if (wantS) {
         const sel = a.stations ? a.stations.split(',').map((t) => findStation(stations, t.trim())) : stations;
@@ -1922,8 +2761,9 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-problems', group: 'operate', session: true,
-    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), stalled_on_line (speed 0 on the same tile for stall_days, not at a station or broken down; the daemon samples every 15 s once vehicle-problems has run), deadlock (two such trains within 16 tiles: reverse one with vehicle-reverse), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot (with how long it has been parked), loose_wagons (wagons without a locomotive in a depot), stopped, old, broken_down, low_reliability, crashed. Every row has as_of (game date of this sample) and days_watched (how long the history behind it is); --fresh true starts the history again. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
-    args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'),
+    description: 'Vehicles with problems, one row per problem: problem, severity (action = it cannot earn until fixed; info = worth knowing, leave a running train alone), evidence, suggested_fix, plus id and unit_number (the "Train #4" the game window shows). Checks: wrong_network / unreachable_destination (no rail path, or for road vehicles no road path (AgentBridge v11), to the current order\'s station), stuck_or_lost (same order for stuck_days game days without getting closer; needs two calls that many days apart, the daemon keeps the history), stalled_on_line (speed 0 on the same tile for stall_days, not at a station or broken down; the daemon samples every 15 s once vehicle-problems has run), deadlock (two such trains within 16 tiles: reverse one with vehicle-reverse), pending_sale (queued by vehicle-sell or vehicle-replace; nothing else is reported for it), no_income (lost money last year at age > 1 year), no_orders, stopped_in_depot (with how long it has been parked), loose_wagons (wagons without a locomotive in a depot), stopped, old, broken_down, low_reliability, crashed. Every row has as_of (game date of this sample) and days_watched (how long the history behind it is); --fresh true starts the history again. Filters: --vehicles A,B, --type, --problem a,b. Run it every turn. The game does not tell scripts when a vehicle is lost; this infers it.',
+    args: z.object({ ...who, vehicle: int().optional().describe('check only this vehicle id'), vehicles: ids().optional().describe('check only these vehicle ids'),
+      type: z.enum(VEHICLE_TYPES).optional().describe('only vehicles of this type'), problem: z.string().optional().describe('only these problems, comma-separated (e.g. stuck_or_lost,no_income)'),
       stuck_days: int().min(1).default(30).describe('game days without progress before a vehicle counts as stuck or lost'),
       stall_days: int().min(1).default(10).describe('game days standing still on one tile (speed 0, not at a station) before stalled_on_line / deadlock'),
       trace: bool().default(true).describe('check rail (and, AgentBridge v11, road) connectivity to each vehicle\'s destination'),
@@ -1935,8 +2775,11 @@ export const COMMANDS = [
       let vehicles = vehiclesFromRows(await s.gs.call('vehicles', { company }));
       if (a.vehicle !== undefined) {
         vehicles = vehicles.filter((v) => v.id === a.vehicle);
-        if (!vehicles.length) throw new Error(`vehicle ${a.vehicle} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
+        if (!vehicles.length) throw new Error((await soldNote(s, company, a.vehicle)) ?? `vehicle ${a.vehicle} does not exist or is not owned by company ${company}; run: openttd-agent vehicles`);
       }
+      if (a.vehicles) vehicles = vehicles.filter((v) => a.vehicles.includes(v.id));
+      if (a.type) vehicles = vehicles.filter((v) => v.type === a.type);
+      const wanted = a.problem ? new Set(a.problem.split(',').map((t) => t.trim()).filter(Boolean)) : null;
       const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
       const stationById = new Map(stations.map((st) => [st.id, st]));
       s.vehicleHistory ??= new Map();
@@ -1958,6 +2801,16 @@ export const COMMANDS = [
       const lineCache = new Map();
       const rows = [];
       for (const v of vehicles) {
+        // L6: a vehicle queued for sale is reported as that alone (not stopped_in_depot or stuck).
+        const sale = s.pendingSales.get(`${company}:${v.id}`);
+        if (sale) {
+          if ((a.severity === 'all' || a.severity === 'info') && (!wanted || wanted.has('pending_sale'))) {
+            rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, problem: 'pending_sale', severity: 'info',
+              evidence: `queued for sale since ${sale.since ?? '?'}${sale.replaced_by !== undefined && sale.replaced_by !== null ? ` (replaced by ${sale.replaced_by})` : ''}; ${v.state === 'in_depot' ? 'in a depot: sold at the next check (20 s)' : sale.send && !sale.sent ? 'no depot found yet: sent again every 20 s' : 'heading to a depot'}`,
+              suggested_fix: `nothing: it is sold when it stops in a depot (vehicle-start --vehicles ${v.id} --cancel_sale true keeps it instead)`, as_of: gameDate(info), days_watched: 0 });
+          }
+          continue;
+        }
         let orders = null;
         if (v.current_order === undefined && v.order_count > 0) { // AgentBridge before v9: one `vehicle` call each
           const cur = await currentOrderOf(s, company, v.id);
@@ -1995,7 +2848,7 @@ export const COMMANDS = [
         }
         for (const p of vehicleProblems(v, { today: info.date, stuckDays: a.stuck_days, progress, reach, line, stall: stalls.get(v.id), stallDays: a.stall_days, partners: partners.get(v.id), parkedDays: s.depotHistory.has(`${company}:${v.id}`) ? info.date - s.depotHistory.get(`${company}:${v.id}`) : null })) {
           const seen = [s.vehicleHistory.get(`${company}:${v.id}`)?.first, s.stallHistory.get(`${company}:${v.id}`)?.since, s.depotHistory.get(`${company}:${v.id}`)].filter((d) => d !== undefined);
-          if (a.severity === 'all' || a.severity === p.severity) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p, as_of: gameDate(info), days_watched: seen.length ? info.date - Math.min(...seen) : 0 });
+          if ((a.severity === 'all' || a.severity === p.severity) && (!wanted || wanted.has(p.problem))) rows.push({ id: v.id, unit_number: v.unit_number, name: v.name, type: v.type, ...p, as_of: gameDate(info), days_watched: seen.length ? info.date - Math.min(...seen) : 0 });
         }
       }
       const samples = vehicles.map((v) => s.vehicleHistory.get(`${company}:${v.id}`)).filter(Boolean);
@@ -2012,9 +2865,10 @@ export const COMMANDS = [
   },
   {
     name: 'verify-route', group: 'operate', session: true,
-    description: 'Is there a rail or road path? --vehicle ID traces from the vehicle to each of its order stations and between consecutive order stations (rail for trains, road for road vehicles); --from_station A --to_station B (id or name) traces A to B (mode auto: rail when both have rail, road when both have truck or bus stops). Reports connected and, if not, the last reachable tile and the first gap with a reason. Rail (AgentBridge v9; coarse map-mirror trace before): no_track, track_not_joined, station_platform_side, depot_entrance_faces_away, one_way_signal_against, other_company_track, bridge_side, tunnel_side. Road (AgentBridge v11; refused before): no_road, road_not_joined, one_way_road, depot_not_joined, depot_entrance_faces_away, stop_not_joined, stop_entrance_faces_away, other_owner_road (another company\'s stop or depot).',
+    description: 'Is there a rail or road path? --vehicle ID traces from the vehicle to each of its order stations and between consecutive order stations (rail for trains, road for road vehicles); --from_station A --to_station B (id or name) traces A to B and B back to A (both_ways, default; there/back, connected = both; --both_ways false = A to B only; mode auto: rail when both have rail, road when both have truck or bus stops). legs_connected[] has one true/false per leg (vehicle: its order legs; pair: there, back). Reports connected and, if not, the last reachable tile and the first gap with a reason. Rail (AgentBridge v9; coarse map-mirror trace before): no_track, track_not_joined, station_platform_side, depot_entrance_faces_away, one_way_signal_against, other_company_track, bridge_side, tunnel_side. Road (AgentBridge v11; refused before): no_road, road_not_joined, one_way_road, depot_not_joined, depot_entrance_faces_away, stop_not_joined, stop_entrance_faces_away, other_owner_road (another company\'s stop or depot).',
     args: z.object({ ...who, vehicle: int().optional(), from_station: z.coerce.string().optional().describe('station id or name'), to_station: z.coerce.string().optional().describe('station id or name'),
-      mode: z.enum(['auto', 'rail', 'road']).default('auto').describe('station pair only: which network to trace') }),
+      mode: z.enum(['auto', 'rail', 'road']).default('auto').describe('station pair only: which network to trace'),
+      both_ways: bool().default(true).describe('station pair only: also trace B back to A (a train must get back; one-way signals can block one direction)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
@@ -2035,7 +2889,7 @@ export const COMMANDS = [
         const tracer = await pick(veh.type);
         const legs = await routeLegs(s, company, tracer, stations, veh);
         return { vehicle: veh.id, unit_number: veh.unit_number, type: veh.type, at: { x: veh.x, y: veh.y }, connected: legs.connected, method: tracer.method,
-          ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), from_vehicle: legs.from_vehicle, legs: legs.legs };
+          ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), legs_connected: legs.legs.map((l) => l.connected), from_vehicle: legs.from_vehicle, legs: legs.legs };
       }
       if (a.from_station === undefined || a.to_station === undefined) throw new Error('give --vehicle ID, or both --from_station and --to_station (id or name)');
       const from = findStation(stations, a.from_station), to = findStation(stations, a.to_station);
@@ -2043,7 +2897,12 @@ export const COMMANDS = [
       const mode = a.mode !== 'auto' ? a.mode : (from.facilities.includes('rail') && to.facilities.includes('rail')) || !(roadish(from) && roadish(to)) ? 'rail' : 'road';
       const tracer = await pick(mode);
       const r = await tracer.trace(await tracer.stationStarts(from), to);
-      return { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, mode, method: tracer.method, ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}), ...brief(r) };
+      const head = { from: { id: from.id, name: from.name }, to: { id: to.id, name: to.name }, mode, method: tracer.method, ...(tracer.method === 'mirror_adjacency' ? { note: OLD_GS_TRACE } : {}) };
+      if (!a.both_ways) return { ...head, ...brief(r), legs_connected: [r.connected] };
+      const back = await tracer.trace(await tracer.stationStarts(to), from);
+      const bad = !r.connected ? r : back;
+      return { ...head, ...brief(bad), connected: r.connected && back.connected, tiles_reached: r.tiles_reached, legs_connected: [r.connected, back.connected],
+        there: brief(r), back: brief(back), ...(r.connected && !back.connected ? { note_back: `${to.name} -> ${from.name} is not connected: trains get there but not back` } : {}) };
     },
   },
   {
@@ -2081,13 +2940,61 @@ export const COMMANDS = [
   },
   {
     name: 'events', group: 'operate', session: true,
-    description: 'Game events since sequence number `since` (keep latest_seq and pass it next time): vehicle_crashed, subsidy_offer/awarded/expired, industry_open/close, company_new/in_trouble/bankrupt/merger, station_first_vehicle, town_founded, exclusive_transport_rights, road_reconstruction. The game does not send scripts vehicle-lost/unprofitable or production-change events: poll `vehicles` and `industries` for those. The buffer holds the last 300 events and restarts when the game is loaded.',
-    args: z.object({ since: int().default(0), type: z.string().optional().describe('substring of the event type') }),
+    description: 'Game events since sequence number `since` (keep latest_seq and pass it next time): vehicle_crashed, subsidy_offer/awarded/expired, industry_open/close, company_new/in_trouble/bankrupt/merger, station_first_vehicle, town_founded, exclusive_transport_rights, road_reconstruction. The game does not send scripts vehicle-lost/unprofitable or production-change events: poll `vehicles` and `industries` for those. The buffer holds the last 300 events and restarts when the game is loaded. Filters: --type a,b (any), --exclude a,b, --companies A,B (or --company N).',
+    // Not `company`: events are public news, and the relay would force `company` to the player's own.
+    args: z.object({ since: int().default(0), type: z.string().optional().describe('comma-separated substrings of the event type (any matches), e.g. crash,subsidy'),
+      exclude: z.string().optional().describe('comma-separated substrings of event types to leave out, e.g. industry,town_founded'),
+      companies: ids().optional().describe('only events about these companies (event company or old_company); --company N works too') }),
     run: async (ctx, a) => {
       const s = await ctx.session();
       const events = await s.gs.call('events', { since: a.since });
       return { latest_seq: events.length ? events.at(-1).seq : a.since, my_company: s.cfg.company,
-        events: events.filter((e) => !a.type || e.type.includes(lc(a.type))) };
+        events: filterEvents(events, { types: wordList(a.type), exclude: wordList(a.exclude), companies: a.companies }) };
+    },
+  },
+
+  {
+    name: 'overview', group: 'operate', session: true,
+    description: 'One small per-turn snapshot instead of status + goal-status + companies + stations + vehicles + depots + events + vehicle-problems: date, paused, money/loan/max_loan/value/profit (last quarter), goal (one line), fleet (one line: counts per type and state, profit, loss makers), vehicle_lines (worst by profit last year), station_lines (lowest rating first), depots, problems (vehicle-problems rows with severity action, one line per problem kind with the vehicle ids), rivals (one line per other company), events since --since (yours, world news and company news; one line each) and latest_seq (pass it as --since next turn). Lines are capped (*_total says how many there are); use the full commands for detail.',
+    args: z.object({ ...who, since: int().min(0).default(0).describe('events after this seq (latest_seq of the last overview); 0 = the newest only'),
+      vehicle_lines: int().min(0).default(5), station_lines: int().min(0).default(6), event_lines: int().min(0).default(5), problem_lines: int().min(0).default(6).describe('most problem kinds shown (one line per kind with the vehicle ids)'),
+      problems: bool().default(true).describe('run the vehicle-problems checks (rail/road traces; about 1 s on a mid-size company)') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const [info, companyRows, goalRows, stationRows, vehicleRows, events, ...depotRows] = await Promise.all([
+        s.gs.call('info'), s.gs.call('companies'), s.gs.call('goal_status', { company }), s.gs.call('stations', { company }), s.gs.call('vehicles', { company }),
+        s.gs.call('events', { since: a.since }), ...VEHICLE_TYPES.map((t) => s.gs.call('depots', { company, type: vehicleTypeId(t) })),
+      ]);
+      const me = meFromCompanies(companyRows, company);
+      const stations = stationsFromRows(stationRows, s.cargos);
+      const names = new Map(stations.map((st) => [st.id, st.name]));
+      const vehicles = vehiclesFromRows(vehicleRows);
+      const minRating = (st) => Math.min(101, ...st.cargo.map((c) => c.rating_pct));
+      // Vehicles inside from the vehicle list: the GS depots count (GSVehicleList_Depot) read 0 for stopped trains in a live 15.3 game.
+      const depots = depotsLine(VEHICLE_TYPES.map((t, i) => [t, depotRows[i]]), vehicles);
+      let problems = null;
+      if (a.problems) {
+        const vp = COMMANDS_BY_NAME.get('vehicle-problems');
+        problems = (await vp.run(ctx, vp.args.parse({ company, severity: 'action' }))).problems;
+      }
+      const COMPANY_NEWS = /^company_/;
+      const seen = events.filter((e) => e.company === undefined || e.company === company || COMPANY_NEWS.test(e.type));
+      const cap = (list, n) => list.slice(Math.max(0, list.length - n));
+      return {
+        company, date: dateString(info), paused: info.paused,
+        ...(me ? { money: me.money, loan: me.loan, max_loan: me.max_loan, value: me.value, profit_last_quarter: me.profit, performance: me.performance } : {}),
+        goal: goalRows.length ? goalLine(goalFromRow(goalRows[0])) : null,
+        fleet: fleetLine(vehicles),
+        vehicles_total: vehicles.length,
+        vehicle_lines: [...vehicles].sort((p, q) => p.profit_last_year - q.profit_last_year).slice(0, a.vehicle_lines).map((v) => shortVehicleLine(v, names)),
+        stations_total: stations.length,
+        station_lines: [...stations].sort((p, q) => minRating(p) - minRating(q)).slice(0, a.station_lines).map(shortStationLine),
+        depots,
+        ...(problems ? { problems_total: problems.length, problems: problemGroups(problems).slice(0, a.problem_lines) } : {}),
+        rivals: companyRows.filter((c) => c.id !== company).slice(0, 8).map(rivalLine),
+        events_new: seen.length, events: cap(seen, a.since === 0 ? Math.min(3, a.event_lines) : a.event_lines).map(eventLine),
+        latest_seq: events.length ? events.at(-1).seq : a.since,
+      };
     },
   },
 
@@ -2139,7 +3046,7 @@ export const COMMANDS = [
   },
   {
     name: 'loan', group: 'operate', session: true,
-    description: 'Show or change your company loan. Give one of: amount (set the loan to this), borrow (add this much), repay (pay back this much; needs the cash), max true (borrow up to max_loan). The new loan is rounded up to the loan interval; refused below 0 or over max_loan. No arguments = show. Returns loan, max_loan and money before and after (dry_run: predicted). Needs AgentBridge v8.',
+    description: 'Show or change your company loan. Give one of: amount (set the loan to this), borrow (add this much), repay (pay back this much; needs the cash), max true (borrow up to max_loan). The new loan is rounded up to the loan interval; refused below 0; more than max_loan borrows up to max_loan (clamped). No arguments = show. Returns loan, max_loan and money before and after (dry_run: predicted). Needs AgentBridge v8.',
     args: z.object({ ...act, amount: int().optional().describe('set the loan to this amount'), borrow: int().min(1).optional().describe('add this much to the loan'),
       repay: int().min(1).optional().describe('pay back this much of the loan'), max: bool().optional().describe('true = borrow up to max_loan') }),
     run: async (ctx, a) => {
@@ -2148,8 +3055,11 @@ export const COMMANDS = [
       const { s, company } = await mine(ctx, a);
       const before = await loanState(s, company);
       if (!given.length) return before;
-      const step = a.max ? ['loan', 'max', 0] : a.amount !== undefined ? ['loan', 'set', a.amount] : ['loan', 'add', a.borrow ?? -a.repay];
-      const requested = a.max ? before.max_loan : a.amount ?? before.loan + (a.borrow ?? -a.repay);
+      let step = a.max ? ['loan', 'max', 0] : a.amount !== undefined ? ['loan', 'set', a.amount] : ['loan', 'add', a.borrow ?? -a.repay];
+      let requested = a.max ? before.max_loan : a.amount ?? before.loan + (a.borrow ?? -a.repay);
+      // L8: asking for more than max_loan borrows up to it (a weak model asks "borrow 1000000" and loops on the refusal).
+      const overMax = requested > before.max_loan ? { asked: requested, clamped_to_max_loan: before.max_loan } : null;
+      if (overMax) { step = ['loan', 'max', 0]; requested = before.max_loan; }
       if (!a.dry_run) s.throttleBuild();
       const res = await s.exec(company, [step], { dryRun: a.dry_run });
       const r = res.results[0];
@@ -2157,7 +3067,7 @@ export const COMMANDS = [
       if (!res.ok) return { ok: false, dry_run: a.dry_run, error: r?.error ?? res.stopped ?? 'failed', requested_loan: requested, before, after: before };
       const target = r.value ?? 0; // execSummary drops a 0 value
       const after = a.dry_run ? { loan: target, max_loan: before.max_loan, money: before.money + target - before.loan } : await loanState(s, company);
-      return { ok: true, dry_run: a.dry_run, requested_loan: requested, ...(target !== requested ? { rounded_to: target, note: 'rounded up to a multiple of the loan interval' } : {}),
+      return { ok: true, dry_run: a.dry_run, requested_loan: requested, ...(overMax ? { clamped: overMax } : {}), ...(target !== requested ? { rounded_to: target, note: 'rounded up to a multiple of the loan interval' } : {}),
         change: target - before.loan, before, after };
     },
   },
@@ -2204,17 +3114,25 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-buy', group: 'operate', session: true,
-    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>; the train must be stopped in that depot (checked first, also in a dry run; a wagon the game will not couple is sold back). New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one). One call for a whole train: --wagon W --wagons N attaches N wagons of engine W to each new locomotive (refitted to cargo); --orders A,B (station ids or names) gives the new vehicles those orders (the first gets them, the others share them; with attach_to, the train attach_to gets them), --order_flags sets flags per order separated by ";" (e.g. "full_load_any;unload,no_load"; one set applies to every order), --start true starts them.',
-    args: z.object({ ...act, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1),
+    description: 'Buy `count` vehicles of an engine id (see engines) at your depot tile (see depots). cargo (name) refits on purchase. For trains buy the locomotive first, then wagons with attach_to=<train id>; the train must be stopped in that depot (checked first, also in a dry run; a wagon the game will not couple is sold back). New ids are in `vehicles`. Vehicles start stopped in the depot: add orders, then vehicle-start. route_of=<train id>: refuse unless the depot is rail-connected to that train\'s order stations (use it before copying that train\'s orders onto the new one). One call for a whole train: --wagon W --wagons N attaches N wagons of engine W to each new locomotive (refitted to cargo); --orders A,B (station ids or names) gives the new vehicles those orders (the first gets them, the others share them; with attach_to, the train attach_to gets them), --order_flags sets flags per order separated by ";" (e.g. "full_load_any;unload,no_load"; one set applies to every order), --start true starts them. --routes "A,B;C,D" buys one vehicle per route (bus networks: many small routes), each with its own orders, and starts them (routes: vehicle + orders).',
+    args: z.object({ ...act, ...borrow, depot_x: int(), depot_y: int(), engine: int(), cargo: z.string().optional(), attach_to: int().default(-1), count: int().min(1).max(50).default(1),
       route_of: int().optional().describe('rail: check the depot is joined to this vehicle\'s order stations first'),
       wagon: int().optional().describe('wagon engine id to attach to each new locomotive'), wagons: int().min(0).max(60).default(0),
       orders: z.string().optional().describe('comma-separated station ids or names, in order'), order_flags: z.string().default('').describe('flags per order separated by ";", or one set for all'),
-      start: bool().default(false) }),
+      routes: z.string().optional().describe('one vehicle per route, routes separated by ";" and stations by ",": "A,B;C,D" buys 2 vehicles, each with its own orders, started unless --start false'),
+      start: bool().optional().describe('start the new vehicles (default false; true with --routes)') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const cargo = cargoId(s.cargos, a.cargo) ?? -1;
       if (a.wagons > 0 && a.wagon === undefined) throw new Error('give --wagon ENGINE_ID with --wagons N (see engines --wagons true)');
-      const plan = a.orders ? orderPlan(stationsFromRows(await s.gs.call('stations', { company }), s.cargos), a.orders, a.order_flags) : null;
+      if (a.routes !== undefined && (a.orders !== undefined || a.attach_to >= 0)) throw new Error('--routes gives each new vehicle its own orders: not with --orders or --attach_to');
+      const stationRows = a.orders || a.routes ? stationsFromRows(await s.gs.call('stations', { company }), s.cargos) : null;
+      const routePlans = a.routes !== undefined ? a.routes.split(';').map((t) => t.trim()).filter(Boolean).map((r) => orderPlan(stationRows, r, a.order_flags)) : null;
+      if (routePlans && !routePlans.length) throw new Error('--routes needs at least one route, e.g. "A,B;C,D"');
+      if (routePlans && a.count !== 1 && a.count !== routePlans.length) throw new Error(`--routes has ${routePlans.length} routes but --count is ${a.count}: one vehicle per route (leave --count out)`);
+      if (routePlans) a = { ...a, count: routePlans.length };
+      a = { ...a, start: a.start ?? !!routePlans };
+      const plan = a.orders ? orderPlan(stationRows, a.orders, a.order_flags) : null;
       const check = a.route_of !== undefined ? await depotForRoute(s, company, { ...a, check_route: true }, a.route_of, { cmd: 'vehicle-buy' }) : null;
       if (a.attach_to >= 0) {
         const why = await attachRefusal(s, company, a);
@@ -2230,7 +3148,7 @@ export const COMMANDS = [
       }
       const bought = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
       let setup = null;
-      if (res.ok && !a.dry_run && (plan || a.start || a.wagons > 0)) {
+      if (res.ok && !a.dry_run && (plan || routePlans || a.start || a.wagons > 0)) {
         const heads = a.attach_to >= 0 ? [a.attach_to] : bought;
         const steps = [];
         if (a.attach_to < 0) for (const v of heads) for (let i = 0; i < a.wagons; i++) steps.push(['veh_buy', a.depot_x, a.depot_y, a.wagon, cargo, v]);
@@ -2238,27 +3156,46 @@ export const COMMANDS = [
           for (const o of plan) steps.push(['order_add', heads[0], o.x, o.y, o.flags, -1]);
           for (const v of heads.slice(1)) steps.push(['orders_copy', v, heads[0], true]);
         }
+        if (routePlans) heads.forEach((v, i) => { for (const o of routePlans[i]) steps.push(['order_add', v, o.x, o.y, o.flags, -1]); });
         if (a.start) for (const v of heads) steps.push(['veh_start_stop', v, 1]);
         setup = await s.exec(company, steps);
         Object.assign(res, { cost: res.cost + setup.cost, ok: setup.ok, error: setup.ok ? res.error : `bought ${bought.join(', ')}; then: ${setup.error} (the vehicles are stopped in the depot)`, ...(setup.ok ? {} : { first_error: setup.first_error }) });
       }
       return { ...res, vehicles: bought, ...(check ? { route_check: check.route_check } : {}),
-        ...(plan ? { orders: plan.map((o) => ({ station: o.station, name: o.name, flags: o.flag_names })) } : {}), ...(setup ? { setup: { ok: setup.ok, steps: setup.steps_total ?? setup.results?.length } , started: a.start && setup.ok } : {}),
+        ...(plan ? { orders: plan.map((o) => ({ station: o.station, name: o.name, flags: o.flag_names })) } : {}),
+        ...(routePlans ? { routes: routePlans.map((r, i) => ({ vehicle: bought[i] ?? null, orders: r.map((o) => ({ station: o.station, name: o.name, flags: o.flag_names })) })) } : {}), ...(setup ? { setup: { ok: setup.ok, steps: setup.steps_total ?? setup.results?.length } , started: a.start && setup.ok } : {}),
         ...(soldBack ? { sold_back: soldBack, error: `${res.error}; ${soldBack.ok ? `sold the wagon${stray.length > 1 ? 's' : ''} back (${stray.join(', ')})` : `selling ${stray.join(', ')} back failed too: sell ${stray.length > 1 ? 'them' : 'it'} with vehicle-sell`}` } : {}) };
     },
   },
   {
     name: 'vehicle-clone', group: 'operate', session: true,
-    description: 'Clone a vehicle `count` times, sharing its orders by default; start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check.',
-    args: z.object({ ...act, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
-      depot_x: int().optional(), depot_y: int().optional(), vehicle: int(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
-      check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations') }),
+    description: 'Clone a vehicle `count` times, sharing its orders by default (--share is the same flag); start=true starts the clones. New ids are in `vehicles`. Depot: --depot auto (or no depot) picks your depot nearest the vehicle\'s first order station that is rail-connected to all its order stations; --depot_x/--depot_y is refused for a train when that depot is not rail-connected to its order stations (a clone there would get lost). check_route=false skips the check. --station ID [--cargo C] instead of --vehicle clones the best-earning vehicle with an order there (source says which). A sold vehicle id is refused with already_sold, the sale date and the vehicles serving its stations now. Trains: refused with needs_loop when the line would run more trains than its usable passing loops + 1 (as add-train; line_check says why); any vehicle that lost money last year and this year is refused with source_unprofitable. --force true skips both.',
+    args: z.object({ ...act, ...borrow, depot: z.enum(['auto']).optional().describe('auto = pick a depot on the vehicle\'s own route'),
+      depot_x: int().optional(), depot_y: int().optional(), vehicle: int().optional(), share_orders: bool().default(true), count: int().min(1).max(50).default(1), start: bool().default(false),
+      station: z.string().optional().describe('instead of --vehicle: clone the best-earning vehicle with an order for this station (id or name; AgentBridge v12)'),
+      cargo: z.string().optional().describe('with --station: only a vehicle that carries this cargo'),
+      check_route: bool().default(true).describe('rail: refuse a depot not joined to the vehicle\'s order stations'),
+      force: bool().default(false).describe('skip the passing-loop (needs_loop) and source_unprofitable checks') }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const { depot, ...check } = await depotForRoute(s, company, a, a.vehicle, { cmd: 'vehicle-clone' });
-      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, a.share_orders]));
+      if ((a.vehicle === undefined) === (a.station === undefined)) throw new Error('give --vehicle ID or --station ID (clone a vehicle serving it), not both');
+      const source = a.station !== undefined ? await cloneSourceAt(s, company, a.station, a.cargo) : null;
+      const vehicle = source ? source.vehicle : a.vehicle;
+      const { depot, ...check } = await depotForRoute(s, company, a, vehicle, { cmd: 'vehicle-clone' });
+      const veh = await vehicleOf(s, company, vehicle);
+      let lineCheck = null;
+      if (!a.force) {
+        if (veh.type === 'rail') {
+          const cap = await lineCapacity(s, company, vehicle, a.count, { cmd: 'vehicle-clone' });
+          lineCheck = cap.check;
+          if (cap.refusal) return { ok: false, dry_run: a.dry_run, error: cap.refusal, first_error: 'needs_loop', ...(source ? { source } : {}), depot, ...check, line_check: lineCheck };
+        }
+        const why = unprofitableRefusal(veh);
+        if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: 'source_unprofitable', ...(source ? { source } : {}), depot, ...check };
+      }
+      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, vehicle, a.share_orders]));
       const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
-      const out = { ...res, depot, ...check, vehicles };
+      const out = { ...res, ...(source ? { source } : {}), depot, ...check, ...(lineCheck ? { line_check: lineCheck } : {}), vehicles };
       if (!a.start || a.dry_run || !vehicles.length) return out;
       const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
       return { ...out, started: started.ok };
@@ -2266,64 +3203,36 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-replace', group: 'operate', session: true,
-    description: 'Replace vehicles (comma-separated ids) in one call: buy the replacement at a depot on the vehicle\'s own route (--depot auto, the default, or --depot_x/--depot_y), share the old vehicle\'s orders, start it; the old vehicle gets its own copy of the orders, loads nothing more at its next unloading stop (no_load) and gets a "stop in depot" order right after it (--when unloaded, the default; --when now sends it to a depot at once), and is sold when it stops there. The daemon (or relay) checks every 20 s and sells it; --finish true sells any that have arrived now and lists the rest (pending_sales). Without --engine the replacement is a clone (same engine and wagons). --engine N buys that engine instead; for trains also --wagons N (default: as many as the old train) of --wagon ID (default: the old train\'s wagon type; AgentBridge v12) refitted to the old cargo. For age-based replacement of whole fleets, group-autoreplace or autorenew is cheaper in calls.',
+    description: 'Replace vehicles (comma-separated ids) in one call: buy the replacement at a depot on the vehicle\'s own route (--depot auto, the default, or --depot_x/--depot_y), share the old vehicle\'s orders, start it; the old vehicle gets its own copy of the orders, loads nothing more at its next unloading stop (no_load) and gets a "stop in depot" order right after it (--when unloaded, the default; --when now sends it to a depot at once), and is sold when it stops there. The daemon (or relay) checks every 20 s and sells it; --finish true sells any that have arrived now and lists the rest (pending_sales). Without --engine the replacement is a clone (same engine and wagons). --engine N buys that engine instead; for trains also --wagons N (default: as many as the old train) of --wagon ID (default: the old train\'s wagon type; AgentBridge v12) refitted to the old cargo. --select "min_age_pct=100,type=road" --max 5 picks the vehicles by filter instead of --vehicles (selected: ids, matched). For age-based replacement of whole fleets, group-autoreplace or autorenew is cheaper in calls.',
     args: z.object({ ...act, vehicles: ids().optional(), engine: int().optional(), wagon: int().optional(), wagons: int().min(0).max(60).optional(),
       depot: z.enum(['auto']).optional(), depot_x: int().optional(), depot_y: int().optional(),
       when: z.enum(['unloaded', 'now']).default('unloaded').describe('when the old vehicle heads for the depot'),
-      finish: bool().default(false).describe('only sell replaced vehicles that have stopped in a depot; no new replacements') }),
+      finish: bool().default(false).describe('only sell replaced vehicles that have stopped in a depot; no new replacements'), ...selectArgs('replace', 5) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       if (a.finish) return { ...forCompany(await s.finishSales(), company), pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
-      if (!a.vehicles) throw new Error('give --vehicles A,B (or --finish true)');
+      if (a.vehicles && a.select) throw new Error('give --vehicles A,B or --select FILTER, not both');
+      const picked = a.select ? await selectVehicles(s, company, a.select, a.max) : null;
+      const list = picked ? picked.ids : a.vehicles;
+      if (!list) throw new Error('give --vehicles A,B, --select FILTER (or --finish true)');
+      if (picked && !list.length) return { ok: true, dry_run: a.dry_run, replaced: [], selected: picked, note: 'no vehicle matches --select (vehicles queued for sale are left out)' };
       const v12 = ((await s.gs.call('info')).bridge_version ?? 0) >= 12;
       const replaced = [];
-      for (const id of a.vehicles) replaced.push(await replaceOne(s, company, a, id, v12));
+      for (const id of list) replaced.push(await replaceOne(s, company, a, id, v12));
       if (!a.dry_run) s.watchSales();
       const bad = replaced.filter((r) => !r.ok);
       return { ok: !bad.length, dry_run: a.dry_run, error: bad.length ? bad.map((r) => `vehicle ${r.vehicle}: ${r.error}`).join('; ') : null,
         ...(bad.length ? { first_error: bad[0].first_error ?? errorCode(bad[0].error) } : {}),
-        cost: replaced.reduce((n, r) => n + (r.cost ?? 0), 0), replaced, pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
+        cost: replaced.reduce((n, r) => n + (r.cost ?? 0), 0), replaced, ...(picked ? { selected: picked } : {}), pending_sales: [...s.pendingSales.values()].filter((p) => p.company === company) };
     },
   },
   {
     name: 'add-train', group: 'operate', session: true,
-    description: 'Add a train to a running line safely, in one call: counts the trains on the line of --vehicle (same order stations) and the passing loops on its track between its first two stations (pairs of points outside stations and depot spurs), refuses when the trains would outnumber the loops + 1 (single track: each loop lets one more train run; first_error needs_loop with the loop-sites command), then clones the train at a depot on its own route (sharing orders), starts it and traces the new train\'s route (verify). --force true skips the loop check. AgentBridge v12 (counts) and v9 (trace).',
+    description: 'Add a train to a running line safely, in one call: counts the trains on the line of --vehicle (same order stations) and the usable passing loops on its track between its first two stations (a second track that leaves the line at points and rejoins it, with a signal on each side and room for the longest train: check.loops / check.unusable_loops), refuses when the trains would outnumber the loops + 1 (single track: each loop lets one more train run; first_error needs_loop with the loop-sites command), refuses to copy a train that lost money last year and this year (source_unprofitable), then clones the train at a depot on its own route (sharing orders), starts it and traces the new train\'s route (verify; first_leg.detour_ratio = depot-to-first-station tiles / straight distance, warning depot_exit_detour when the depot exit leads the long way). --force true skips both checks. AgentBridge v12 (counts) and v9 (trace).',
     args: z.object({ ...act, vehicle: int(), count: int().min(1).max(10).default(1), force: bool().default(false) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
-      const info = await s.gs.call('info');
-      const stops = await orderStations(s, company, a.vehicle);
-      if (stops.length < 2) throw new Error(`refused: vehicle ${a.vehicle} has fewer than two station orders`);
-      const ids = await stationVehicleIds(s, company);
-      const sameLine = ids ? (ids.get(stops[0].id) ?? []).filter((v) => stops.every((st) => (ids.get(st.id) ?? []).includes(v))) : null;
-      const tracer = (info.bridge_version ?? 0) >= 9 ? await makeTracer(s, company, info) : null;
-      let loops = null;
-      if (tracer) {
-        const r = await tracer.trace(await tracer.stationStarts(stops[0]), stops[1]);
-        if (r.connected) loops = await countLoops(tracer, r.path);
-      }
-      const trains = sameLine ? sameLine.length : null;
-      const check = { trains_on_line: trains, passing_loops: loops, after: trains === null ? null : trains + a.count, allowed: loops === null ? null : loops + 1 };
-      if (!a.force && trains !== null && loops !== null && trains + a.count > loops + 1) {
-        return { ok: false, dry_run: a.dry_run, error: `needs_loop: the line already runs ${trains} train${trains === 1 ? '' : 's'} with ${loops} passing loop${loops === 1 ? '' : 's'}; ${trains + a.count} trains on single track need ${trains + a.count - 1} loops. Build one first: loop-sites --vehicle ${a.vehicle}, or --force true`,
-          first_error: 'needs_loop', check };
-      }
-      const { depot, ...routeCheck } = await depotForRoute(s, company, { depot: 'auto', check_route: true }, a.vehicle, { cmd: 'vehicle-clone' });
-      const res = await run(ctx, a, Array.from({ length: a.count }, () => ['veh_clone', depot.x, depot.y, a.vehicle, true]));
-      const vehicles = res.results.filter((r) => r.ok && r.value !== undefined).map((r) => r.value);
-      const out = { ...res, check, depot, ...routeCheck, vehicles };
-      if (a.dry_run || !vehicles.length) return out;
-      const started = await s.exec(company, vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
-      out.started = started.ok;
-      if (tracer) {
-        try {
-          const stations = stationsFromRows(await s.gs.call('stations', { company }), s.cargos);
-          const legs = await routeLegs(s, company, tracer, stations, await vehicleOf(s, company, vehicles[0]));
-          out.verify = { connected: legs.connected, ...(legs.connected ? {} : { legs: legs.legs.filter((l) => !l.connected) }) };
-          if (!legs.connected) { out.ok = false; out.error = `route_broken: the new train ${vehicles[0]} has no path to all its stations; see verify`; out.first_error = 'route_broken'; }
-        } catch (e) { out.verify = { connected: null, error: e.message }; }
-      }
-      return out;
+      return addTrain(ctx, s, company, a);
     },
   },
   {
@@ -2380,10 +3289,67 @@ export const COMMANDS = [
     },
   },
   {
+    name: 'wait', group: 'operate', session: true,
+    description: `Wait in one call instead of polling: --vehicles A,B --until ${WAIT_STATES.join('|')} returns when every listed vehicle is there (--any true: the first one); loaded = cargo on board >= --load_pct (default 100) of capacity (AgentBridge v13); stopped includes stopped in a depot; sold = gone after a queued sale (vehicle-sell). --days N waits N game days (about 2 s each) instead. Checks once a second; --timeout_s (default 60, max 280: one call must answer within 5 minutes) ends it with first_error wait_timeout and where each vehicle is. A paused game refuses at once (paused: game days do not pass; the host runs turn-advance). Changes nothing.`,
+    args: z.object({ ...who, vehicles: ids().optional(), until: z.enum(WAIT_STATES).optional(), days: int().min(1).max(120).optional(),
+      any: bool().default(false).describe('done when any one vehicle matches'), load_pct: int().min(1).max(100).default(100).describe('until loaded: share of capacity'),
+      timeout_s: int().min(1).max(280).default(60) }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      if ((a.vehicles === undefined) !== (a.until === undefined)) throw new Error('give --vehicles A,B with --until STATE, or --days N');
+      if (a.days === undefined && a.until === undefined) throw new Error('give --vehicles A,B --until STATE, or --days N');
+      const started = Date.now();
+      const first = await s.gs.call('info');
+      const check = async () => {
+        if (a.until === 'sold') await s.finishSales();
+        const rows = new Map(vehiclesFromRows(await s.gs.call('vehicles', { company })).map((v) => [v.id, v]));
+        let loads = null;
+        if (a.until === 'loaded') {
+          try { loads = loadsFromRows(await s.gs.call('vehicle_loads', { company, vehicles: a.vehicles })); } catch (e) {
+            if (/unknown cmd/.test(e.message)) throw new Error('refused: wait --until loaded needs AgentBridge v13; the host re-runs install-gamescript and loads the game again');
+            throw e;
+          }
+        }
+        return a.vehicles.map((id) => {
+          const v = rows.get(id) ?? null;
+          const load = loads?.get(id) ?? null;
+          const matched = waitMatch(v, a.until, { load, loadPct: a.load_pct, sold: !!s.soldVehicles?.get(`${company}:${id}`) });
+          return { id, state: v ? v.state : s.soldVehicles?.get(`${company}:${id}`) ? 'sold' : 'gone', matched, ...(v ? { x: v.x, y: v.y } : {}), ...(load ? { load_pct: load.pct } : {}) };
+        });
+      };
+      let info = first, vehicles = a.vehicles ? await check() : [];
+      const met = () => (a.days !== undefined ? info.date - first.date >= a.days : a.any ? vehicles.some((v) => v.matched) : vehicles.every((v) => v.matched));
+      const out = () => ({ until: a.until ?? null, ...(a.days !== undefined ? { days: a.days } : {}), waited_s: Math.round((Date.now() - started) / 100) / 10,
+        game_days: info.date - first.date, date: gameDate(info), ...(a.vehicles ? { vehicles } : {}) });
+      if (met()) return { ok: true, done: true, ...out() };
+      if (info.paused) return { ok: false, done: false, error: 'paused: the game is paused, so vehicles do not move and no game days pass; the host runs turn-advance (or unpause)', first_error: 'paused', ...out() };
+      while (Date.now() - started < a.timeout_s * 1000) {
+        await sleep(1000);
+        info = await s.gs.call('info');
+        if (a.vehicles) vehicles = await check();
+        if (met()) return { ok: true, done: true, ...out() };
+        if (info.paused) return { ok: false, done: false, error: 'paused: the game was paused while waiting', first_error: 'paused', ...out() };
+      }
+      return { ok: false, done: false, error: `wait_timeout: not done after ${a.timeout_s} s (${info.date - first.date} game days)${a.vehicles ? `; not yet: ${vehicles.filter((v) => !v.matched).map((v) => `${v.id} ${v.state}`).join(', ')}` : ''}`, first_error: 'wait_timeout', ...out() };
+    },
+  },
+  {
     name: 'vehicle-start', group: 'operate', session: true,
-    description: 'Start vehicles (comma-separated ids). Already running ones are left alone.',
-    args: z.object({ ...act, vehicles: ids() }),
-    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true }),
+    description: 'Start vehicles (comma-separated ids). Already running ones are left alone. A vehicle queued for sale (vehicle-sell, vehicle-replace) is refused with queued_for_sale: starting it would only send it round again; --cancel_sale true takes it off the queue and starts it.',
+    args: z.object({ ...act, vehicles: ids(), cancel_sale: bool().default(false).describe('take vehicles off the sale queue and start them') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const queued = a.vehicles.filter((v) => s.pendingSales.has(`${company}:${v}`));
+      if (queued.length && !a.cancel_sale) {
+        return { ok: false, dry_run: a.dry_run, error: `queued_for_sale: vehicle${queued.length > 1 ? 's' : ''} ${queued.join(', ')} ${queued.length > 1 ? 'are' : 'is'} queued for sale and will be sold in the depot; nothing was started. To keep ${queued.length > 1 ? 'them' : 'it'}: vehicle-start --vehicles ${queued.join(',')} --cancel_sale true`,
+          first_error: 'queued_for_sale', queued_for_sale: queued, results: [] };
+      }
+      if (queued.length && !a.dry_run) for (const v of queued) s.pendingSales.delete(`${company}:${v}`);
+      const res = await run(ctx, a, a.vehicles.map((v) => ['veh_start_stop', v, 1]), { keepGoing: true });
+      const sold = [];
+      for (const r of res.results.filter((x) => !x.ok)) { const note = await soldNote(s, company, a.vehicles[r.step]); if (note) sold.push(note); }
+      return { ...res, ...(queued.length ? { sale_cancelled: a.dry_run ? [] : queued } : {}), ...(sold.length ? { already_sold: sold } : {}) };
+    },
   },
   {
     name: 'vehicle-stop', group: 'operate', session: true,
@@ -2393,12 +3359,15 @@ export const COMMANDS = [
   },
   {
     name: 'vehicle-depot', group: 'operate', session: true,
-    description: 'Send vehicles (comma-separated ids) to a depot: they stop there (needed before vehicle-sell). service=true = service only and carry on. Safe to repeat: vehicles already heading to a depot are left alone (already_heading; sending again would cancel their depot order in OpenTTD) and ones already stopped in a depot are reported (already_in_depot). Failures say why (failed[].error: not_found, broken_down, loading_full_load, no_depot). AgentBridge v11; older ones only skip vehicles already in a depot.',
-    args: z.object({ ...act, vehicles: ids(), service: bool().default(false) }),
+    description: 'Send vehicles (comma-separated ids) to a depot: they stop there (needed before vehicle-sell). service=true = service only and carry on. Safe to repeat: vehicles already heading to a depot are left alone (already_heading; sending again would cancel their depot order in OpenTTD) and ones already stopped in a depot are reported (already_in_depot). Failures say why (failed[].error: not_found, broken_down, loading_full_load, no_depot). --select "max_reliability_pct=50" --service true services the vehicles matching a filter (at most --max, default 20; selected lists them). AgentBridge v11; older ones only skip vehicles already in a depot.',
+    args: z.object({ ...act, vehicles: ids().optional(), service: bool().default(false), ...selectArgs('send', 20) }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
+      if (a.vehicles && a.select) throw new Error('give --vehicles A,B or --select FILTER, not both');
+      const picked = a.select ? await selectVehicles(s, company, a.select, a.max) : null;
+      if (!a.vehicles && !picked) throw new Error('give --vehicles A,B or --select FILTER');
       const v11 = ((await s.gs.call('info')).bridge_version ?? 0) >= 11;
-      let send = a.vehicles;
+      let send = picked ? picked.ids : a.vehicles;
       const inDepot = [];
       if (!v11) {
         const rows = vehiclesFromRows(await s.gs.call('vehicles', { company }));
@@ -2409,16 +3378,57 @@ export const COMMANDS = [
       const res = send.length ? await run(ctx, a, send.map((v) => ['veh_depot', v, a.service]), { keepGoing: true })
         : { ok: true, error: null, dry_run: a.dry_run, steps_total: 0, steps_done: 0, cost: 0, results: [] };
       const by = (code) => res.results.filter((r) => r.ok && (v11 ? (r.value ?? 0) === code : code === 1)).map((r) => send[r.step]);
-      return { ...res, sent: by(1), already_heading: by(2), already_in_depot: [...inDepot, ...by(3)],
+      return { ...res, ...(picked ? { selected: picked } : {}), sent: by(1), already_heading: by(2), already_in_depot: [...inDepot, ...by(3)],
         failed: res.results.filter((r) => !r.ok).map((r) => ({ vehicle: send[r.step], error: r.error ?? 'failed' })),
         ...(v11 ? {} : { note: 'the running AgentBridge is older than v11: a vehicle already heading to a depot cannot be detected, and sending it again cancels its depot order' }) };
     },
   },
   {
     name: 'vehicle-sell', group: 'operate', session: true,
-    description: 'Sell vehicles (comma-separated ids). Each must be stopped inside a depot (vehicle-depot, then check `vehicles --state in_depot`). The negative cost is the sale income.',
-    args: z.object({ ...act, vehicles: ids() }),
-    run: (ctx, a) => run(ctx, a, a.vehicles.map((v) => ['veh_sell', v]), { keepGoing: true }),
+    description: 'Sell vehicles (comma-separated ids) in one call: ones stopped in a depot are sold now (sold, income); the others are sent to a depot and queued (queued): the daemon (or relay) sells each when it stops there (checked every 20 s; status background_jobs, vehicle-problems pending_sale; kept in the jobs file). --send false sells only the ones in a depot and fails the rest (not_in_depot). A vehicle already sold through openttd-agent is already_sold (ok) with the sale date. The negative cost is the sale income.',
+    args: z.object({ ...act, vehicles: ids(), send: bool().default(true).describe('send vehicles that are not in a depot there and sell them on arrival (false = refuse them)') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const rows = new Map(vehiclesFromRows(await s.gs.call('vehicles', { company })).map((v) => [v.id, v]));
+      const now = [], toQueue = [], alreadyQueued = [], alreadySold = [], failed = [];
+      for (const id of [...new Set(a.vehicles)]) {
+        const v = rows.get(id);
+        if (!v) {
+          const note = await soldNote(s, company, id);
+          if (note) alreadySold.push({ vehicle: id, note }); else failed.push({ vehicle: id, error: `not_found: vehicle ${id} does not exist or is not yours` });
+        } else if (v.state === 'in_depot') now.push(v);
+        else if (s.pendingSales.has(`${company}:${id}`)) alreadyQueued.push(id);
+        else if (a.send) toQueue.push(v);
+        else failed.push({ vehicle: id, error: `not_in_depot: vehicle ${id} is ${v.state.replace('_', ' ')}; send it with vehicle-depot or use --send true` });
+      }
+      const info = { stations: new Map() };
+      for (const v of [...now, ...toQueue]) info.stations.set(v.id, a.dry_run ? [] : await orderStationIds(s, company, v.id));
+      const sell = now.length ? await run(ctx, a, now.map((v) => ['veh_sell', v.id]), { keepGoing: true }) : null;
+      const sold = [];
+      for (const r of sell?.results ?? []) {
+        const v = now[r.step];
+        if (!r.ok) { failed.push({ vehicle: v.id, error: r.error ?? 'failed' }); continue; }
+        sold.push(v.id);
+        if (!a.dry_run) await s.recordSold({ company, vehicle: v.id, income: -r.cost, unit_number: v.unit_number, name: v.name, stations: info.stations.get(v.id) });
+      }
+      const queued = [];
+      if (toQueue.length) {
+        const sent = await run(ctx, a, toQueue.map((v) => ['veh_depot', v.id, false]), { keepGoing: true });
+        for (const r of sent.results) {
+          const v = toQueue[r.step];
+          if (!r.ok && /^not_found/.test(r.error ?? '')) { failed.push({ vehicle: v.id, error: r.error }); continue; }
+          queued.push({ vehicle: v.id, sent: r.ok, ...(r.ok ? {} : { retrying: r.error ?? 'failed' }) });
+          if (!a.dry_run) s.pendingSales.set(`${company}:${v.id}`, { company, vehicle: v.id, send: true, sent: r.ok, since: new Date().toISOString(), unit_number: v.unit_number, name: v.name, stations: info.stations.get(v.id) });
+        }
+        if (!a.dry_run) s.watchSales();
+      }
+      const income = -(sell?.cost ?? 0);
+      return { ok: !failed.length, dry_run: a.dry_run, error: failed.length ? failed.map((f) => `vehicle ${f.vehicle}: ${f.error}`).join('; ') : null,
+        ...(failed.length ? { first_error: errorCode(failed[0].error) } : {}), cost: sell?.cost ?? 0, income,
+        sold, [a.dry_run ? 'would_queue' : 'queued']: queued, ...(alreadyQueued.length ? { already_queued: alreadyQueued } : {}),
+        ...(alreadySold.length ? { already_sold: alreadySold } : {}), failed, results: sell?.results ?? [],
+        ...(queued.length && !a.dry_run ? { note: 'queued vehicles are sold when they stop in a depot (the daemon checks every 20 s); wait --vehicles ... --until sold waits for it' } : {}) };
+    },
   },
   {
     name: 'vehicle-refit', group: 'operate', session: true,
@@ -2467,25 +3477,30 @@ export const COMMANDS = [
   },
   {
     name: 'build-rail', group: 'build', session: true,
-    description: 'Plan and build a rail line between two anchor tiles. Anchors are where the line connects (a station end tile, the tile in front of a depot, existing track, or connect_at from build-terminus): track is laid on every tile strictly between them. The planner prefers flat and straight, avoids houses, industries and stations, crosses roads on the level and bridges water, rail and roads where it must. Use dry_run=true first for the cost; each step reports ok/error. On failure nothing after the failed step is built: fix (terraform, demolish, other anchors) and run again; already-built track is kept.',
-    args: z.object({ ...pathArgs, rail_type: int().optional().describe('see rail-types; default: first available') }),
+    description: 'Plan and build a rail line between two anchor tiles. Anchors are where the line connects (a station end tile, the tile in front of a depot, existing track, or connect_at from build-terminus): track is laid on every tile strictly between them. The planner prefers flat and straight, avoids houses, industries and stations, crosses roads on the level and bridges water, rail and roads where it must. Use dry_run=true first for the cost; each step reports ok/error. On failure nothing after the failed step is built: fix (terraform, demolish, other anchors) and run again; already-built track is kept. A vehicle on the tiles (ERR_VEHICLE_IN_THE_WAY) gives transient: true and vehicles_in_the_way (blocked_by_vehicle in a dry run); --wait_clear_s N waits for it to pass and retries from that step.',
+    args: z.object({ ...pathArgs, rail_type: int().optional().describe('see rail-types; default: first available'), ...waitClear }),
     run: (ctx, a) => buildPath(ctx, a, 'rail'),
   },
   {
     name: 'build-rail-station', group: 'build', session: true,
-    description: 'Build a rail station with its lowest-x/y corner at x,y. axis=x: platforms run along x and are stacked along y (axis=y: the reverse). Trains enter at either end of a platform.',
-    args: z.object({ ...act, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(20).default(1), length: int().min(1).max(20).default(4), ...join, rail_type: int().optional() }),
-    run: (ctx, a) => run(ctx, a, [['rail_station', a.x, a.y, a.axis === 'y', a.platforms, a.length, joinArg(a.join)]], { railType: a.rail_type }),
+    description: 'Build a rail station with its lowest-x/y corner at x,y. axis=x: platforms run along x and are stacked along y (axis=y: the reverse). Trains enter at either end of a platform. A real build returns station {id, name} (the new or joined station).',
+    args: z.object({ ...act, ...borrow, ...point, axis: z.enum(['x', 'y']).default('x'), platforms: int().min(1).max(20).default(1), length: int().min(1).max(20).default(4), ...join, rail_type: int().optional() }),
+    run: async (ctx, a) => {
+      const res = await run(ctx, a, [['rail_station', a.x, a.y, a.axis === 'y', a.platforms, a.length, joinArg(a.join)]], { railType: a.rail_type });
+      if (!res.ok || a.dry_run) return res;
+      const { s, company } = await mine(ctx, a);
+      return { ...res, station: await builtStationAt(s, company, a.x, a.y, 'rail', a.platforms + a.length) };
+    },
   },
   {
     name: 'build-rail-depot', group: 'build', session: true,
     description: 'Build a rail depot at x,y with its entrance facing front (a tile next to it that has or will get track). Connect it with build-rail using the front tile as an anchor. The result has exit_dir and (AgentBridge v9) front_joined: whether track on the front tile reaches the entrance, and front_leads (the ways a train leaving the depot can go from there); a warning when nothing joins it yet or when trains can leave in one direction only (every new train then runs that way first, e.g. to the far end of the line to turn).',
-    args: z.object({ ...act, ...point, ...front, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, ...point, ...front, rail_type: int().optional() }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const res = await run(ctx, a, [['rail_depot', a.x, a.y, a.front_x, a.front_y]], { railType: a.rail_type });
       const dir = TRACE_DIRS.findIndex(([dx, dy]) => a.x + dx === a.front_x && a.y + dy === a.front_y);
-      const out = { ...res, exit_dir: DIR_NAMES[dir] ?? null };
+      const out = { ...res, exit_dir: DIR_NAMES[dir] ?? null, ...(res.ok && !a.dry_run ? { depot: { x: a.x, y: a.y }, next: `vehicle-buy --depot_x ${a.x} --depot_y ${a.y} --engine <id>` } : {}) };
       if (dir < 0 || !res.ok) return out;
       let t = null;
       try { t = (await s.gs.call('rail_tiles', { x0: a.front_x, y0: a.front_y, x1: a.front_x, y1: a.front_y }))[0]; } catch { return out; }
@@ -2516,7 +3531,7 @@ export const COMMANDS = [
   },
   {
     name: 'build-cargo-route', group: 'build', session: true,
-    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. --passing_loops N lays N passing loops on straight stretches spread along the line, each sized for the train (length = train tiles + 2), so more trains can run on the single track (passing_loops in the result; a loop that does not fit is a warning, not a failure). A town end with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked). warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). Refused (failed_step existing_route) when your rail stations near both ends are already served by one of your vehicles: clone that train instead, or --allow_existing true. Stations nobody serves (e.g. after selling the fleet) do not block it. A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
+    description: 'Composite: a whole rail route in one call. Terminus at each end (station-sites logic, each facing the other end), rail between their connect_at anchors, a depot beside the line near the source, one train (cheapest-to-run locomotive that can pull the cargo unless --engine; wagons that carry it, --wagons default fills the platform), orders (full_load_any at the source, unload,no_load at the destination; passengers/mail between two towns: plain orders both ways), started. dry_run=true checks every placement and the rail path and returns estimated_cost without building. --passing_loops N lays N passing loops on straight stretches spread along the line, each sized for the train (length = train tiles + 2), so more trains can run on the single track (passing_loops in the result; a loop that does not fit is a warning, not a failure). --trains K then runs up to K trains: clones of the first, only as many as the built line has usable loops + 1 (warning trains when fewer). An end (town or industry) with no room is retried automatically with a wider search, a shorter platform and one platform (source_fallback / dest_fallback say what worked); when nothing fits, first_error no_terminus_site with no_site {candidates_on_map, dry_runs, rejected (counts by error), tried, own_station_near, hint (only what was not tried)}. warnings[] lists your stations within 8 tiles of a new terminus (near_own_station, tiles). When your rail stations near both ends are already served by one of your vehicles, --if_exists decides: refuse (default; failed_step existing_route), skip (ok, action exists), add_train (runs add-train on that line), build. Stations nobody serves (e.g. after selling the fleet) do not block it. Refused with source_produces_nothing when --from_industry does not produce the cargo, or is a secondary industry (sawmill, factory...) that made none last month (feed it first; --force true builds anyway). A real build ends by tracing the line both ways: verify {connected, there, back, first_gap, first_leg (depot to source: detour_ratio, warning depot_exit_detour)}; failed_step verify with first_error route_broken when it does not trace (the train is already running). A failure stops at that step and reports failed_step and everything already built (nothing is demolished). Example: --from_industry 6 --to_industry 9 --cargo iron --dry_run true',
     args: z.object({
       ...act,
       from_industry: int().optional().describe('source industry id (see industries / find-cargo-pairs)'), from_town: z.string().optional().describe('source town id or name'),
@@ -2528,14 +3543,18 @@ export const COMMANDS = [
       radius: int().min(2).max(20).default(8).describe('station search box around each end'),
       margin: int().min(2).max(80).default(20).describe('how far the line may wander outside the two stations'),
       max_bridge: int().min(3).max(40).default(12), rail_type: int().optional().describe('see rail-types; default: the one with the cheapest track'),
-      allow_existing: bool().default(false).describe('build even when one of your vehicles already serves your stations at both ends (refused by default: clone trains instead)'),
+      allow_existing: bool().default(false).describe('same as --if_exists build'),
+      if_exists: z.enum(['refuse', 'skip', 'add_train', 'build']).default('refuse').describe('when one of your vehicles already serves your stations at both ends: refuse (failed_step existing_route), skip (ok: true, action: exists), add_train (add-train on that line: loop and profit checks, clone, start), build (a second line anyway)'),
       passing_loops: int().min(0).max(6).default(0).describe('passing loops to build on the line, spread along it on straight stretches (loop-sites logic), sized for the train'),
+      trains: int().min(1).max(10).default(1).describe('trains to run on the new line: the first, then clones (shared orders) only while the built line has a usable passing loop for each; use with --passing_loops'),
+      force: bool().default(false).describe('build from a source that produces none of the cargo now (source_produces_nothing: a secondary industry before its input arrives)'),
+      reuse_stations: z.enum(['auto', 'never']).default('auto').describe('auto: at an end within --radius of one of your rail stations, the new terminus joins that station (reused_station; reuse_failed when it does not fit); never: always a new station'),
     }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       if ((a.from_industry !== undefined) === (a.from_town !== undefined)) throw new Error('give exactly one of --from_industry, --from_town');
       if ((a.to_industry !== undefined) === (a.to_town !== undefined)) throw new Error('give exactly one of --to_industry, --to_town');
-      return buildCargoRoute(s, company, a);
+      return buildCargoRoute(s, company, a, ctx);
     },
   },
   {
@@ -2557,22 +3576,28 @@ export const COMMANDS = [
   },
   {
     name: 'build-track', group: 'build', session: true,
-    description: 'Lay (or with remove=true, remove) one rail piece on tile x,y joining its neighbour from_x,from_y to its neighbour to_x,to_y. Existing track on the tile is kept, so this makes junctions: e.g. connect a depot or a branch onto an existing line. Neighbours may be straight across (straight piece) or at right angles (curve).',
-    args: z.object({ ...act, ...point, from_x: int(), from_y: int(), to_x: int(), to_y: int(), remove: bool().default(false), rail_type: int().optional() }),
-    run: (ctx, a) => run(ctx, a, [[a.remove ? 'rail_remove' : 'rail', a.from_x, a.from_y, a.x, a.y, a.to_x, a.to_y]], { railType: a.rail_type }),
+    description: 'Lay (or with remove=true, remove) one rail piece on tile x,y joining its neighbour from_x,from_y to its neighbour to_x,to_y. Existing track on the tile is kept, so this makes junctions: e.g. connect a depot or a branch onto an existing line. Neighbours may be straight across (straight piece) or at right angles (curve). A vehicle on the tiles (ERR_VEHICLE_IN_THE_WAY) gives transient: true and vehicles_in_the_way (blocked_by_vehicle in a dry run); --wait_clear_s N waits for it to pass and retries from that step.',
+    args: z.object({ ...act, ...point, from_x: int(), from_y: int(), to_x: int(), to_y: int(), remove: bool().default(false), rail_type: int().optional(), ...waitClear }),
+    run: (ctx, a) => runClear(ctx, a, [[a.remove ? 'rail_remove' : 'rail', a.from_x, a.from_y, a.x, a.y, a.to_x, a.to_y]], { railType: a.rail_type }),
   },
   {
     name: 'build-signal', group: 'build', session: true,
-    description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it (refused with no_signal_here when there is none facing that way). The track must exist; in a template\'s dry run, signals on track it lays show skipped_in_dry_run.',
-    args: z.object({ ...act, ...point, ...front, type: z.enum(Object.keys(SIGNAL_TYPES)).default('path'), two_way: bool().default(false), remove: bool().default(false) }),
+    description: 'Build a signal on the track tile x,y facing trains that come from the neighbouring tile `front`. type: path (default; trains may pass it from behind), path_oneway, block, entry, exit, combo. two_way applies to block/entry/exit/combo. remove=true removes it (refused with no_signal_here when there is none facing that way, and with loop_signal when the tile is on a passing loop: without that signal two trains can enter the loop from both ends; --force true removes it anyway). The track must exist; in a template\'s dry run, signals on track it lays show skipped_in_dry_run.',
+    args: z.object({ ...act, ...point, ...front, type: z.enum(Object.keys(SIGNAL_TYPES)).default('path'), two_way: bool().default(false), remove: bool().default(false),
+      force: bool().default(false).describe('remove: also remove a passing loop\'s signal') }),
     run: async (ctx, a) => {
       if (a.remove) {
         const { s } = await mine(ctx, a);
         const why = await signalRemoveRefusal(s, a);
         if (why) return { ok: false, dry_run: a.dry_run, error: why, first_error: why.split(':')[0], steps_done: 0, results: [] };
+        const loop = a.force ? null : await loopOfTile(s, a.x, a.y);
+        if (loop) {
+          return { ok: false, dry_run: a.dry_run, first_error: 'loop_signal', steps_done: 0, results: [], loop: { x: loop.at.x, y: loop.at.y, end: loop.end, clear_tiles: loop.clear_tiles },
+            error: `loop_signal: (${a.x},${a.y}) is on the passing loop between the points at (${loop.at.x},${loop.at.y}) and (${loop.end.x},${loop.end.y}); without this signal trains from both ends can enter the loop and crash or jam. Nothing was removed. To take the whole loop out use build-passing-loop --remove true; to remove only this signal pass --force true` };
+        }
         return run(ctx, a, [['signal_remove', a.x, a.y, a.front_x, a.front_y]]);
       }
-      return run(ctx, a, [['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]);
+      return runClear(ctx, a, [['signal', a.x, a.y, a.front_x, a.front_y, SIGNAL_TYPES[a.type] + (a.two_way && SIGNAL_TYPES[a.type] < 4 ? 8 : 0)]]);
     },
   },
   {
@@ -2606,21 +3631,24 @@ export const COMMANDS = [
   },
   {
     name: 'build-passing-loop', group: 'build', session: true,
-    description: 'Template: passing loop for a single-track line. The main track runs length+2 tiles from x,y in direction dir (sw=+x, se=+y, ne=-x, nw=-y); a second track is laid beside it (side=1 or -1) with one-way path signals: trains heading dir use the main track, the others the loop. Both sides have length-1 clear tiles between the points and the exit signal (fits trains up to length-2 tiles). Give --train_tiles N or --for_vehicle ID (the longest train on that vehicle\'s line is used): length then defaults to train+2, and a loop with fewer than train+1 clear tiles is refused (loop_too_short). Checked first (AgentBridge v9): every main-line tile must be straight track along dir, or free land (not_straight_at / blocked_at / signal_at {x,y}); loop tiles must be free (loop_side_occupied_at). After a real build: loop_check (both directions through the loop) and, with --for_vehicle, route_after (connected|broken with first_gap). remove=true with the same x,y,dir,length,side takes the loop track and both signals (including the one on the main track) out again; the main track stays.',
+    description: 'Template: passing loop for a single-track line. The main track runs length+2 tiles from x,y in direction dir (sw=+x, se=+y, ne=-x, nw=-y); a second track is laid beside it (side=1 or -1) with one-way path signals: trains heading dir use the main track, the others the loop. Both sides have length-1 clear tiles between the points and the exit signal (fits trains up to length-2 tiles). Give --train_tiles N or --for_vehicle ID (the longest train on that vehicle\'s line is used); without either, the longest of your trains serving the line through x,y is used (train_from_line), else a train_length_unknown warning. Length then defaults to train+2, and a loop with fewer than train+1 clear tiles is refused (loop_too_short). Checked first (AgentBridge v9): every main-line tile must be straight track along dir, or free land (not_straight_at / blocked_at / signal_at {x,y}); loop tiles must be free (loop_side_occupied_at). After a real build: loop_check (both directions through the loop) and, with --for_vehicle, route_after (connected|broken with first_gap). remove=true with the same x,y,dir,length,side takes the loop track and both signals (including the one on the main track) out again; the main track stays. A vehicle on the tiles (ERR_VEHICLE_IN_THE_WAY) gives transient: true and vehicles_in_the_way (blocked_by_vehicle in a dry run); --wait_clear_s N waits for it to pass and retries from that step.',
     args: z.object({ ...act, ...point, dir: z.enum(DIR_NAMES).default('sw').describe('sw=+x, se=+y, ne=-x, nw=-y'), length: int().min(2).max(30).optional().describe('default: train tiles + 2, else 6'),
       side: int().default(1), rail_type: int().optional(),
       train_tiles: int().min(1).max(40).optional().describe('longest train that must wait in the loop, in tiles'),
       for_vehicle: int().optional().describe('a train of this line: its longest train sets train_tiles; also traces its route after the build'),
-      remove: bool().default(false).describe('take out a loop built with the same arguments') }),
+      remove: bool().default(false).describe('take out a loop built with the same arguments'), ...waitClear }),
     run: async (ctx, a) => {
       const { s, company } = await mine(ctx, a);
       const info = await s.gs.call('info');
       const train = a.for_vehicle !== undefined ? await longestTrainOnLine(s, company, a.for_vehicle) : null;
-      const trainTiles = a.train_tiles ?? train?.tiles ?? null;
+      // C6: no train flags: the longest train already serving the line through x,y sets the size.
+      const onLine = a.train_tiles === undefined && !train && !a.remove ? await longestTrainAt(s, company, a.x, a.y) : null;
+      const trainTiles = a.train_tiles ?? train?.tiles ?? (onLine?.tiles || null);
       const length = a.length ?? (trainTiles ? trainTiles + 2 : 6);
+      const lineNote = onLine ? (onLine.tiles ? { train_from_line: onLine } : { warnings: [{ train_length_unknown: `${onLine.reason}; the loop is sized ${length} (fits trains up to ${length - 2} tiles). Pass --train_tiles N or --for_vehicle ID` }] }) : {};
       if (length > 30) return { ok: false, dry_run: a.dry_run, error: `loop_too_long: trains of ${trainTiles} tiles need length ${length}; the template allows 30`, first_error: 'loop_too_long' };
       const t = passingLoopSteps({ x: a.x, y: a.y, dir: dirIndex(a.dir), length, side: a.side < 0 ? -1 : 1 });
-      const geometry = { length, clear_tiles: t.clear_tiles, fits_trains_up_to_tiles: t.clear_tiles - 1, ends: t.ends, ...(trainTiles ? { train_tiles: trainTiles } : {}), ...(train ? { longest_train: train } : {}) };
+      const geometry = { length, clear_tiles: t.clear_tiles, fits_trains_up_to_tiles: t.clear_tiles - 1, ends: t.ends, ...(trainTiles ? { train_tiles: trainTiles } : {}), ...(train ? { longest_train: train } : {}), ...lineNote };
       if (a.remove) {
         const res = await run(ctx, a, passingLoopRemoveSteps(t), { keepGoing: true });
         if (!a.dry_run) await s.refreshArea(a.x - length - 3, a.y - length - 3, a.x + length + 3, a.y + length + 3);
@@ -2644,7 +3672,7 @@ export const COMMANDS = [
         }
         siteCheck = 'ok';
       }
-      const res = await run(ctx, a, t.steps, { railType: a.rail_type });
+      const res = await runClear(ctx, a, t.steps, { railType: a.rail_type });
       const out = { ...res, ...geometry, site_check: siteCheck };
       if (a.dry_run || !res.ok) return out;
       await s.refreshArea(a.x - length - 3, a.y - length - 3, a.x + length + 3, a.y + length + 3);
@@ -2726,6 +3754,66 @@ export const COMMANDS = [
 
   // ---- build: road ---------------------------------------------------------------------
   {
+    name: 'road-stop-sites', group: 'build', session: true,
+    description: 'Where a bus or truck stop fits near a town (drive-through stops on straight town roads near the centre, then bay stops), an industry (bay stops within --radius, default 3, of its tiles) or a tile: each site dry-run checked as your company, with cost and build (the build-road-station command to run). --count N (default 3) sites at least --spacing tiles apart (Manhattan; e.g. 6 for a bus network across a town); --cargo C keeps only sites whose catchment accepts it (acceptance, radius 3); --with_depot true adds a depot spot beside a road near the first site (depot.build). rejected counts failed candidates by reason. Changes nothing. Example: --town Bigton --count 4 --spacing 5 --with_depot true',
+    args: z.object({ ...who, town: z.string().optional().describe('town id or name'), industry: int().optional(), x: int().optional(), y: int().optional(),
+      kind: z.enum(['bus', 'truck']).optional().describe('default: bus at a town, truck otherwise'), cargo: z.string().optional().describe('only sites that accept this cargo'),
+      count: int().min(1).max(10).default(3), spacing: int().min(0).max(30).default(0).describe('least tiles between two returned sites'),
+      radius: int().min(1).max(12).optional().describe('search radius; default 4 at a town, 3 at an industry or tile'),
+      with_depot: bool().default(false).describe('also find a road depot spot near the first site') }),
+    run: async (ctx, a) => {
+      const { s, company } = await mine(ctx, a);
+      const [economy] = await Promise.all([s.economy(), s.ensureTiles()]);
+      const end = lineEnd(s, economy, { town: a.town, industry: a.industry, x: a.x, y: a.y });
+      const r = a.radius ?? (end.kind === 'town' ? 4 : 3);
+      const kind = a.kind ?? (end.kind === 'town' ? 'bus' : 'truck');
+      const xs = end.targets.map((t) => t[0]), ys = end.targets.map((t) => t[1]);
+      await s.refreshArea(Math.min(...xs) - r - 8, Math.min(...ys) - r - 8, Math.max(...xs) + r + 8, Math.max(...ys) + r + 8);
+      const cands = end.kind === 'town'
+        ? [...townStopCandidates(s.map, { cx: end.point[0], cy: end.point[1], radius: r, max: 40 }), ...truckStopCandidates(s.map, { targets: [end.point], catchment: r, max: 40 })]
+        : truckStopCandidates(s.map, { targets: end.targets, catchment: r, max: 40 });
+      const want = a.cargo !== undefined ? cargoId(s.cargos, a.cargo) : undefined;
+      const sites = [], rejected = {};
+      const reject = (why) => { rejected[why] = (rejected[why] ?? 0) + 1; };
+      let dryRuns = 0;
+      for (const c of cands) {
+        if (sites.length >= a.count || dryRuns >= Math.max(16, a.count * 8)) break;
+        if (sites.some((p) => p.x === c.x && p.y === c.y)) continue;
+        if (a.spacing && sites.some((p) => tileDistance(p, c) < a.spacing)) { reject('too_close'); continue; }
+        dryRuns++;
+        const steps = [['road_station', c.x, c.y, c.front_x, c.front_y, kind === 'truck', c.drive_through, -1], ...(c.drive_through ? [] : [['road', c.front_x, c.front_y, c.x, c.y]])];
+        const dry = await s.exec(company, steps, { dryRun: true });
+        if (!dry.ok) { reject(dry.first_error ?? 'failed'); continue; }
+        let acceptance;
+        if (want !== undefined) {
+          const lists = await acceptanceAt(s, [[c.x, c.y]], { radius: 3, cargos: [want] });
+          acceptance = lists ? (lists[0][0]?.acceptance ?? 0) : null;
+          if (acceptance !== null && acceptance < ACCEPTED) { reject('not_accepted'); continue; }
+        }
+        sites.push({ x: c.x, y: c.y, front_x: c.front_x, front_y: c.front_y, drive_through: c.drive_through, cost: dry.cost, ...(acceptance !== undefined ? { acceptance } : {}),
+          tiles_from_target: Math.min(...end.targets.map(([tx, ty]) => tileDistance(c, { x: tx, y: ty }))),
+          build: `build-road-station --x ${c.x} --y ${c.y} --front_x ${c.front_x} --front_y ${c.front_y} --kind ${kind}${c.drive_through ? ' --drive_through true' : ''}` });
+      }
+      let depot;
+      if (a.with_depot && sites.length) {
+        const f = sites[0];
+        const roads = [];
+        for (let y = f.y - 6; y <= f.y + 6; y++) for (let x = f.x - 6; x <= f.x + 6; x++) if (s.map.inBounds(x, y) && s.map.classAt(x, y) === 'd') roads.push([x, y]);
+        const skip = new Set(sites.map((p) => `${p.x},${p.y}`));
+        depot = null;
+        for (const d of roadDepotCandidates(s.map, roads, { x: f.x, y: f.y }, { skip })) {
+          const dry = await s.exec(company, [['road_depot', d.x, d.y, d.front_x, d.front_y], ['road', d.front_x, d.front_y, d.x, d.y]], { dryRun: true });
+          if (dry.ok) { depot = { x: d.x, y: d.y, front_x: d.front_x, front_y: d.front_y, cost: dry.cost, build: `build-road-depot --x ${d.x} --y ${d.y} --front_x ${d.front_x} --front_y ${d.front_y}` }; break; }
+        }
+      }
+      // Every candidate refused by the town: say who and why once (R8), not just a count.
+      const la = !sites.length && rejected.ERR_LOCAL_AUTHORITY_REFUSES ? await authorityDetail(s, company, ['road_station'], { x: end.point[0], y: end.point[1] }) : null;
+      return { target: end.what, kind, candidates_on_map: cands.length, dry_runs: dryRuns, rejected, ...listResult('sites', sites, sites), ...(la ? { local_authority: la } : {}),
+        ...(depot !== undefined ? { depot } : {}),
+        ...(sites.length < a.count ? { hint: `${sites.length} of ${a.count} sites found: try --radius ${Math.min(12, r + 3)}${a.spacing ? ', a smaller --spacing' : ''}${a.cargo ? ', or no --cargo' : ''}` } : {}) };
+    },
+  },
+  {
     name: 'build-road-path', group: 'build', session: true,
     description: 'Plan and build a road between two tiles (both included), reusing existing roads where that is cheaper, going round houses and industries, bridging water and rail where it must. dry_run=true for the cost first. road_type (see road-types) lays that road or tram type (tram track can go on existing roads).',
     args: z.object({ ...pathArgs, road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
@@ -2733,8 +3821,8 @@ export const COMMANDS = [
   },
   {
     name: 'build-road-station', group: 'build', session: true,
-    description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis; not on junctions). A normal (bay) stop also gets the road piece on front that joins its entrance. Returns connected (AgentBridge v11): true when the entrance (or one end of a drive-through stop) joins a road beyond it. connect=auto builds a road from the entrance to the nearest road when it does not. A refused drive-through stop says why where it can tell (junction, one_way_road, other_owner_road, slope).',
-    args: z.object({ ...act, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join,
+    description: 'Build a bus or truck stop at x,y with its entrance facing front (a neighbouring road tile). drive_through=true builds on a straight road tile (front picks the axis; not on junctions). A normal (bay) stop also gets the road piece on front that joins its entrance. Returns station {id, name} (the new or joined station) and connected (AgentBridge v11): true when the entrance (or one end of a drive-through stop) joins a road beyond it. connect=auto builds a road from the entrance to the nearest road when it does not. A refused drive-through stop says why where it can tell (junction, one_way_road, other_owner_road, slope).',
+    args: z.object({ ...act, ...borrow, ...point, ...front, kind: z.enum(['bus', 'truck']).default('truck'), drive_through: bool().default(false), ...join,
       connect: z.enum(['none', 'auto']).default('none').describe('auto = when the entrance does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
       const res = await run(ctx, a, [
@@ -2747,18 +3835,22 @@ export const COMMANDS = [
         const why = await driveThroughRefusal(s, company, a);
         if (why.length) return { ...res, error: `drive_through_refused: ${why.join('; ')} (game: ${res.results[0].error ?? 'failed'})`, first_error: 'drive_through_refused', reasons: why };
       }
-      return withRoadJoin(s, company, a, res, a.drive_through ? 'drive_through' : 'bay');
+      const out = await withRoadJoin(s, company, a, res, a.drive_through ? 'drive_through' : 'bay');
+      if (!out.ok || a.dry_run) return out;
+      return { ...out, station: await builtStationAt(s, company, a.x, a.y, 'road') };
     },
   },
   {
     name: 'build-road-depot', group: 'build', session: true,
-    description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile), plus the road piece on front that joins the entrance. Returns connected (AgentBridge v11): true when the front tile joins a road beyond it. connect=auto builds a road from the front tile to the nearest road when it does not.',
-    args: z.object({ ...act, ...point, ...front,
+    description: 'Build a road vehicle depot at x,y with its entrance facing front (a neighbouring road tile), plus the road piece on front that joins the entrance. Returns depot {x, y} and front for vehicle-buy, and connected (AgentBridge v11): true when the front tile joins a road beyond it. connect=auto builds a road from the front tile to the nearest road when it does not.',
+    args: z.object({ ...act, ...borrow, ...point, ...front,
       connect: z.enum(['none', 'auto']).default('none').describe('auto = when the front tile does not join a road, build a road path from it to the nearest road'), road_type: int().optional().describe('road type id from road-types (trams: a tram type); default plain road') }),
     run: async (ctx, a) => {
       const res = await run(ctx, a, [['road_depot', a.x, a.y, a.front_x, a.front_y], ['road', a.front_x, a.front_y, a.x, a.y]], a.road_type !== undefined ? { roadType: a.road_type } : {});
       const { s, company } = await mine(ctx, a);
-      return withRoadJoin(s, company, a, res, 'depot');
+      const out = await withRoadJoin(s, company, a, res, 'depot');
+      if (!out.ok || a.dry_run) return out;
+      return { ...out, depot: { x: a.x, y: a.y }, front: { x: a.front_x, y: a.front_y }, next: `vehicle-buy --depot_x ${a.x} --depot_y ${a.y} --engine <id> (engines --type road)` };
     },
   },
 
@@ -2766,13 +3858,13 @@ export const COMMANDS = [
   {
     name: 'build-bridge', group: 'build', session: true,
     description: 'Build a rail, road or water (aqueduct) bridge between two tiles in a straight line (the ramps go on those tiles).',
-    args: z.object({ ...act, type: z.enum(['rail', 'road', 'water']).default('rail'), x1: int(), y1: int(), x2: int(), y2: int(), ...bridgeArg, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, type: z.enum(['rail', 'road', 'water']).default('rail'), x1: int(), y1: int(), x2: int(), y2: int(), ...bridgeArg, rail_type: int().optional() }),
     run: (ctx, a) => run(ctx, a, [['bridge', transport(a.type), a.x1, a.y1, a.x2, a.y2, bridgeType(a.bridge)]], { railType: a.rail_type }),
   },
   {
     name: 'build-tunnel', group: 'build', session: true,
     description: 'Build a rail or road tunnel starting at x,y, a tile at the foot of a slope; the game finds the other end straight through the hill.',
-    args: z.object({ ...act, type: z.enum(['rail', 'road']).default('rail'), ...point, rail_type: int().optional() }),
+    args: z.object({ ...act, ...borrow, type: z.enum(['rail', 'road']).default('rail'), ...point, rail_type: int().optional() }),
     run: (ctx, a) => run(ctx, a, [['tunnel', transport(a.type), a.x, a.y]], { railType: a.rail_type }),
   },
   {
@@ -2858,7 +3950,7 @@ export const COMMANDS = [
   {
     name: 'build-dock', group: 'build', session: true,
     description: 'Build a ship dock on the sloped coast tile x,y (the land half; the water half extends into the sea).',
-    args: z.object({ ...act, ...point, ...join }),
+    args: z.object({ ...act, ...borrow, ...point, ...join }),
     run: (ctx, a) => run(ctx, a, [['dock', a.x, a.y, joinArg(a.join)]]),
   },
   {
@@ -2876,7 +3968,7 @@ export const COMMANDS = [
   {
     name: 'build-airport', group: 'build', session: true,
     description: 'Build an airport with its lowest-x/y corner at x,y. airport = type name (see airport-types); find a spot with airport-sites.',
-    args: z.object({ ...act, ...point, airport: z.string().default('small'), ...join }),
+    args: z.object({ ...act, ...borrow, ...point, airport: z.string().default('small'), ...join }),
     run: async (ctx, a) => {
       const types = await (await ctx.session()).gs.call('airport_types');
       const at = types.find((t) => t.name === lc(a.airport));
@@ -2889,7 +3981,8 @@ export const COMMANDS = [
 export const COMMANDS_BY_NAME = new Map(COMMANDS.map((c) => [c.name, c]));
 
 /**
- * Forgiving argument names: --id for --vehicle, --vehicle for --vehicles and back (one id).
+ * Forgiving argument names: --id for --vehicle, --vehicle for --vehicles and back (one id), --share and
+ * --share_orders for each other.
  * Returns a new args object; keys the command really has always win.
  */
 export function aliasArgs(known, raw) {
@@ -2903,44 +3996,161 @@ export function aliasArgs(known, raw) {
   move('id', 'vehicles');
   const single = (v) => (Array.isArray(v) && v.length === 1 ? v[0] : typeof v === 'string' && /^\s*\d+\s*$/.test(v) ? v.trim() : v);
   move('vehicles', 'vehicle', single);
+  move('share', 'share_orders'); // vehicle-clone --share (C12)
+  move('share_orders', 'share'); // orders-copy --share_orders
+  move('company', 'companies'); // events --company N (events take no `company`: see events)
   return out;
 }
 
-/** zod issues -> "--key: message (got 'raw')" lines, so a bad number shows what was received. */
+/** zod issues -> "--key: message (got 'raw')" lines; a missing key says "required". */
 function argErrors(error, raw) {
   return error.issues.map((i) => {
     const key = i.path[0];
+    if (key !== undefined && i.path.length === 1 && i.code === 'invalid_type' && raw[key] === undefined) return `--${key}: required`;
     const got = key !== undefined && key in raw ? ` (got ${JSON.stringify(raw[key])})` : '';
     return `${key !== undefined ? `--${i.path.join('.')}` : 'arguments'}: ${i.message}${got}`;
   }).join('; ');
 }
 
-/** Validate args and run. Throws with a readable message on bad args. */
-export async function runCommand(ctx, name, rawArgs = {}) {
+/** Drop keys whose value is null or undefined: JSON callers send null for "not given". */
+const dropNulls = (raw) => Object.fromEntries(Object.entries(raw ?? {}).filter(([, v]) => v !== null && v !== undefined));
+
+/**
+ * Validate `args` against the command schema, repairing what has one obvious meaning (zod issue
+ * driven, so it covers every argument): a numeric string for a number arg becomes the number (CLI
+ * flags are text); a JSON number for a string arg becomes its text (P4); ""
+ * for a number counts as not given; an out-of-range number is clamped to the bound (L13) in read
+ * commands and dry runs only (a real build must not silently do something else). Returns
+ * { data, args (repaired raw), clamped } or throws bad_arguments.
+ */
+function parseArgs(cmd, name, args, cls) {
+  const a = { ...args };
+  const clamped = {};
+  const mayClamp = cls === 'read' || a.dry_run === true || a.dry_run === 'true';
+  for (let round = 0; round < 4; round++) {
+    const parsed = cmd.args.safeParse(a);
+    if (parsed.success) return { data: parsed.data, args: a, clamped };
+    let fixed = false;
+    for (const i of parsed.error.issues) {
+      if (i.path.length !== 1) continue;
+      const k = i.path[0];
+      const v = a[k];
+      if (i.code === 'invalid_type' && i.expected === 'number' && typeof toNumber(v) === 'number') { a[k] = toNumber(v); fixed = true; }
+      else if (i.code === 'invalid_type' && i.expected === 'string' && typeof v === 'number') { a[k] = String(v); fixed = true; }
+      else if (i.code === 'invalid_type' && i.expected === 'number' && typeof v === 'string' && v.trim() === '') { delete a[k]; fixed = true; }
+      else if (mayClamp && (i.code === 'too_big' || i.code === 'too_small') && i.origin === 'number' && i.inclusive !== false && typeof toNumber(v) === 'number') {
+        const to = Number(i.code === 'too_big' ? i.maximum : i.minimum);
+        clamped[k] = { from: toNumber(v), to };
+        a[k] = to;
+        fixed = true;
+      }
+    }
+    if (!fixed) throw new Error(`bad_arguments: bad arguments for ${name}: ${argErrors(parsed.error, a)}`);
+  }
+  throw new Error(`bad_arguments: bad arguments for ${name}: could not repair them`);
+}
+
+/** A failed admin connection (direct mode) -> { hint, network } for its address, or null. */
+function adminConnectHint(message) {
+  const m = /admin connect to (\[[^\]]+\]|[^\s:]+):(\d+) failed: (\S+?)[.)]?(\s|$)/.exec(message) ?? /no welcome from (\[[^\]]+\]|[^\s:]+):(\d+) within/.exec(message);
+  if (!m) return null;
+  return connectionHint(m[1], m[3] ?? 'timeout', { kind: 'admin' });
+}
+
+/**
+ * Validate and run one command; the full enveloped result (no output shaping). The daemon and the
+ * relay serve this; callers shape it once (runCommand / dispatch). opts.readOnly: L12 gate.
+ * Throws with a readable `code: text` message on bad arguments.
+ */
+export async function executeCommand(ctx, name, rawArgs = {}, { readOnly = false } = {}) {
   const cmd = COMMANDS_BY_NAME.get(name);
-  if (!cmd) throw new Error(`unknown command '${name}'. Run: openttd-agent help`);
+  if (!cmd) throw new Error(`unknown_command: unknown command '${name}'. Run: openttd-agent help`);
+  const known = Object.keys(cmd.args.shape ?? {});
+  const cls = commandClass(name, known);
+  let args = aliasArgs(known, dropNulls(rawArgs));
+  // L13: flags that cannot mean anything here are dropped with a note instead of failing the call.
+  const ignored = [];
+  const ignore = (k) => { delete args[k]; ignored.push(k); };
+  if (cls === 'read') for (const k of ['dry_run', 'list']) if (k in args && !known.includes(k)) ignore(k);
+  if (name === 'vehicle-depot' && args.depot === 'auto' && !known.includes('depot')) ignore('depot');
   // Refuse unknown keys: a mistyped or `--help` flag must never run the command with defaults
   // (`turn-advance --help` once advanced the game 30 days).
-  const known = Object.keys(cmd.args.shape ?? {});
-  const args = aliasArgs(known, rawArgs ?? {});
   const unknown = Object.keys(args).filter((k) => !known.includes(k));
   if (unknown.length) {
-    throw new Error(`unknown argument${unknown.length > 1 ? 's' : ''} for ${name}: ${unknown.map((k) => `--${k}`).join(', ')}. Valid: ${known.map((k) => `--${k}`).join(' ') || '(none)'}. Nothing was run.`);
+    throw new Error(`unknown_argument: unknown argument${unknown.length > 1 ? 's' : ''} for ${name}: ${unknown.map((k) => `--${k}`).join(', ')}. Valid: ${known.map((k) => `--${k}`).join(' ') || '(none)'} (and on every command: --fields --brief --compact --steps). Nothing was run.`);
   }
-  const parsed = cmd.args.safeParse(args);
-  if (!parsed.success) throw new Error(`bad arguments for ${name}: ${argErrors(parsed.error, args)}`);
+  let forced = false;
+  if (readOnly) ({ args, forced } = readOnlyGate(name, known, args));
+  const parsed = parseArgs(cmd, name, args, cls);
+  const notes = {
+    ...(forced ? { forced_dry_run: true } : {}),
+    ...(Object.keys(parsed.clamped).length ? { clamped: parsed.clamped } : {}),
+    ...(ignored.length ? { ignored_args: ignored } : {}),
+  };
+  const withNotes = (res) => (Object.keys(notes).length ? { ...res, ...notes } : res);
   // Player with a relay configured: the host's relay runs every game command (it holds the admin connection and the map mirror).
   if (cmd.session && ctx.cfg.relay) {
-    const res = envelope(await callRelay(ctx.cfg, name, args));
+    let res;
+    try { res = envelope(await callRelay(ctx.cfg, name, parsed.args)); } catch (e) {
+      const h = e.netCode ? connectionHint(ctx.cfg.relay, e.netCode, { kind: 'relay' }) : null;
+      if (!h) throw e;
+      return withNotes({ ok: false, error: e.message, first_error: errorCode(e.message), hint: h.hint, network: h.network });
+    }
     const host = res.versions?.openttd_agent;
     if (name === 'status' && host && host !== VERSION) {
       res.warnings = [...(res.warnings ?? []), `the host's relay runs openttd-agent ${host}, you run ${VERSION}: use the same version (npx -y github:mmmnorthmark/openttd-agent#v${host} ...)`];
     }
-    return res;
+    return withNotes(res);
   }
-  return envelope(await cmd.run(ctx, parsed.data));
+  // G20: every game action (a command with dry_run) answers with the bank balance after it.
+  const wantMoney = cmd.session && cls === 'dry_run';
+  const mark = wantMoney ? (await ctx.session()).lastExec?.n ?? 0 : 0;
+  let res;
+  try { res = envelope(await cmd.run(ctx, parsed.data)); } catch (e) {
+    const h = cmd.session ? adminConnectHint(e.message) : null;
+    if (!h) throw e;
+    return withNotes({ ok: false, error: e.message, first_error: errorCode(e.message), hint: h.hint, network: h.network });
+  }
+  if (wantMoney && res.money_after === undefined) {
+    const m = await moneyAfter(ctx, parsed.data.company, mark, res);
+    if (m !== undefined) res.money_after = m;
+  }
+  return withNotes(res);
 }
 
+/**
+ * Bank balance of `company` (default: the configured one) after a call: from the call's last
+ * exec reply when it ran one for that company, else the result's own top-level `money` (GS
+ * replies give the balance after the action), else from GS `companies` (one extra call).
+ * undefined when unknown (no company, the game did not answer).
+ */
+async function moneyAfter(ctx, company, mark, res) {
+  try {
+    const s = await ctx.session();
+    const c = company ?? s.cfg.company;
+    if (c === null || c === undefined) return undefined;
+    const last = s.lastExec;
+    if (last && last.n > mark && last.company === c && typeof last.money === 'number') return last.money;
+    if (typeof res.money === 'number') return res.money;
+    return (await s.gs.call('companies')).find((r) => r.id === c)?.money;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Validate, run and shape one command: the library and in-process entry. Takes the reserved
+ * output args (fields, brief, compact, steps; see src/output.js) besides the command's own.
+ */
+export async function runCommand(ctx, name, rawArgs = {}, opts = {}) {
+  const cmd = COMMANDS_BY_NAME.get(name);
+  const { args, output } = takeOutputArgs(rawArgs, cmd ? Object.keys(cmd.args.shape ?? {}) : []);
+  return shapeResult(await executeCommand(ctx, name, args, opts), output);
+}
+
+/** JSON schema of a command's arguments as callers send them (io: 'input', as MCP tools/list shows). */
+export const argsJsonSchema = (cmd) => z.toJSONSchema(cmd.args, { io: 'input' });
+
 export function describeCommands() {
-  return COMMANDS.map((c) => ({ name: c.name, group: c.group, description: c.description, needs_game: c.session, args: z.toJSONSchema(c.args) }));
+  return COMMANDS.map((c) => ({ name: c.name, group: c.group, description: c.description, needs_game: c.session, args: argsJsonSchema(c) }));
 }

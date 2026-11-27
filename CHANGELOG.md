@@ -3,6 +3,254 @@
 Semver. The GameScript has its own integer version (`GetVersion()` in info.nut); the host must
 re-run `install-gamescript` when it changes.
 
+## 0.8.0 (2026-11-27)
+
+This release comes from a review of every agent log so far: 6,064 tool calls across a multiplayer game night, the dev sessions and the local-model runs. It is aimed at fewer calls, less output and fewer failures. Headlines:
+- **One contract for CLI and MCP,** enforced by a parity test over every command.
+- **Output controls:** `--fields`, `--brief` and compact output.
+- **Read-only mode,** and forgiving arguments.
+- **Host tools:** load, saves, `server-stop`, `console` and `server-log`; `launch` waits until the game is ready; `install-gamescript --reload`.
+- **Background jobs** persist across restarts.
+- **Rail safety:** loop-aware clone and add-train, and loop-signal protection; route checks come back in build results.
+- **Road and fleet tools:** a sell queue, `wait`, per-route `vehicle-buy`, `road-stop-sites`, explained money and local-authority failures.
+- **`overview`** in one call.
+- **AgentBridge v14,** which also runs on OpenTTD 14.x.
+- **Version gating** and a sandboxed version matrix across 14.0–15.3.
+- **Network diagnostics** (`net-check`).
+- **First-run checks.**
+
+Breaking changes are marked **Breaking** in each section below.
+
+
+Hardening (batch 8):
+
+- **AgentBridge v14** runs on OpenTTD 14.0 and 14.1 too: info.nut declares script API 14
+  (15.x loads it through its compat script); the two 15.0+ calls are chosen at run time.
+- OpenTTD version awareness (`src/versions.js`): `doctor` reports `openttd` (version, class
+  tested / older_unsupported / newer_untested / beta / custom, tested_versions). **Breaking:**
+  `launch` and every game connection refuse an untested OpenTTD (`first_error:
+  untested_openttd_version`; the server's version comes from the admin welcome) unless
+  `--accept_untested true` (launch), `configure --accept_untested true` or
+  `OPENTTD_AGENT_ACCEPT_UNTESTED=1`; older than 14.0 is refused (`unsupported_openttd_version`).
+  `status` shows `openttd` (server, local, match) and warns on a host/client mismatch. No OpenTTD
+  installed: `openttd_not_found` with the official download link instead of a stack trace.
+- Version matrix: `tools/version-matrix.mjs` downloads official releases (sha256 from the
+  release manifest), runs a smoke suite per version in a sandbox (own HOME, OPENTTD_AGENT_HOME,
+  OpenGFX, ports) and prints the table in `docs/COMPATIBILITY.md` (14.0-15.3 green on macOS);
+  `.github/workflows/version-matrix.yml` runs it on the Linux builds.
+- `net-check` (new, read-only): player side classifies the host address (loopback, private,
+  CGNAT/mesh, link-local, public) against this machine's subnets and test-connects the relay and
+  game ports (a private address on another network is not probed unless `--probe true`); host side
+  (`--role host`) shows listeners and bind addresses, a LAN self-connect, the firewall state
+  without admin rights and secure `fixes`. A failed relay call (`relay_unreachable`) or admin
+  connection now answers with `hint` and `network`; `configure --relay` with a private address on
+  another network adds them too. README: "Playing over a network".
+- README "Bonus": a link to John Broomhall's 2014 re-recorded Transport Tycoon soundtrack (no audio bundled).
+- First-run checks: the CLI stops with `node_too_old` on Node < 20; `doctor` adds `node_ok`,
+  `base_graphics` (OpenGFX / original / other), `disk_free_mb` and next steps for a missing base set,
+  OpenTTD never opened and low disk; `install-opengfx` (new) downloads the official OpenGFX
+  (sha256 checked); `guide` starts with node / openttd-version / opened-once / base-graphics / disk
+  steps. `launch` names the program holding a busy port, warns about missing graphics and low disk,
+  and prints `keep_awake` (macOS `caffeinate`). `load` names `save_too_new` and `newgrf_missing`.
+- Public hygiene: `tools/check_public.sh` (part of `npm run check`) fails on personal names,
+  paths, private IPs and hostnames; examples use RFC 5737 addresses.
+
+Road and fleet operations (batch 5; AgentBridge v13):
+
+- **AgentBridge v13** (host: `install-gamescript`, then load the game again): `town_rating` and
+  `vehicle_loads` queries; `depots` counts the vehicles standing in each depot (it showed 0 for
+  trains stopped there). On an older GameScript the features below that need v13 say so.
+- **Breaking:** `vehicle-sell` sells the vehicles stopped in a depot and sends the others to a
+  depot and queues them (`queued`); the daemon sells each on arrival. `--send false` gives the old
+  refusal (`not_in_depot`). Unknown ids are `not_found` before anything is sent.
+- Sold-vehicle ledger (kept in the jobs file): a sold id answers `already_sold` (ok in
+  `vehicle-sell`) with the sale date and the vehicles now serving its stations, in `vehicle`,
+  `vehicle-clone`, `vehicle-problems --vehicle` and every command that looks a vehicle up.
+- Vehicles queued for sale: `vehicle-problems` shows only `pending_sale`; `vehicle-start` refuses
+  them (`queued_for_sale`) unless `--cancel_sale true`.
+- New `wait`: `--vehicles A,B --until in_depot|at_station|loaded|moving|stopped|sold [--any
+  --load_pct --timeout_s]` or `--days N`; `wait_timeout`, and `paused` at once on a paused game.
+- New `road-stop-sites --town | --industry | --x --y [--kind --cargo --count --spacing --radius
+  --with_depot]`: dry-run-checked stop sites with the build command, `rejected` by reason, and the
+  town's rating when the local authority refuses them all.
+- `build-rail-station` / `build-road-station` return `station {id, name}`; `build-rail-depot` /
+  `build-road-depot` return `depot {x, y}` and a `next` hint.
+- `vehicle-buy --routes "A,B;C,D"`: one vehicle per route, each with its own orders, started
+  (`start` now defaults to true with `--routes`, false otherwise).
+- `vehicle-clone --station ID [--cargo C]` clones the best-earning vehicle serving that station
+  (`source`); `--vehicle` is now optional (one of the two).
+- `vehicles --ids --min_age_days --max_profit_this_year --engine --sort [-]key`;
+  `vehicle-replace --select FILTER --max N` and `vehicle-depot --select FILTER --max N` (filter keys
+  as `vehicles`; vehicles queued for sale are left out).
+- `summary` vehicle lines add `spd`, `load now/capacity` (v13) and `order i/n`, plus
+  `age_buckets`, `reliability_buckets` and `low_reliability`; `vehicle` gains `load {load,
+  capacity, pct}`.
+- `vehicle-problems --vehicles A,B --type T --problem a,b`; `stuck_or_lost` on a route that
+  traces connected says "not lost" and points at trains vs loops, never at a depot.
+- Money: a failure with `ERR_NOT_ENOUGH_CASH` carries `needed`, `loan`, `max_loan`,
+  `loan_headroom` and `next` (`loan --borrow N`); a dry run that costs more than the bank warns
+  `not_enough_money` with the same fields. `--borrow_if_needed true` (simple builds, `build-rail`,
+  `build-road-path`, `vehicle-buy`, `vehicle-clone`) borrows what the rest costs and finishes.
+- **Breaking:** `loan --amount/--borrow` over `max_loan` borrows up to `max_loan` (`clamped`)
+  instead of refusing.
+- `ERR_LOCAL_AUTHORITY_REFUSES` carries `local_authority {town, town_name, rating, rating_value,
+  needed, needed_text, hint}`; `towns` rows gain `my_rating {rating, value, rated}` and take
+  `--company` (v13).
+- A road, stop or depot refused on a slope: `first_error: sloped_tile`, `at` (the first sloped
+  tile of the step) and a hint.
+
+Rail safety and build efficiency (batch 4):
+
+- **Breaking:** `vehicle-clone` on a train runs the passing-loop check of `add-train` and refuses
+  with `needs_loop` (`line_check`) when the line would run more trains than usable loops + 1.
+  `vehicle-clone` and `add-train` refuse to copy a vehicle that lost money last year and this
+  year (`source_unprofitable`). `--force true` skips both.
+- **Breaking:** loops count only when they are real loops: a second track that leaves the line at
+  points and rejoins it, with a signal on each side and room for the line's longest train. Depot
+  spurs, terminus throats and branches no longer count. `add-train` `check` gains `loops[]`,
+  `unusable_loops[]` (with `why`), `train_tiles`.
+- `build-signal --remove` refuses a passing loop's signal (`loop_signal`, with the loop's points);
+  `--force true` removes it anyway.
+- `ERR_VEHICLE_IN_THE_WAY`: results gain `transient: true`, `blocked_at`, `vehicles_in_the_way[]`
+  and, in a dry run, `blocked_by_vehicle: true`. `build-rail`, `build-track` and
+  `build-passing-loop` take `--wait_clear_s N` (wait for the vehicle, retry from the failed step).
+- **Breaking:** `build-passing-loop` without `--train_tiles`/`--for_vehicle` sizes the loop for
+  the longest of your trains on the line through x,y (`train_from_line`), so a `--length` too
+  short for it is refused (`loop_too_short`); `train_length_unknown` warns when there is none.
+- **Breaking:** `verify-route --from_station --to_station` traces both directions (`there`,
+  `back`; `connected` needs both); `--both_ways false` for one. `verify-route` gains
+  `legs_connected[]`.
+- `build-cargo-route`: a real build ends with `verify {connected, there, back, first_gap,
+  first_leg}` and fails with `route_broken` (`failed_step: verify`) when the line does not trace.
+  `first_leg.detour_ratio` (also in `add-train`'s `verify`) and warning `depot_exit_detour` when
+  the depot exit sends new trains the long way round.
+- `build-cargo-route`: industry ends get the wider/shorter/one-platform retries too; no site gives
+  `first_error: no_terminus_site` with `no_site {candidates_on_map, dry_runs, rejected (by error),
+  tried, own_station_near, hint}` (the hint lists only what was not tried).
+- `build-cargo-route --if_exists refuse|skip|add_train|build` (`--allow_existing true` = build):
+  skip returns `ok: true, action: "exists"`, add_train runs `add-train` on that line.
+- **Breaking:** `build-cargo-route --reuse_stations auto` (default) joins the new terminus to your
+  rail station within `--radius` of an end (`reused_station`; `reuse_failed` when it does not
+  fit); `never` builds new stations as before.
+- `build-cargo-route` refuses a source that does not make the cargo, or a secondary industry that
+  made none last month (`source_produces_nothing`, `feeder`); `--force true` builds anyway.
+- `build-cargo-route --trains K`: clones the first train after the loops, only as many as the
+  built line has usable loops + 1 (`more_trains`, warning `trains`).
+- `vehicle-clone --share` = `--share_orders` (and `orders-copy --share_orders` = `--share`). On
+  the CLI a lone whole number is the id: `vehicle 31`, `vehicle-clone 31 --count 2`.
+- `find-cargo-pairs`: `--source_id`, `--dest_id`, region `--x0 --y0 --x1 --y1`, `--sort
+  effort|revenue|distance|production`, `yours {from_station, to_station, served_by}` with
+  `--exclude_yours true` (default), `excluded` counts and a `hint` when nothing is left,
+  `--dry_run_top N` (`dry_run {ok, estimated_cost, line_tiles, failed_step}`), `--format lines`,
+  and a `build` command per pair.
+- Existing-route detection counts a just-built station (no cargo rating yet) and no longer takes
+  the reverse route for one-way cargo.
+
+Host tools (batch 3):
+
+- **Breaking:** `launch --mode dedicated` now waits until the admin port and AgentBridge answer
+  (default 60 s, `--wait_s`; `--wait false` returns at once) and returns `ready`, `bridge_version`,
+  `seconds`. Not ready: `ok: false`, `first_error: not_ready`, with `process` (pid, running,
+  exit_code) and `log_tail`.
+- **Breaking:** `launch` on a profile whose server already runs returns `already_running: true`
+  and starts nothing; `--restart true` stops it (console quit, then SIGTERM to the processes
+  started with that profile's cfg only) and starts again.
+- **Breaking:** `launch --dry_run true` writes nothing (it used to write the profile files); it
+  lists them in `would_write`.
+- `launch` rotates the profile's `openttd.log` (keeps `.1`-`.3`).
+- `launch --server NAME --game_port N --admin_port M`: a second server on its own launch profile
+  (`profiles/NAME/server.json` keeps its ports). A server on another admin port than the
+  configured one leaves the config alone (`side_server` says how to reach it). `--server` is not
+  `--profile`: the global `--profile` picks a player profile.
+- New host commands (group `host`, refused by the relay), each with `--server NAME`: `load --name N
+  [--pause true|false]`, `saves [--match --limit]`, `company-new [--ai IdleAI]`, `server-stop [--save N]`,
+  `console --command "<console line>"`, `server-log [--lines --errors true --grep]`.
+- `install-gamescript --reload true [--server --save_name]`: install, rescan, save, load that save,
+  wait for the bundled bridge version, restore the pause state.
+- `doctor` reports a macOS quarantine flag on OpenTTD.app (with the `xattr` fix) and `servers`:
+  every launch profile with running, ports and whether its log shows the GameScript died.
+- GS timeouts carry a code: `gs_died` (the server log shows the script died after its last start;
+  the lines are in the error) or `gs_timeout` (with the last error lines). Connecting to a game
+  whose GameScript does not answer gives `no_gamescript` / `gs_died`.
+- Admin logins the server drops before welcome fail at once with `first_error: admin_auth`
+  (they used to wait for the 10 s timeout).
+- Background jobs (queued vehicle sales, train-add-wagons jobs, the periodic save) are kept in
+  `~/.openttd-agent/jobs-<host>-<port>.json` per game (seed and start date) and resume when the
+  daemon or relay reconnects to that game. `status` gains `background_jobs`.
+
+CLI/MCP parity and the output contract (batches 1 and 2):
+
+- **Breaking:** MCP refuses unknown arguments like the CLI (`first_error: unknown_argument`,
+  nothing runs). The SDK used to strip them and run the command with defaults (a stray `help`
+  advanced the game 41 days). Tools get a pass-through schema; aliases (`--id`) and the error
+  JSON now work over MCP too.
+- **Breaking:** build/exec results list only failed steps: `results_failed` plus
+  `steps_done`/`steps_total`. `--steps all` gives the full `results`. A failed step has no `value`
+  (it could show 1048575 as an id).
+- **Breaking:** the CLI prints one-line JSON when stdout is not a terminal (`--compact false` or
+  `OPENTTD_AGENT_COMPACT=0` indents), and the MCP server is compact by default (`mcp --compact false`).
+- **Breaking:** a result with `ok: false` makes the CLI exit 1 and sets MCP `isError` (it used to
+  exit 0 / not set it unless the command threw). `batch` prints `{"name", "result"}` for every
+  line, failures too (they used to be a bare error object without the name).
+- **Breaking:** `null`, `""`, `false` and `[]` no longer coerce to 0 for numbers (company 0 is a
+  real company). `null` (and `""` for a number) means "not given"; `false`/`[]` are refused.
+- **Breaking:** `help` prints one line per command (`help --full` for the old listing, about 4x
+  longer); `commands` schemas use `io: 'input'`, the same as MCP `tools/list`.
+- Every command takes `--fields a,b.c` (projection; item fields apply to lists), `--brief true`
+  (ok, cost, money, ids) and `--compact`, on the CLI, in `batch` and over MCP.
+- Error codes: `unknown_command`, `unknown_argument`, `bad_arguments` (a missing argument says
+  `required`), `read_only`, `daemon_timeout`, `daemon_failed`, `relay_timeout`.
+- A JSON number works for a text argument (`join: 12`). Read commands and dry runs clamp an
+  out-of-range number (`clamped`); read commands ignore `--dry_run`/`--list`, `vehicle-depot`
+  ignores `--depot auto` (`ignored_args`). CLI: a bare word after a value joins it with a space.
+  Town arguments of line ends (`build-cargo-route`, `build-truck-route`, `station-sites`) accept a
+  station-style name ("Bigton Woods" -> Bigton) or a unique prefix; the target says `matched_town`.
+- Read-only mode: `OPENTTD_AGENT_READ_ONLY=1` or `mcp --read_only true` forces dry runs
+  (`forced_dry_run: true`) and refuses other actions. `OPENTTD_AGENT_TOOLS=a,b` limits the CLI and
+  `help` like `mcp --tools`. A relay player's MCP server lists only the tools the relay serves.
+- One dispatch for CLI, batch and MCP (`src/dispatch.js`): MCP game calls now share the background
+  daemon (its map mirror and background jobs) unless `--no-daemon`; `batch --no-daemon` works and
+  keeps one connection. A one-shot call that starts a background job warns `background_job_not_kept`.
+- The daemon reports `code_id` (files of src/bin/gamescript) and `config_hash` on `/health`. The
+  CLI restarts a daemon running other code (no more `daemon-stop` after an update or an edit), and
+  once more when a daemon answers "unknown command" for a known one. A daemon running with other
+  settings (another caller's env, e.g. `OPENTTD_AGENT_COMPANY`) is left alone; the call runs in the
+  caller's process with `warnings: daemon_config_mismatch`.
+- Calls longer than 5 minutes work through the daemon and the relay (node:http, server request
+  timeouts off); one overall timeout `OPENTTD_AGENT_CALL_TIMEOUT_S` (default 3600 s).
+- `test/parity.test.js`: every command through the CLI and MCP against identical fake servers.
+
+Observation and output (batch 6):
+
+- `status` gains `date` ("YYYY-MM-DD") and `me` (your company's row: money, loan, max_loan, value,
+  cargo_delivered, performance, profit of the last full quarter). Read `me`, never `companies[0]`:
+  the list holds every company and ids need not start at your company. `summary` gets the same
+  `date` and `me` header.
+- `companies` gains `date`; every row and `history` row gains `profit` (income + expenses).
+- `tiles --format text` (up to 80x80): one character per tile (class letter, upper case = owned by
+  your company), an x ruler and rows `"y|chars"`. `tiles --x --y --radius R` instead of the corners
+  (both formats). The box is clipped to the map.
+- `stations --ids A,B`, `--near_x X --near_y Y [--radius R]` (nearest first, each with `distance`),
+  `--unserved true` and `--max_vehicles N`. **Breaking:** the default `--limit` for your own
+  company rises from 100 to 1000 (another company's stay at 100).
+- `events --type a,b` takes a list (any matches), `--exclude a,b` leaves types out, and
+  `--companies A,B` (alias `--company N`) keeps events about those companies. The argument is
+  not `company` on purpose: the relay forces `company` to the player's own, and news is public.
+- `airport-sites --towns A,B`: several towns in one call (`towns[{town, sites}]`; a town that is
+  not found gets `error`). `--town` alone keeps the old result.
+- Every game action (every session command with `--dry_run`, also in a dry run) has a top-level
+  `money_after`: the bank balance after the call, from the call's last exec reply (no extra game
+  call), else the result's own `money`, else one GS `companies` read. `--brief` keeps it. Set
+  once in `executeCommand`, so new actions get it too.
+- New `overview [--since SEQ]`: one small per-turn snapshot in place of status, goal-status,
+  companies, stations, vehicles, depots, events and vehicle-problems: date, paused, money, loan,
+  max_loan, value, profit of the last quarter, the goal in one line, a fleet line, the worst
+  vehicles, the lowest-rated stations, depots, action problems, rivals, new events (yours, world
+  and company news) and `latest_seq` for the next call. Lines are capped (`--vehicle_lines`,
+  `--station_lines`, `--event_lines`, `--problem_lines`; `*_total` gives the full counts);
+  problems come one line per kind with the vehicle ids; `--problems false` skips the
+  vehicle-problems traces. Live (6 trains, 4 stations, 2 companies): 0.9-1.3 KB, 0.6 s. Not named `brief`: that is a reserved output argument.
+
 ## 0.7.0 (2026-11-26)
 
 AgentBridge GameScript v12: hosts must run `install-gamescript` and reload the game. Older GameScripts get clear refusals or fallbacks. List outputs and `first_error` changed shape (below), so scripts that parse them need updating.

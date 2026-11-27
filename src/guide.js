@@ -5,7 +5,8 @@
 //   buildGuide(role, probes)   pure: probe results -> { role, steps, next }.
 // Probe shape (every field optional; missing = not probed):
 //   config: { relay, token, admin_password: booleans, launch_profile: boolean, relay_port }
-//   doctor: { ok, openttd_found, openttd_version, gamescript_installed, gamescript_bundled } | { ok: false, error }
+//   doctor: { ok, openttd_found, openttd_version, openttd_class, openttd_message, node_ok, base_graphics, opened_once, disk_free_mb,
+//             gamescript_installed, gamescript_bundled } | { ok: false, error }
 //   lan_ips: [string]
 //   game:   { ok, companies: [ids], goals: { [id]: status } | null } | { ok: false, error }    (host)
 //   relay_local: { ok, version } | { ok: false, error }                                     (host)
@@ -82,6 +83,8 @@ export async function probeSetup(ctx, role) {
   const d = await attempt(() => doctor(), 3000, 'doctor');
   probes.doctor = d.ok
     ? { ok: true, openttd_found: !String(d.value.openttd_executable).startsWith('NOT FOUND'), openttd_version: d.value.openttd_version ?? null,
+      openttd_class: d.value.openttd?.class ?? null, openttd_message: d.value.openttd?.message ?? null, node_ok: d.value.node_ok ?? null,
+      base_graphics: d.value.base_graphics?.found ?? null, opened_once: d.value.personal_dir_exists ?? null, disk_free_mb: d.value.disk_free_mb ?? null,
       gamescript_installed: d.value.gamescript_installed_version, gamescript_bundled: d.value.gamescript_bundled_version }
     : d;
   const wanted = role === 'unknown' ? inferRole(config) : role;
@@ -116,6 +119,27 @@ function doctorStep(p) {
   };
 }
 
+/**
+ * First run on a machine (batch 8): Node, a tested OpenTTD, opened once, base graphics, disk.
+ * done null when the probe has no answer, so older probes never stop on these.
+ */
+export function firstRunSteps(p) {
+  const d = p.doctor?.ok ? p.doctor : {};
+  const v = (x) => (x === undefined ? null : x);
+  return [
+    { id: 'node', step: 'Node 20 or newer', done: v(d.node_ok), command: 'node --version', why: 'openttd-agent needs Node 20+; get the LTS from https://nodejs.org/' },
+    { id: 'openttd-version', step: 'A tested OpenTTD release (14.0-15.3)', done: d.openttd_class === undefined || d.openttd_class === null ? null : d.openttd_class === 'tested',
+      command: 'openttd-agent doctor (openttd.class)', why: 'Betas, nightlies and newer releases are refused until you pass --accept_untested true; every machine needs the same version.',
+      ...(d.openttd_message ? { detail: d.openttd_message } : {}) },
+    { id: 'opened-once', step: 'Open OpenTTD once on this machine, then quit', done: v(d.opened_once), command: 'open OpenTTD from your apps menu (macOS: from Finder the first time)',
+      why: 'The first start creates its folders (and on macOS clears the "downloaded from the internet" check).' },
+    { id: 'base-graphics', step: 'Base graphics installed (OpenGFX or your own original files)', done: v(d.base_graphics), command: 'openttd-agent install-opengfx',
+      why: 'OpenTTD cannot start without a graphics set; OpenGFX is free and official.' },
+    { id: 'disk', step: 'Enough free disk for saves', done: d.disk_free_mb === undefined || d.disk_free_mb === null ? null : d.disk_free_mb >= 500,
+      command: 'free some space', why: 'Saves and autosaves fail silently on a full disk.', ...(d.disk_free_mb !== undefined && d.disk_free_mb !== null ? { detail: `${d.disk_free_mb} MB free` } : {}) },
+  ];
+}
+
 export function hostSteps(p, version = VERSION) {
   const d = p.doctor, game = p.game, players = p.players ?? [];
   const ip = p.lan_ips?.[0] ?? '<host-LAN-IP>';
@@ -126,6 +150,7 @@ export function hostSteps(p, version = VERSION) {
   const goals = game?.ok ? game.goals : null;
   return [
     doctorStep(p),
+    ...firstRunSteps(p),
     {
       id: 'install-gamescript', step: 'Install the AgentBridge GameScript (host only)',
       done: known(d) && d.ok ? (d.gamescript_installed !== null && d.gamescript_installed === d.gamescript_bundled) : null,
@@ -156,8 +181,8 @@ export function hostSteps(p, version = VERSION) {
     {
       id: 'network', step: 'Open the firewall and tell players the address',
       done: null,
-      command: `allow incoming TCP 3979 (game) and ${relayPort} (relay); players join ${ip}:3979`,
-      why: 'You can only check this from another machine.',
+      command: `openttd-agent net-check --role host; allow OpenTTD and node (or TCP 3979 and ${relayPort}) on your private network; players join ${ip}:3979`,
+      why: 'net-check reads the firewall and listeners here; the real test is a player running openttd-agent net-check against this address.',
       lan_ips: p.lan_ips ?? [],
     },
     {
@@ -203,6 +228,7 @@ export function playerSteps(p, version = VERSION) {
   const configured = Boolean(c.relay && c.token);
   return [
     doctorStep(p),
+    ...firstRunSteps(p),
     {
       id: 'configure', step: 'Point openttd-agent at the host\'s relay with your token',
       done: configured,
@@ -212,7 +238,7 @@ export function playerSteps(p, version = VERSION) {
     {
       id: 'relay', step: 'Reach the host\'s relay',
       done: configured && known(relay) ? relay.ok : null,
-      command: "ask the host to run: openttd-agent relay; check the address and that TCP 47978 is open",
+      command: 'openttd-agent net-check (says whether you are on the host\'s network); ask the host to run: openttd-agent relay',
       why: 'Every game command goes through it.',
       ...(relay && !relay.ok ? { detail: relay.error } : {}),
     },
@@ -258,9 +284,10 @@ export function buildGuide(role, probes, version = VERSION) {
   if (r === 'host') steps = hostSteps(probes, version);
   else if (r === 'player') steps = playerSteps(probes, version);
   else {
-    const host = hostSteps(probes, version).slice(1).map((s) => ({ ...s, part: 'host' }));
-    const player = playerSteps(probes, version).slice(1).map((s) => ({ ...s, part: 'player' }));
-    steps = [doctorStep(probes),
+    const first = new Set(firstRunSteps(probes).map((s) => s.id));
+    const host = hostSteps(probes, version).slice(1).filter((s) => !first.has(s.id)).map((s) => ({ ...s, part: 'host' }));
+    const player = playerSteps(probes, version).slice(1).filter((s) => !first.has(s.id)).map((s) => ({ ...s, part: 'player' }));
+    steps = [doctorStep(probes), ...firstRunSteps(probes),
       { id: 'role', step: 'Decide: are you hosting the game or joining it?', done: false,
         command: 'openttd-agent guide --role host   or   openttd-agent guide --role player', why: 'Nothing in the config says yet.' },
       ...host, ...player];

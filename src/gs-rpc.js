@@ -14,6 +14,8 @@ export class GSRpc {
     this.client = randomBytes(4).toString('hex');
     this.nextId = 1;
     this.pending = new Map(); // id -> { parts: Map, lastPart, resolve, reject, timer, cmd, started }
+    // Optional () -> { code, detail } | null, called on a timeout: the host's server log says whether the GS died (host.js diagnoseGs).
+    this.diagnose = null;
     admin.on('gamescript', (msg) => this._onMessage(msg));
     admin.subscribe(UPDATE.GAMESCRIPT, FREQ.AUTOMATIC);
   }
@@ -23,7 +25,10 @@ export class GSRpc {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new GSError(`GS cmd '${cmd}' timed out after ${timeoutMs}ms. Is the AgentBridge GameScript running on the host? (openttd-agent doctor)`));
+        const what = `GS cmd '${cmd}' timed out after ${timeoutMs}ms`;
+        let d = null;
+        try { d = this.diagnose?.() ?? null; } catch { /* no diagnosis: plain timeout */ }
+        reject(new GSError(d ? `${d.code}: ${what}; ${d.detail}` : `gs_timeout: ${what}. Is the AgentBridge GameScript running on the host? (openttd-agent doctor, server-log --errors true)`));
       }, timeoutMs);
       this.pending.set(id, { parts: new Map(), lastPart: null, resolve, reject, timer, cmd, started: Date.now() });
       try {

@@ -80,6 +80,14 @@ for company-owned tiles), `vehicle_wagons` (`{company, vehicle}` -> `[index, eng
 capacity]`), `signs` (`{company}` -> `[id, x, y, owner, text]`) and `road_types` (`{company}` ->
 `[id, name, tram, max_speed, build_cost, available]`); `companies` rows gain `station_count` and
 `vehicles_by_type` ([rail, road, water, air]); `depots` rows gain `front_x, front_y`.
+v13 adds `town_rating` (`{company, towns?, points?}` -> `[town, rating, detailed, x, y]`: the
+town window's word (`none`, `appalling` ... `outstanding`, from `GSTown.GetRating`) and the number
+behind it (`GSTown.GetDetailedRating`, -1000..1000); with `points` (at most 60) one row per point
+for the town whose local authority covers that tile (`GSTile.GetTownAuthority`, town -1 = none))
+and `vehicle_loads` (`{company, vehicles?}` -> `[vehicle, cargo, capacity, load]` per cargo it can carry).
+v14 declares script API 14 so OpenTTD 14.x loads it (15.x loads it through `compat_14.nut`); no
+protocol change. The two 15.0+ calls it uses (`GSBaseStation.GetOwner`, `GSTile.IsHouseTile`) are
+picked at run time (`StationOwner`, `IsHouse` in main.nut).
 Row formats are documented in `gamescript/AgentBridge/main.nut`.
 
 The `veh_depot` exec step (v11) never undoes an earlier send (a second "go to depot" cancels the

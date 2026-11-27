@@ -235,6 +235,15 @@ export function acceptanceFromRows(rows, cargosById, nPoints) {
   return out;
 }
 
+/** Stable key of a pair: "industry:1>town:2:Goods" (find-cargo-pairs exclusions). */
+export const pairKey = (pr) => `${pr.source.kind ?? 'industry'}:${pr.source.id}>${pr.dest.kind}:${pr.dest.id}:${pr.cargo}`;
+
+const PAIR_SORTS = {
+  revenue: (x, y) => y.source_last_month * (100 - y.source_transported_pct) * y.distance - x.source_last_month * (100 - x.source_transported_pct) * x.distance,
+  distance: (x, y) => x.distance - y.distance,
+  production: (x, y) => y.source_last_month - x.source_last_month,
+};
+
 /**
  * Source industries producing `cargo` (name substring) with transported% <= maxTransportedPct,
  * paired with destinations `minDist..maxDist` tiles away (Manhattan): industries whose type accepts
@@ -244,17 +253,24 @@ export function acceptanceFromRows(rows, cargosById, nPoints) {
  * destKind 'industry' | 'town' | 'any'. Secondary (processing) sources are marked `secondary: true`:
  * their last_month is 0 between deliveries, so minProduction does not drop them.
  * Towns are sources too, for cargos that `cargos` (id -> { name, passengers, mail }) marks as passenger or
- * mail: see townToTownPairs. Optionally ranks each pair by routeEffort on `map`.
+ * mail: see townToTownPairs. Filters: sourceId / destId (industry or town id), region { x0, y0, x1, y1 }
+ * (both ends inside), near { x, y, radius } (source), exclude (Set of pairKey). sort: effort (default:
+ * routeEffort per tile on `map`, over a revenue-ranked shortlist), revenue, distance, production.
+ * Returns { total_candidates, map_complete, pairs, notes?, excluded? (counts by reason, when no pair is left) }.
  */
 export function findCargoPairs({ industries, types, towns = [], cargos = new Map(), townAcceptance = null, townCargoFallback = new Set(), map, cargo, sourceType, destType, destKind = 'any',
-  minDist = 0, maxDist = 1e9, maxTransportedPct = 100, minProduction = 0, limit = 10, withEffort = true, near = null }) {
+  minDist = 0, maxDist = 1e9, maxTransportedPct = 100, minProduction = 0, limit = 10, withEffort = true, near = null, sourceId, destId, region = null, exclude = null, sort = 'effort' }) {
   const pairs = [];
+  const excluded = {};
+  const skip = (why) => { excluded[why] = (excluded[why] ?? 0) + 1; };
   for (const src of industries) {
     if (!matches(sourceType, src.type_name)) continue;
+    if (sourceId !== undefined && src.id !== sourceId) continue;
     const secondary = isSecondary(types.get(src.type));
     for (const p of src.produces) {
       if (!matches(cargo, p.cargo_name)) continue;
-      if (p.transported_pct > maxTransportedPct || (!secondary && p.last_month < minProduction)) continue;
+      if (p.transported_pct > maxTransportedPct) { skip('transported_pct'); continue; }
+      if (!secondary && p.last_month < minProduction) { skip('min_production'); continue; }
       const base = { cargo: p.cargo_name, source_last_month: p.last_month, source_transported_pct: p.transported_pct };
       const srcBrief = { ...brief(src), ...(secondary ? { secondary: true } : {}) };
       if (destKind !== 'town') {
@@ -263,36 +279,41 @@ export function findCargoPairs({ industries, types, towns = [], cargos = new Map
           const dt = types.get(dst.type);
           if (!dt?.accepts.includes(p.cargo)) continue;
           if (!matches(destType, dst.type_name)) continue;
+          if (destId !== undefined && dst.id !== destId) continue;
           const dist = manhattan(src, dst);
-          if (dist < minDist || dist > maxDist) continue;
+          if (dist < minDist || dist > maxDist) { skip('distance'); continue; }
           pairs.push({ source: srcBrief, dest: { kind: 'industry', ...brief(dst) }, ...base, distance: dist });
         }
       }
       if (destKind !== 'industry' && (townAcceptance || townCargoFallback.has(p.cargo))) {
         for (const town of towns) {
           if (destType && !matches(destType, 'town') && !matches(destType, town.name)) continue;
+          if (destId !== undefined && town.id !== destId) continue;
           const acc = townAcceptance ? (townAcceptance.get(town.id)?.[p.cargo] ?? 0) : null;
-          if (acc !== null && acc < ACCEPTED) continue;
+          if (acc !== null && acc < ACCEPTED) { skip('town_acceptance'); continue; }
           const dist = manhattan(src, town);
-          if (dist < minDist || dist > maxDist) continue;
+          if (dist < minDist || dist > maxDist) { skip('distance'); continue; }
           pairs.push({ source: srcBrief, dest: { kind: 'town', id: town.id, name: town.name, x: town.x, y: town.y, population: town.population, acceptance: acc },
             ...base, distance: dist });
         }
       }
     }
   }
-  if (destKind !== 'industry') pairs.push(...townToTownPairs({ towns, cargos, townAcceptance, townCargoFallback, cargo, sourceType, destType, minDist, maxDist, maxTransportedPct, minProduction }));
-  // near = { x, y, radius }: keep pairs whose source is within radius of that tile.
-  if (near) {
-    for (let i = pairs.length - 1; i >= 0; i--) if (manhattan(pairs[i].source, near) > near.radius) pairs.splice(i, 1);
-  }
+  if (destKind !== 'industry') pairs.push(...townToTownPairs({ towns, cargos, townAcceptance, townCargoFallback, cargo, sourceType, destType, minDist, maxDist, maxTransportedPct, minProduction, sourceId, destId, skip }));
+  const keep = (pr) => {
+    if (near && manhattan(pr.source, near) > near.radius) return 'near';
+    if (region && ![pr.source, pr.dest].every((e) => e.x >= region.x0 && e.x <= region.x1 && e.y >= region.y0 && e.y <= region.y1)) return 'region';
+    if (exclude?.has(pairKey(pr))) return 'yours';
+    return null;
+  };
+  for (let i = pairs.length - 1; i >= 0; i--) { const why = keep(pairs[i]); if (why) { skip(why); pairs.splice(i, 1); } }
   // Pre-rank by unserved volume * distance (revenue proxy) before the costlier effort pass.
-  pairs.sort((x, y) => y.source_last_month * (100 - y.source_transported_pct) * y.distance
-    - x.source_last_month * (100 - x.source_transported_pct) * x.distance);
-  const shortlist = pairs.slice(0, Math.max(limit * 3, limit));
+  pairs.sort(PAIR_SORTS.revenue);
+  if (sort !== 'effort' && PAIR_SORTS[sort]) pairs.sort(PAIR_SORTS[sort]);
+  const shortlist = sort === 'effort' ? pairs.slice(0, Math.max(limit * 3, limit)) : pairs.slice(0, limit);
   if (withEffort && map?.isComplete()) {
     for (const pr of shortlist) pr.route = routeEffort(map, pr.source, pr.dest);
-    shortlist.sort((x, y) => (x.route.reachable ? x.route.effort_per_tile : 1e9) - (y.route.reachable ? y.route.effort_per_tile : 1e9));
+    if (sort === 'effort') shortlist.sort((x, y) => (x.route.reachable ? x.route.effort_per_tile : 1e9) - (y.route.reachable ? y.route.effort_per_tile : 1e9));
   }
   const notes = [];
   if (shortlist.some((pr) => pr.source.secondary && pr.source_last_month === 0)) {
@@ -301,7 +322,8 @@ export function findCargoPairs({ industries, types, towns = [], cargos = new Map
   if (townAcceptance === null && pairs.some((pr) => pr.dest.kind === 'town')) {
     notes.push('town acceptance was not checked (the running AgentBridge is older than v7): verify with `acceptance --x --y` before building');
   }
-  return { total_candidates: pairs.length, map_complete: !!map?.isComplete(), pairs: shortlist.slice(0, limit), ...(notes.length ? { notes } : {}) };
+  return { total_candidates: pairs.length, map_complete: !!map?.isComplete(), pairs: shortlist.slice(0, limit), ...(notes.length ? { notes } : {}),
+    ...(pairs.length ? {} : { excluded }) };
 }
 
 const brief = (ind) => ({ id: ind.id, type: ind.type_name, x: ind.x, y: ind.y });
@@ -313,24 +335,28 @@ const townBrief = (town) => ({ kind: 'town', id: town.id, name: town.name, x: to
  * another town whose centre accepts the cargo (same acceptance rule as industry -> town pairs).
  * sourceType / destType, when given, must match 'town' or the town name.
  */
-function townToTownPairs({ towns, cargos, townAcceptance, townCargoFallback, cargo, sourceType, destType, minDist, maxDist, maxTransportedPct, minProduction }) {
+function townToTownPairs({ towns, cargos, townAcceptance, townCargoFallback, cargo, sourceType, destType, minDist, maxDist, maxTransportedPct, minProduction, sourceId, destId, skip = () => {} }) {
   const pairs = [];
   for (const c of cargos.values()) {
     if (!(c.passengers || c.mail) || !matches(cargo, c.name)) continue;
     if (!townAcceptance && !townCargoFallback.has(c.id)) continue;
     for (const src of towns) {
       if (sourceType && !matches(sourceType, 'town') && !matches(sourceType, src.name)) continue;
+      if (sourceId !== undefined && src.id !== sourceId) continue;
       const produced = c.passengers ? src.pax_produced : src.mail_produced;
       const pct = c.passengers ? src.pax_transported_pct : src.mail_transported_pct;
-      if (produced === undefined || pct > maxTransportedPct || produced < minProduction) continue;
+      if (produced === undefined) continue;
+      if (pct > maxTransportedPct) { skip('transported_pct'); continue; }
+      if (produced < minProduction) { skip('min_production'); continue; }
       const base = { cargo: c.name, source_last_month: produced, source_transported_pct: pct };
       for (const dst of towns) {
         if (dst.id === src.id) continue;
         if (destType && !matches(destType, 'town') && !matches(destType, dst.name)) continue;
+        if (destId !== undefined && dst.id !== destId) continue;
         const acc = townAcceptance ? (townAcceptance.get(dst.id)?.[c.id] ?? 0) : null;
-        if (acc !== null && acc < ACCEPTED) continue;
+        if (acc !== null && acc < ACCEPTED) { skip('town_acceptance'); continue; }
         const dist = manhattan(src, dst);
-        if (dist < minDist || dist > maxDist) continue;
+        if (dist < minDist || dist > maxDist) { skip('distance'); continue; }
         pairs.push({ source: townBrief(src), dest: { ...townBrief(dst), acceptance: acc }, ...base, distance: dist });
       }
     }

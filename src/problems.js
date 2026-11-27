@@ -118,8 +118,14 @@ export function vehicleProblems(v, { today, stuckDays = 30, progress = null, rea
   if (progress && v.order_count > 0 && v.state !== 'in_depot' && v.state !== 'stopped' && v.state !== 'crashed') {
     const stalled = today - progress.since;
     if (stalled >= stuckDays && !(stall && stalledFor >= stallDays && stall.samples >= 2)) {
-      add('stuck_or_lost', `order ${v.current_order} (to ${dest}) for ${stalled} days without getting closer than ${progress.best} tiles; now ${v.dist ?? '?'} tiles away, speed ${v.speed ?? '?'}`,
-        v.speed === 0
+      // L7: a vehicle whose path to the destination traces connected is not lost.
+      const traced = reach && reach.connected;
+      add('stuck_or_lost', `order ${v.current_order} (to ${dest}) for ${stalled} days without getting closer than ${progress.best} tiles; now ${v.dist ?? '?'} tiles away, speed ${v.speed ?? '?'}${traced ? `; not lost: the ${net === 'road' ? 'road' : 'track'} to ${dest} traces connected` : ''}`,
+        traced
+          ? (net === 'rail'
+            ? `not lost: the line is joined, so it is waiting for a path: usually more trains than the single track's passing loops allow (add-train --vehicle ${v.id} --dry_run true counts trains and loops; loop-sites --vehicle ${v.id}) or a queue behind a loading train. Do not send it to a depot; if two trains face each other, vehicle-reverse one`
+            : `not lost: the road is joined; it is probably queueing at a busy stop (add a second stop or fewer vehicles) or behind a broken-down vehicle`)
+          : v.speed === 0
           ? 'standing still: probably waiting at a red signal or behind another train; check the track ahead and the number of trains on the line'
           : `probably lost (the game shows "cannot reach"): run verify-route --vehicle ${v.id} and fix the gap it reports`);
     }

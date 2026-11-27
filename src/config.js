@@ -20,6 +20,7 @@ export const DEFAULTS = {
   daemon_port: 47977,         // local daemon (127.0.0.1 only)
   max_builds_per_minute: 0,   // client-side throttle, 0 = unlimited (full speed)
   tile_refresh_rows_per_sec: 4, // background map refresh speed after the first full load
+  accept_untested: false,     // true = run with an OpenTTD version openttd-agent was not tested with (or OPENTTD_AGENT_ACCEPT_UNTESTED=1)
 };
 
 const ENV = {

@@ -24,7 +24,8 @@ after(() => fake.server.close());
 
 // Start `mcp <flags>`, send JSON-RPC requests in order, return their responses by id.
 async function mcpSession(flags, requests) {
-  const child = spawn(process.execPath, [BIN, 'mcp', ...flags], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  // --no-daemon: never reach a background daemon on the default port from a test.
+  const child = spawn(process.execPath, [BIN, 'mcp', '--no-daemon', ...flags], { env, stdio: ['pipe', 'pipe', 'pipe'] });
   const replies = new Map();
   let buf = '';
   child.stdout.on('data', (d) => {

@@ -14,6 +14,8 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { CONFIG_DIR } from './config.js';
 import { log } from './log.js';
+import { nodeProblem, findBasesets, freeBytes, diskWarning } from './preflight.js';
+import { detectInstalledVersion, classifyVersion, installHint, TESTED_VERSIONS } from './versions.js';
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const GS_NAME = 'AgentBridge';
@@ -37,7 +39,7 @@ export function findPersonalDir() {
 }
 
 export function findExecutable() {
-  if (process.env.OPENTTD_EXE) return process.env.OPENTTD_EXE;
+  if (process.env.OPENTTD_EXE) return fs.existsSync(process.env.OPENTTD_EXE) ? process.env.OPENTTD_EXE : null; // a wrong OPENTTD_EXE = not installed
   const candidates = {
     darwin: ['/Applications/OpenTTD.app/Contents/MacOS/openttd', path.join(os.homedir(), 'Applications/OpenTTD.app/Contents/MacOS/openttd')],
     win32: ['C:\\Program Files\\OpenTTD\\openttd.exe', 'C:\\Program Files (x86)\\OpenTTD\\openttd.exe',
@@ -71,7 +73,7 @@ export function doctor() {
   const report = {
     platform: process.platform,
     node: process.version,
-    openttd_executable: exe ?? 'NOT FOUND (install from https://www.openttd.org or set OPENTTD_EXE)',
+    openttd_executable: exe ?? 'NOT FOUND (see openttd.message)',
     personal_dir: personal,
     personal_dir_exists: fs.existsSync(personal),
     original_graphics: ORIGINAL_BASESET.every((f) => baseFiles.includes(f)) ? 'found' : `missing (${ORIGINAL_BASESET.filter((f) => !baseFiles.includes(f)).join(', ')}); OpenGFX will be used instead`,
@@ -80,14 +82,30 @@ export function doctor() {
     gamescript_installed_version: readGsVersion(installedGs),
     gamescript_needed: 'host only',
   };
-  if (exe && process.platform === 'darwin') {
-    // Read the bundle version; never run the binary here (it would open the game window).
-    const plist = path.resolve(path.dirname(exe), '..', 'Info.plist');
-    const m = fs.existsSync(plist) && fs.readFileSync(plist, 'utf8').match(/CFBundleShortVersionString<\/key>\s*<string>([^<]+)/);
-    if (m) report.openttd_version = m[1];
-  }
+  const detected = detectInstalledVersion(exe);
+  const cls = classifyVersion(detected.version);
+  if (detected.version) report.openttd_version = detected.version;
+  report.openttd = { version: detected.version, class: exe ? cls.class : 'not_installed', tested: cls.tested, tested_versions: TESTED_VERSIONS,
+    source: detected.source, ...(exe ? (cls.tested ? {} : { message: detected.version ? cls.message : `version not detected (${detected.error})` }) : { message: installHint() }) };
   report.next_steps = [];
-  if (!exe) report.next_steps.push('Install OpenTTD 15.x');
+  const nodeIssue = nodeProblem();
+  report.node_ok = !nodeIssue;
+  if (nodeIssue) report.next_steps.push(nodeIssue);
+  const sets = findBasesets(personal);
+  report.base_graphics = { sets, found: sets.length > 0 };
+  if (!sets.length) report.next_steps.push('No base graphics found: run openttd-agent install-opengfx (downloads the free OpenGFX set from cdn.openttd.org into your OpenTTD baseset folder), or open OpenTTD once and accept its offer to download OpenGFX');
+  if (!report.personal_dir_exists) report.next_steps.push(`OpenTTD has never run on this machine (no ${personal}): open it once from your apps menu, then quit; it creates its folders`);
+  const free = freeBytes(CONFIG_DIR);
+  report.disk_free_mb = free === null ? null : Math.round(free / 1024 / 1024);
+  const low = diskWarning(free, `saves in ${CONFIG_DIR}`);
+  if (low) report.next_steps.push(low);
+  if (!exe) report.next_steps.push(installHint());
+  else if (detected.version && !cls.tested) report.next_steps.push(cls.message);
+  const q = exe ? quarantine(exe) : null;
+  if (q) {
+    report.quarantine = q;
+    report.next_steps.push(`macOS has quarantined ${q.app} (downloaded, never opened): a headless launch may hang on the hidden "are you sure" dialog. Open it once from Finder, or run: xattr -dr com.apple.quarantine "${q.app}"`);
+  }
   if (report.gamescript_installed_version !== report.gamescript_bundled_version) {
     report.gamescript_warning = report.gamescript_installed_version === null ? 'AgentBridge is not installed'
       : `installed AgentBridge v${report.gamescript_installed_version} differs from the v${report.gamescript_bundled_version} this openttd-agent ships`;
@@ -99,6 +117,16 @@ export function doctor() {
     report.next_steps.push(`Launch profile ${gsProblems.map((p) => p.profile).join(', ')}: [game_scripts] lists ${gsProblems.map((p) => p.game_scripts.join(', ') || 'nothing').join('; ')}; AgentBridge must be the only entry: run openttd-agent launch again (it rewrites the section)`);
   }
   return report;
+}
+
+/** macOS: the .app bundle around exe and its com.apple.quarantine value, or null (not macOS, not set, no xattr tool). */
+export function quarantine(exe) {
+  if (process.platform !== 'darwin') return null;
+  const app = exe.includes('.app/') ? exe.slice(0, exe.indexOf('.app/') + 4) : exe;
+  try {
+    const value = execFileSync('xattr', ['-p', 'com.apple.quarantine', app], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return value ? { app, value } : null;
+  } catch { return null; } // exit 1: attribute not set
 }
 
 function removeIfSymlink(p) {
@@ -204,23 +232,49 @@ export function resolveSavePath(load, profileDir) {
   return found;
 }
 
+/** OpenTTD's launch profile folder for a server name (`launch --server NAME`; default: the mode). */
+export function profileDir(name) {
+  if (!/^[A-Za-z0-9_.-]{1,32}$/.test(String(name)) || String(name).startsWith('.')) throw new Error(`server name must be 1-32 of A-Z a-z 0-9 _ . - (not starting with '.'), got '${name}'`);
+  return path.join(CONFIG_DIR, 'profiles', name);
+}
+
 /**
- * Write a launch profile and start OpenTTD.
- * mode: 'dedicated' (headless server, everyone joins as a client),
- *       'host' (GUI; you then start a LAN server from the Multiplayer menu),
- *       'join' (GUI client joining host:3979).
+ * Where this machine's CLI reaches the admin port of a server bound to `bind`: 127.0.0.1 for a
+ * wildcard or loopback bind, else the bound address itself (a server on 192.0.2.5 only does not
+ * answer on 127.0.0.1). Several addresses: the first.
  */
-export function launch({ mode = 'dedicated', profile = mode, adminPassword, adminPort = 3977, gamePort = 3979,
-  bind = '0.0.0.0', joinHost, seed, mapBits = 8, load, commandDelayTicks = 0, maxBuildsPerDay = 0, scriptOpcodes = 100000, terrain, serverName = 'openttd-agent game',
-  dryRun = false }) {
-  const exe = findExecutable();
-  if (!exe) throw new Error('OpenTTD executable not found; install it or set OPENTTD_EXE');
-  const dir = path.join(CONFIG_DIR, 'profiles', profile);
-  fs.mkdirSync(dir, { recursive: true });
+export function adminHostForBind(bind) {
+  const first = String(bind ?? '').split(',')[0].trim().replace(/^\[|\]$/g, '');
+  if (!first || first === '0.0.0.0' || first === '::' || /^127\./.test(first) || first === 'localhost' || first === '::1') return '127.0.0.1';
+  return first;
+}
+
+/** One value of an INI file (`section`, `key`), or undefined. */
+export function iniValue(text, section, key) {
+  const lines = String(text).split(/\r?\n/);
+  const start = lines.findIndex((l) => l.trim().toLowerCase() === `[${section}]`);
+  if (start === -1) return undefined;
+  for (let i = start + 1; i < lines.length && !/^\s*\[.*\]\s*$/.test(lines[i]); i++) {
+    const m = /^\s*([^=;#]+?)\s*=\s*(.*?)\s*$/.exec(lines[i]);
+    if (m && m[1] === key) return m[2];
+  }
+  return undefined;
+}
+
+/**
+ * Plan a launch: the files to write and the command line, reading but never writing anything
+ * (so --dry_run changes nothing on disk). Returns { dir, cfgPath, files: [{ path, text, mode? }], args, logFile }.
+ */
+export function planLaunch({ mode = 'dedicated', server = mode, adminPassword, adminPort = 3977, gamePort = 3979,
+  bind = '0.0.0.0', joinHost, seed, mapBits = 8, load, commandDelayTicks = 0, maxBuildsPerDay = 0, scriptOpcodes = 100000, terrain, serverName = 'openttd-agent game' }) {
+  const dir = profileDir(server);
   const cfgPath = path.join(dir, 'openttd.cfg');
-  if (!fs.existsSync(cfgPath)) {
+  const files = [];
+  let cfgText;
+  if (fs.existsSync(cfgPath)) cfgText = fs.readFileSync(cfgPath, 'utf8');
+  else {
     const userCfg = path.join(findPersonalDir(), 'openttd.cfg');
-    fs.writeFileSync(cfgPath, fs.existsSync(userCfg) ? fs.readFileSync(userCfg, 'utf8') : '');
+    cfgText = fs.existsSync(userCfg) ? fs.readFileSync(userCfg, 'utf8') : '';
   }
   const patches = {};
   if (mode !== 'join') {
@@ -232,7 +286,6 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
     // Opcodes a script may run per tick before OpenTTD suspends it (game default 10000, max 250000).
     // Higher = faster map dumps and replies, at some cost to tick time on the host.
     patches.script = { script_max_opcode_till_suspend: scriptOpcodes };
-
     patches.game_creation = { map_x: mapBits, map_y: mapBits };
     // Uncompressed saves: scenario-prepare reads and rewrites them (src/savegame.js). Read at startup only.
     patches.misc = { savegame_format: 'none' };
@@ -240,20 +293,22 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
     // loaded save keeps its own value, which `pause` sets over the console).
     patches.construction = { command_pause_level: 3 };
     if (terrain !== undefined) patches.difficulty = { terrain_type: TERRAIN_TYPES.indexOf(terrain) }; // seed goes on the command line (-G); ini v7 dropped generation_seed
-    fs.writeFileSync(path.join(dir, 'secrets.cfg'), `[network]\nadmin_password = ${adminPassword}\n`, { mode: 0o600 });
+    files.push({ path: path.join(dir, 'secrets.cfg'), text: `[network]\nadmin_password = ${adminPassword}\n`, mode: 0o600 });
     // client_name and server_name are private settings (private.cfg since ini_version 1; openttd.cfg
     // entries are ignored). A dedicated server joins its own game as a client: name it, or the
     // client list shows "Unnamed Client".
     const privatePath = path.join(dir, 'private.cfg');
     const privateText = fs.existsSync(privatePath) ? fs.readFileSync(privatePath, 'utf8') : '';
-    fs.writeFileSync(privatePath, patchIni(privateText, { network: { server_name: serverName, ...(mode === 'dedicated' ? { client_name: 'openttd-agent server' } : {}) } }));
+    files.push({ path: privatePath, text: patchIni(privateText, { network: { server_name: serverName, ...(mode === 'dedicated' ? { client_name: 'openttd-agent server' } : {}) } }) });
   }
-  let cfgText = fs.readFileSync(cfgPath, 'utf8');
   if (!/^\s*\[version\]\s*$/m.test(cfgText)) cfgText = `[version]\nini_version = ${INI_VERSION}\n\n${cfgText}`;
   cfgText = cfgText.replace(/^\s*generation_seed\s*=.*\n?/m, '');
   cfgText = patchIni(cfgText, patches);
   if (mode !== 'join') cfgText = replaceIniSection(cfgText, 'game_scripts', [`${GS_NAME} = command_delay_ticks=${commandDelayTicks},max_builds_per_day=${maxBuildsPerDay}`]);
-  fs.writeFileSync(cfgPath, cfgText);
+  files.unshift({ path: cfgPath, text: cfgText });
+  if (mode !== 'join') {
+    files.push({ path: path.join(dir, SERVER_STATE_FILE), text: JSON.stringify({ mode, game_port: gamePort, admin_port: adminPort, bind, host: adminHostForBind(bind) }, null, 2) + '\n' });
+  }
 
   const args = ['-c', cfgPath];
   if (mode === 'dedicated') args.push('-D', `${bind}:${gamePort}`, '-d', 'script=4');
@@ -263,8 +318,37 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
   }
   if (seed !== undefined && mode !== 'join') args.push('-G', String(seed));
   if (load) args.push('-g', resolveSavePath(load, dir));
-  const logFile = path.join(dir, 'openttd.log');
-  const result = { mode, profile_dir: dir, executable: exe, args, log: logFile, admin_port: mode === 'join' ? null : adminPort, game_port: gamePort };
+  return { dir, cfgPath, files, args, logFile: path.join(dir, 'openttd.log') };
+}
+
+/** server.json in a launch profile: { mode, game_port, admin_port, bind, host } written by launch. */
+export const SERVER_STATE_FILE = 'server.json';
+
+/** Keep the last LOG_KEEP logs: openttd.log -> openttd.log.1 -> ... Returns the moved names. */
+export const LOG_KEEP = 3;
+export function rotateLogs(logFile, keep = LOG_KEEP) {
+  if (!fs.existsSync(logFile) || fs.statSync(logFile).size === 0) return [];
+  for (let i = keep - 1; i >= 1; i--) {
+    if (fs.existsSync(`${logFile}.${i}`)) fs.renameSync(`${logFile}.${i}`, `${logFile}.${i + 1}`);
+  }
+  fs.renameSync(logFile, `${logFile}.1`);
+  return [`${path.basename(logFile)} -> ${path.basename(logFile)}.1`];
+}
+
+/**
+ * Write a launch profile and start OpenTTD (or, with dryRun, only say what it would do).
+ * mode: 'dedicated' (headless server, everyone joins as a client),
+ *       'host' (GUI; you then start a LAN server from the Multiplayer menu),
+ *       'join' (GUI client joining host:3979).
+ * Returns { result, child }; child is null on a dry run.
+ */
+export function launch(opts) {
+  const { mode = 'dedicated', dryRun = false, adminPort = 3977, gamePort = 3979, bind = '0.0.0.0' } = opts;
+  const exe = findExecutable();
+  if (!exe) throw new Error(`openttd_not_found: ${installHint()}`);
+  const plan = planLaunch(opts);
+  const result = { mode, server: opts.server ?? mode, profile_dir: plan.dir, executable: exe, args: plan.args, log: plan.logFile,
+    admin_port: mode === 'join' ? null : adminPort, game_port: gamePort };
   // OpenTTD 15.3 binds the admin port to the same addresses as the game port
   // (network.cpp GetBindAddresses: one list for both), so it cannot be kept on loopback
   // while players join over the LAN. The password is what protects it.
@@ -273,11 +357,16 @@ export function launch({ mode = 'dedicated', profile = mode, adminPassword, admi
       ? 'this machine only'
       : 'the LAN (OpenTTD binds it like the game port). Keep the admin password on this machine; players use the relay.';
   }
-  if (dryRun) return { ...result, dry_run: true };
-  const out = fs.openSync(logFile, 'a');
-  const child = spawn(exe, args, { cwd: dir, detached: true, stdio: ['ignore', out, out] });
+  if (dryRun) return { result: { ...result, dry_run: true, would_write: plan.files.map((f) => f.path) }, child: null };
+  fs.mkdirSync(plan.dir, { recursive: true });
+  for (const f of plan.files) fs.writeFileSync(f.path, f.text, f.mode ? { mode: f.mode } : undefined);
+  const rotated = rotateLogs(plan.logFile);
+  if (rotated.length) result.log_rotated = rotated;
+  const out = fs.openSync(plan.logFile, 'a');
+  const child = spawn(exe, plan.args, { cwd: plan.dir, detached: true, stdio: ['ignore', out, out] });
+  fs.closeSync(out);
   child.unref();
   result.pid = child.pid;
   log.info('setup', 'launched OpenTTD', result);
-  return result;
+  return { result, child };
 }

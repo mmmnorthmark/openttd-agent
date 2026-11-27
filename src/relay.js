@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { makeContext } from './context.js';
-import { COMMANDS_BY_NAME, runCommand } from './commands.js';
+import { COMMANDS_BY_NAME, executeCommand } from './commands.js';
 import { CONFIG_DIR, loadConfig } from './config.js';
 import { loadPlayers, playerForToken } from './relay-players.js';
 import { playerView } from './session.js';
@@ -118,7 +118,8 @@ export function startRelay({ port = loadConfig().relay_port, bind = '0.0.0.0' } 
       args = parsed.args ?? {};
       args = authorize(player, name, args);
       ctx.refreshConfig();
-      const result = await runCommand(playerContext(player), name, args);
+      // Unshaped: the player's own runCommand applies --fields/--brief/--steps once.
+      const result = await executeCommand(playerContext(player), name, args);
       const ms = Date.now() - started;
       log.info('relay', 'call', { player: player.name, name, ms });
       stats.record({ player: player.name, outcome: 'ok', name });
@@ -133,6 +134,7 @@ export function startRelay({ port = loadConfig().relay_port, bind = '0.0.0.0' } 
     }
   });
 
+  server.requestTimeout = 0; // long calls (turn-advance) must not be cut after node's default 5 minutes
   return new Promise((resolve, reject) => {
     server.once('error', reject);
     server.listen(port, bind, () => {

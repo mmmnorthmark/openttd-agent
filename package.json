@@ -1,6 +1,6 @@
 {
   "name": "openttd-agent",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "CLI + MCP server that lets coding agents read an OpenTTD world and build for their company, via the admin port and a bundled GameScript.",
   "type": "module",
   "bin": {
@@ -27,7 +27,7 @@
   },
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check bin/openttd-agent.js && for f in src/*.js; do node --check $f || exit 1; done"
+    "check": "node --check bin/openttd-agent.js && for f in src/*.js; do node --check $f || exit 1; done && sh tools/check_public.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.4.0",
