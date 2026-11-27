@@ -17,6 +17,10 @@ Hardening (batch 8):
   `OPENTTD_AGENT_ACCEPT_UNTESTED=1`; older than 14.0 is refused (`unsupported_openttd_version`).
   `status` shows `openttd` (server, local, match) and warns on a host/client mismatch. No OpenTTD
   installed: `openttd_not_found` with the official download link instead of a stack trace.
+- Version matrix: `tools/version-matrix.mjs` downloads official releases (sha256 from the
+  release manifest), runs a smoke suite per version in a sandbox (own HOME, OPENTTD_AGENT_HOME,
+  OpenGFX, ports) and prints the table in `docs/COMPATIBILITY.md` (14.0-15.3 green on macOS);
+  `.github/workflows/version-matrix.yml` runs it on the Linux builds.
 - Public hygiene: `tools/check_public.sh` (part of `npm run check`) fails on personal names,
   paths, private IPs and hostnames; examples use RFC 5737 addresses.
 

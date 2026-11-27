@@ -1,0 +1,54 @@
+# OpenTTD version matrix on Linux (generic amd64 builds from cdn.openttd.org).
+# Each job downloads one release, checks its sha256 against the release manifest, and runs the
+# smoke suite of tools/version-matrix.mjs in a sandbox (own HOME, own OPENTTD_AGENT_HOME, OpenGFX,
+# ports 4100+). Results: the job log (markdown table) and a JSON artifact per version.
+# Add a version here and to src/versions.js TESTED_VERSIONS only after it passes.
+name: version-matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'   # weekly, Monday 04:17 UTC
+  pull_request:
+    paths:
+      - 'gamescript/**'
+      - 'src/versions.js'
+      - 'src/setup.js'
+      - 'src/host.js'
+      - 'tools/version-matrix.mjs'
+      - '.github/workflows/version-matrix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['14.0', '14.1', '15.0', '15.1', '15.2', '15.3']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci
+      # Runtime libraries the generic build links against (a dedicated server opens no window,
+      # but the binary still needs them to start).
+      - name: Install OpenTTD runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsdl2-2.0-0 libfontconfig1 libfreetype6 libharfbuzz0b \
+            libicu74 liblzma5 liblzo2-2 libpng16-16t64 zlib1g libcurl4t64 libfluidsynth3 unzip xz-utils
+      - name: Run the smoke suite
+        run: node tools/version-matrix.mjs --platform linux --versions "${{ matrix.version }}" --base_port 4100 --out "matrix-${{ matrix.version }}.json"
+      - name: Missing libraries (on failure)
+        if: failure()
+        run: ldd ~/.cache/openttd-agent/versions/${{ matrix.version }}/build/*/openttd | grep 'not found' || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: matrix-${{ matrix.version }}
+          path: matrix-${{ matrix.version }}.json
