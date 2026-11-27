@@ -38,6 +38,8 @@ export function makeContext() {
       }
       return connecting;
     },
+    /** The connected Session, or null (no connection attempt). */
+    peekSession() { return session; },
     close() { session?.close(); },
   };
   return ctx;
